@@ -1,8 +1,8 @@
-\newcommand{\drawBlockedWave}[5]{
+\newcommand{\drawBlockedwarp}[5]{
   %%
-  %% Draw a wave coverage with blocked layout
+  %% Draw a warp coverage with blocked layout
   %%
-  %% Wave TL: pre defined top-left coordinate of the wave
+  %% Warp TL: pre defined top-left coordinate of the warp
   %% \elem: pre defined variable
   %%
   %% #1: sizePerThread[0] --> sizePerThreadM
@@ -17,13 +17,13 @@
   \pgfmathsetmacro{\threadsPerWarpN}{#4}
   \pgfmathsetmacro{\order}{#5}
 
-  \pgfmathsetmacro{\waveSizeM}{\sizePerThreadM*\threadsPerWarpM}
-  \pgfmathsetmacro{\waveSizeN}{\sizePerThreadN*\threadsPerWarpN}
+  \pgfmathsetmacro{\warpSizeM}{\sizePerThreadM*\threadsPerWarpM}
+  \pgfmathsetmacro{\warpSizeN}{\sizePerThreadN*\threadsPerWarpN}
 
   \foreach \tid in {0,...,63}{
     \pgfmathsetmacro{\tidM}{int(\tid/\threadsPerWarpN)}
     \pgfmathsetmacro{\tidN}{mod(\tid,\threadsPerWarpN)}
-    \coordinate (Thread TL) at ($(Wave TL)+(\tidN*\sizePerThreadN*\elem, -\tidM*\sizePerThreadM*\elem)$);
+    \coordinate (Thread TL) at ($(Warp TL)+(\tidN*\sizePerThreadN*\elem, -\tidM*\sizePerThreadM*\elem)$);
     \pgfmathsetmacro{\ratio}{\tidM*10}
     
     \ifthenelse{\tid = 0}{
@@ -34,7 +34,7 @@
       rectangle ++(\sizePerThreadN*\elem, -\sizePerThreadM*\elem);
     }
   }
-  \draw (Wave TL) rectangle ++(\waveSizeN*\elem, -\waveSizeM*\elem);
+  \draw (Warp TL) rectangle ++(\warpSizeN*\elem, -\warpSizeM*\elem);
 }
 
 \newcommand{\drawBlockedCTA}[7]{
@@ -62,28 +62,28 @@
 
   \pgfmathsetmacro{\CTASizeM}{\sizePerThreadM*\threadsPerWarpM*\warpsPerCTAM}
   \pgfmathsetmacro{\CTASizeN}{\sizePerThreadN*\threadsPerWarpN*\warpsPerCTAN}
-  \pgfmathsetmacro{\waveSizeM}{\sizePerThreadM*\threadsPerWarpM}
-  \pgfmathsetmacro{\waveSizeN}{\sizePerThreadN*\threadsPerWarpN}
+  \pgfmathsetmacro{\warpSizeM}{\sizePerThreadM*\threadsPerWarpM}
+  \pgfmathsetmacro{\warpSizeN}{\sizePerThreadN*\threadsPerWarpN}
 
-  \pgfmathsetmacro{\maxWaveId}{\warpsPerCTAM*\warpsPerCTAN-1}
+  \pgfmathsetmacro{\maxWarpId}{\warpsPerCTAM*\warpsPerCTAN-1}
 
-  \coordinate (Wave TL) at (CTA TL);
-  \drawBlockedWave{\sizePerThreadM}{\sizePerThreadN}{\threadsPerWarpM}{\threadsPerWarpN}{\order}
-  \foreach \waveId in {0,...,\maxWaveId}{
+  \coordinate (Warp TL) at (CTA TL);
+  \drawBlockedWarp{\sizePerThreadM}{\sizePerThreadN}{\threadsPerWarpM}{\threadsPerWarpN}{\order}
+  \foreach \warpId in {0,...,\maxWarpId}{
     \ifthenelse{\order=1}
     {
-      \pgfmathsetmacro{\waveCoordM}{int(\waveId/\warpsPerCTAN)}
-      \pgfmathsetmacro{\waveCoordN}{mod(\waveId,\warpsPerCTAN)}
+      \pgfmathsetmacro{\warpCoordM}{int(\warpId/\warpsPerCTAN)}
+      \pgfmathsetmacro{\warpCoordN}{mod(\warpId,\warpsPerCTAN)}
       \pgfmathsetmacro{\rot}{0}
     }{
-      \pgfmathsetmacro{\waveCoordM}{mod(\waveId,\warpsPerCTAM)}
-      \pgfmathsetmacro{\waveCoordN}{int(\waveId/\warpsPerCTAM)}
+      \pgfmathsetmacro{\warpCoordM}{mod(\warpId,\warpsPerCTAM)}
+      \pgfmathsetmacro{\warpCoordN}{int(\warpId/\warpsPerCTAM)}
       \pgfmathsetmacro{\rot}{90}
     }
     
-    \coordinate (Wave TL) at ($(CTA TL)+(\waveCoordN*\waveSizeN*\elem, -\waveCoordM*\waveSizeM*\elem)$);
-    \draw [ultra thin] (Wave TL) rectangle ++(\waveSizeN*\elem, -\waveSizeM*\elem)
-    node [pos=.5, scale=.6*\scale, inner sep=0, fill=white, rotate=\rot] {wave\waveId};
+    \coordinate (Warp TL) at ($(CTA TL)+(\warpCoordN*\warpSizeN*\elem, -\warpCoordM*\warpSizeM*\elem)$);
+    \draw [ultra thin] (Warp TL) rectangle ++(\warpSizeN*\elem, -\warpSizeM*\elem)
+    node [pos=.5, scale=.6*\scale, inner sep=0, fill=white, rotate=\rot] {warp\warpId};
   }
   
   \draw [thick] (CTA TL) rectangle ++(\CTASizeN*\elem, -\CTASizeM*\elem);
@@ -168,18 +168,18 @@
   \pgfmathsetmacro{\nonTrans}{1-#1}
   \pgfmathsetmacro{\verbose}{#2}
   \foreach \iVec in {0,1,2,3} {
-    \coordinate (wave TL) at ($(block TL)+(\trans*\iVec*2*4*\elem, -\nonTrans*\iVec*2*4*\elem)$);
+    \coordinate (warp TL) at ($(block TL)+(\trans*\iVec*2*4*\elem, -\nonTrans*\iVec*2*4*\elem)$);
     \foreach \col/\tg in {blue/0,orange/1}{
       \foreach \tid in {0,...,31} {
         \pgfmathsetmacro{\ratio}{\tid*2.5+15}
         \ifthenelse{\verbose=0}{
           \draw [line width=0.005mm, fill=\col!\ratio!white]
-          ($(wave TL)+(\nonTrans*\tid*\elem+\tg*\trans*4*\elem, -\trans*\tid*\elem-\tg*\nonTrans*4*\elem)$)
+          ($(warp TL)+(\nonTrans*\tid*\elem+\tg*\trans*4*\elem, -\trans*\tid*\elem-\tg*\nonTrans*4*\elem)$)
           rectangle ++(\nonTrans*\elem+\trans*4*\elem, -\nonTrans*4*\elem-\trans*\elem);
         }{
           \pgfmathsetmacro{\drawTid}{int(\tid+\tg*32)}
           \draw [line width=0.005mm, fill=\col!\ratio!white]
-          ($(wave TL)+(\nonTrans*\tid*\elem+\tg*\trans*4*\elem, -\trans*\tid*\elem-\tg*\nonTrans*4*\elem)$)
+          ($(warp TL)+(\nonTrans*\tid*\elem+\tg*\trans*4*\elem, -\trans*\tid*\elem-\tg*\nonTrans*4*\elem)$)
           rectangle ++(\nonTrans*\elem+\trans*4*\elem, -\nonTrans*4*\elem-\trans*\elem)
           node [pos=.5, scale=.35*\scale, rotate=90*\nonTrans] {t\drawTid};
         }
@@ -217,7 +217,7 @@
   \pgfmathsetmacro{\CTARepH}{\tensorShapeH/\mfmaNonKDim/\warpsPerCTAH}
   \pgfmathsetmacro{\CTARepW}{\tensorShapeW/\mfmaNonKDim/\warpsPerCTAW}
   \pgfmathsetmacro{\maxCTAId}{\CTARepH*\CTARepW-1}
-  \pgfmathsetmacro{\maxWaveId}{\warpsPerCTAH*\warpsPerCTAW-1}
+  \pgfmathsetmacro{\maxWarpId}{\warpsPerCTAH*\warpsPerCTAW-1}
   \pgfmathsetmacro{\CTASizeH}{\warpsPerCTAH*\mfmaNonKDim}
   \pgfmathsetmacro{\CTASizeW}{\warpsPerCTAW*\mfmaNonKDim}
   
@@ -226,17 +226,17 @@
     \pgfmathsetmacro{\ctaCoordH}{int(\ctaId/\CTARepW)}
     \pgfmathsetmacro{\ctaCoordW}{mod(\ctaId,\CTARepW)}
     \coordinate (CTA TL) at ($(TL)+(\ctaCoordW*\CTASizeW*\elem, -\ctaCoordH*\CTASizeH*\elem)$);
-    %% Draw a detailed view of wave0 in each CTA
+    %% Draw a detailed view of warp0 in each CTA
     \coordinate (block TL) at (CTA TL);
     \drawBlockMFMALayoutLarge{\mfmaTrans}{0}
     
-    \foreach \waveId in {0,...,\maxWaveId}{
-      \pgfmathsetmacro{\waveCoordH}{int(\waveId/\warpsPerCTAW)}
-      \pgfmathsetmacro{\waveCoordW}{mod(\waveId,\warpsPerCTAW)}
-      \coordinate (block TL) at ($(CTA TL)+(\waveCoordW*\mfmaNonKDim*\elem, -\waveCoordH*\mfmaNonKDim*\elem)$);
+    \foreach \warpId in {0,...,\maxWarpId}{
+      \pgfmathsetmacro{\warpCoordH}{int(\warpId/\warpsPerCTAW)}
+      \pgfmathsetmacro{\warpCoordW}{mod(\warpId,\warpsPerCTAW)}
+      \coordinate (block TL) at ($(CTA TL)+(\warpCoordW*\mfmaNonKDim*\elem, -\warpCoordH*\mfmaNonKDim*\elem)$);
       %% Inside the loop, only draw a rectangle
       \draw [ultra thin] (block TL) rectangle ++(\mfmaNonKDim*\elem, -\mfmaNonKDim*\elem)
-      node [scale=.7*\scale, pos=.5, fill=white, inner sep=0] {wave\waveId};
+      node [scale=.7*\scale, pos=.5, fill=white, inner sep=0] {warp\warpId};
     }
     
     %% Draw the outline of each CTA rep
@@ -290,9 +290,9 @@
   }
 }
 
-\newcommand{\drawWaveOperand}[4]{
+\newcommand{\drawWarpOperand}[4]{
   %%
-  %% Draw the part of the tensor that is one operand of the wave
+  %% Draw the part of the tensor that is one operand of the warp
   %%
   %% Op TL: pre defined coordinates of the top-left of the operand
   %% \elem: pre defined variable
@@ -347,16 +347,16 @@
   %% operand A
   \pgfmathsetmacro{\CTARepM}{\M/\warpsPerCTAM/32}
   \pgfmathsetmacro{\maxCTAIdM}{\CTARepM-1}
-  \pgfmathsetmacro{\maxWaveId}{\warpsPerCTAM-1}
+  \pgfmathsetmacro{\maxWarpId}{\warpsPerCTAM-1}
   \foreach \ctaId in {0,...,\maxCTAIdM}{
     \coordinate (CTA TL) at ($(A TL)+(0, -\ctaId*\warpsPerCTAM*32*\elem)$);
-    \foreach \waveId in {0,...,\maxWaveId}{
-      \coordinate (wave TL) at ($(CTA TL)+(0, -\waveId*32*\elem)$);
-      \draw [ultra thin] (wave TL) rectangle ++(\K*\elem, -32*\elem);
+    \foreach \warpId in {0,...,\maxWarpId}{
+      \coordinate (warp TL) at ($(CTA TL)+(0, -\warpId*32*\elem)$);
+      \draw [ultra thin] (warp TL) rectangle ++(\K*\elem, -32*\elem);
     }
-    %% Only draw the detailed view of the first wave in CTA
+    %% Only draw the detailed view of the first warp in CTA
     \coordinate (Op TL) at (CTA TL);
-    \drawWaveOperand{\K}{\mfmaNonKDim}{\kpack}{0}
+    \drawWarpOperand{\K}{\mfmaNonKDim}{\kpack}{0}
 
     %% Draw the outline of each CTA rep
     \draw [ultra thick] (CTA TL) rectangle ++(\K*\elem, -\warpsPerCTAM*32*\elem);
@@ -367,16 +367,16 @@
   %% operand B
   \pgfmathsetmacro{\CTARepN}{\N/\warpsPerCTAN/32}
   \pgfmathsetmacro{\maxCTAIdN}{\CTARepN-1}
-  \pgfmathsetmacro{\maxWaveId}{\warpsPerCTAN-1}
+  \pgfmathsetmacro{\maxWarpId}{\warpsPerCTAN-1}
   \foreach \ctaId in {0,...,\maxCTAIdN}{
     \coordinate (CTA TL) at ($(B TL)+(\ctaId*\warpsPerCTAN*32*\elem, 0)$);
-    \foreach \waveId in {0,...,\maxWaveId}{
-      \coordinate (wave TL) at ($(CTA TL)+(\waveId*32*\elem ,0)$);
-      \draw [ultra thin] (wave TL) rectangle ++(32*\elem, -\K*\elem);
+    \foreach \warpId in {0,...,\maxWarpId}{
+      \coordinate (warp TL) at ($(CTA TL)+(\warpId*32*\elem ,0)$);
+      \draw [ultra thin] (warp TL) rectangle ++(32*\elem, -\K*\elem);
     }
-    %% Only draw the detailed view of the first wave in CTA
+    %% Only draw the detailed view of the first warp in CTA
     \coordinate (Op TL) at (CTA TL);
-    \drawWaveOperand{\K}{\mfmaNonKDim}{\kpack}{1}
+    \drawWarpOperand{\K}{\mfmaNonKDim}{\kpack}{1}
 
     %% Draw the outline of each CTA rep
     \draw [ultra thick] (CTA TL) rectangle ++(\warpsPerCTAN*32*\elem, -\K*\elem);

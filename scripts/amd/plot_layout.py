@@ -154,8 +154,8 @@ def draw_lds_access_cmd(M, K, kpack, ldsLayout, ldsAccess, sizePerThread,
 \\end{{document}}'''
 
 
-def draw_wmma_instr_cmd(waveSize):
-    wmma_mode = 0 if waveSize == 32 else 1
+def draw_wmma_instr_cmd(warpSize):
+    wmma_mode = 0 if warpSize == 32 else 1
     return f'''\\begin{{document}}
   \\begin{{tikzpicture}}
     \\def\\scale{{1}}
@@ -219,7 +219,7 @@ def parse_args():
                         choices=['read', 'write', 'none'],
                         help='choose LDS access mode')
     ## wmma instruction layout parameter
-    parser.add_argument("-wave_size",
+    parser.add_argument("-warp_size",
                         type=int,
                         default=32,
                         choices=[32, 64],
@@ -260,7 +260,7 @@ def main():
     ldsLayout = args.lds_layout
     ldsAccess = args.lds_access
 
-    waveSize = args.wave_size
+    warpSize = args.warp_size
 
     sizePerThread = args.sizePerThread
     threadsPerWarp = args.threadsPerWarp
@@ -322,7 +322,7 @@ def main():
         draw_lds_str = draw_lds_access_cmd(M, K, kpack, ldsLayout, ldsAccess,
                                            sizePerThread, threadsPerWarp)
 
-        draw_wmma_str = draw_wmma_instr_cmd(waveSize)
+        draw_wmma_str = draw_wmma_instr_cmd(warpSize)
 
         f_plot.write(preamble_str + "\n")
         f_plot.write(tikz_code)

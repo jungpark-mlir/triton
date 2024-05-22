@@ -58,7 +58,7 @@ if [ $occLDSPerCU -lt $occVgprPerCU ];then
     occPerCU=$occLDSPerCU
 fi
 occPerEU=$((occPerCU*num_warps/SIMD))
-echo "occupancy: $occPerEU waves/SIMD or $occPerCU workgroups/CU (occLDSPerCU: $occLDSPerCU, occVgprPerCU: $occVgprPerCU)"
+echo "occupancy: $occPerEU warps/SIMD or $occPerCU workgroups/CU (occLDSPerCU: $occLDSPerCU, occVgprPerCU: $occVgprPerCU)"
 
 perf=$(tail -n 2 output.mlir)
 echo "$perf"

@@ -41,13 +41,13 @@ Type getShemPtrTy(Type elemTy) {
   return ptr_ty(elemTy, 3);
 }
 
-// Get waveId inside block of waves.
-Value getWaveIdInBlock(ConversionPatternRewriter &rewriter, Location loc,
-                       Value waveId, const ArrayRef<unsigned int> &wpt,
+// Get warpId inside block of warps.
+Value getWarpIdInBlock(ConversionPatternRewriter &rewriter, Location loc,
+                       Value warpId, const ArrayRef<unsigned int> &wpt,
                        int elemPerInstrNonK, int tensorSizeNonK, int nonKIdx) {
   if (nonKIdx == 1)
-    waveId = udiv(waveId, i32_val(wpt[0]));
-  return urem(urem(waveId, i32_val(wpt[nonKIdx])),
+    warpId = udiv(warpId, i32_val(wpt[0]));
+  return urem(urem(warpId, i32_val(wpt[nonKIdx])),
               i32_val(tensorSizeNonK / elemPerInstrNonK));
 }
 
@@ -102,29 +102,29 @@ swizzleIndexes(ConversionPatternRewriter &rewriter, Location loc, Value row,
  * @brief This function maps particular load of mfma dot operand to element
  * indexes(row, col)
  *
- * Whole tensor is broken into "blocks" of waves along "non-K" axis.
- * One block could be processed by multiple waves.
- * One wave works on a piece of tensor size elemsPerInstr[0] x K.
+ * Whole tensor is broken into "blocks" of warps along "non-K" axis.
+ * One block could be processed by multiple warps.
+ * One warp works on a piece of tensor size elemsPerInstr[0] x K.
  * Each of these pieces is broken into "tiles" of size elemsPerInstr[0] x
  * elemsPerInstr[1].
  *
  * Total offset of element is a sum of following values:
- * 1. Offset of wave-block in tensor
- * 2. Offset of wave inside one wave-block
- * 3. Offset of tile in one wave
+ * 1. Offset of warp-block in tensor
+ * 2. Offset of warp inside one warp-block
+ * 3. Offset of tile in one warp
  * 4. Offset of one lane data in a tile
  * 5. Offset of particular element of tensor processed by one lane
  *
  * This function computes these offsets for axies independently
  * Note that this function returns the offsets of elements in the first
- * wave-block. The offsets of elements in later wave-blocks can be computed
+ * warp-block. The offsets of elements in later warp-blocks can be computed
  * by adding a constant stride to the xor-ed offsets of elements in the
- * first wave-block.
+ * first warp-block.
  *
  * @param rewriter
  * @param loc
  * @param elemsPerInstr operand tile shape consumed by one MFMA instruction
- * @param waveId id component of 2d wave grid along nono-K axis
+ * @param warpId id component of 2d warp grid along nono-K axis
  * @param laneId lane id in warp [0..63]
  * @param numOfElems number of elements accessed by thread per repetition
  * @param reps number of instructions repretition to fully cover dot operand
@@ -137,7 +137,7 @@ swizzleIndexes(ConversionPatternRewriter &rewriter, Location loc, Value row,
  */
 llvm::SmallVector<llvm::SmallVector<Value>> computeTensorElemMappingInBlock(
     ConversionPatternRewriter &rewriter, Location loc,
-    const ArrayRef<int64_t> &elemsPerInstr, Value waveId, Value laneId,
+    const ArrayRef<int64_t> &elemsPerInstr, Value warpId, Value laneId,
     int numOfElems, ArrayRef<int64_t> reps, ArrayRef<Value> smemOffsets,
     int loadVecSize, unsigned iNonKDim, unsigned iKDim) {
   auto numK = reps[1];
@@ -147,7 +147,7 @@ llvm::SmallVector<llvm::SmallVector<Value>> computeTensorElemMappingInBlock(
   Value _0 = i32_val(0);
   Value _32 = i32_val(32);
   Value nonKDim = i32_val(iNonKDim);
-  Value waveVOffset = mul(waveId, i32_val(elemsPerInstr[0]));
+  Value warpVOffset = mul(warpId, i32_val(elemsPerInstr[0]));
 
   for (int tile = 0; tile < numK; ++tile) {
     Value tileVOffset = _0;
@@ -158,12 +158,12 @@ llvm::SmallVector<llvm::SmallVector<Value>> computeTensorElemMappingInBlock(
     if (iNonKDim == 32)
       laneHOffset = select(icmp_uge(laneId, _32), i32_val(numOfElems), _0);
     else {
-      // In this configuration wave contains 16 copies of same data
+      // In this configuration warp contains 16 copies of same data
       if ((iKDim == 1 || iKDim == 4) && iNonKDim == 4) {
         laneHOffset = i32_val(0);
       } else {
         assert(iKDim * iNonKDim / numOfElems == 64 &&
-               "seems no all threads in wave contain unique elements");
+               "seems no all threads in warp contain unique elements");
         laneHOffset = mul(udiv(laneId, nonKDim), i32_val(numOfElems));
       }
     }
@@ -173,7 +173,7 @@ llvm::SmallVector<llvm::SmallVector<Value>> computeTensorElemMappingInBlock(
       Value elemHOffset = i32_val(loadId * loadVecSize);
 
       Value sliceVOffset =
-          add(add(add(tileVOffset, laneVOffset), elemVOffset), waveVOffset);
+          add(add(add(tileVOffset, laneVOffset), elemVOffset), warpVOffset);
       Value sliceHOffset = add(add(tileHOffset, laneHOffset), elemHOffset);
 
       Value row = add(sliceVOffset, smemOffsets[0]);
@@ -200,7 +200,7 @@ Value computeOffset(ConversionPatternRewriter &rewriter, Location loc,
 
 llvm::SmallVector<Value>
 computeOffsetsAType(ConversionPatternRewriter &rewriter, Location loc,
-                    const ArrayRef<int64_t> &elemsPerInstr, Value waveId,
+                    const ArrayRef<int64_t> &elemsPerInstr, Value warpId,
                     Value laneId, int warpsPerBlock, int numOfElems,
                     ArrayRef<int64_t> reps, SharedMemoryObject smemObj,
                     SharedEncodingAttr srcLayout, unsigned nonKDim,
@@ -217,7 +217,7 @@ computeOffsetsAType(ConversionPatternRewriter &rewriter, Location loc,
   }
 
   auto mapping = computeTensorElemMappingInBlock(
-      rewriter, loc, elemsPerInstr, waveId, laneId, numOfElems, reps, offsets,
+      rewriter, loc, elemsPerInstr, warpId, laneId, numOfElems, reps, offsets,
       vectorSize, nonKDim, kDim);
 
   const auto numBlocks = reps[0];
@@ -241,7 +241,7 @@ computeOffsetsAType(ConversionPatternRewriter &rewriter, Location loc,
 
 llvm::SmallVector<Value>
 computeOffsetsBType(ConversionPatternRewriter &rewriter, Location loc,
-                    const ArrayRef<int64_t> &elemsPerInstr, Value waveId,
+                    const ArrayRef<int64_t> &elemsPerInstr, Value warpId,
                     Value laneId, int warpsPerBlock, int numOfElems,
                     ArrayRef<int64_t> reps, SharedMemoryObject smemObj,
                     SharedEncodingAttr srcLayout, unsigned nonKDim,
@@ -263,7 +263,7 @@ computeOffsetsBType(ConversionPatternRewriter &rewriter, Location loc,
   }
 
   auto mapping = computeTensorElemMappingInBlock(
-      rewriter, loc, tElemsPerInstr, waveId, laneId, numOfElems, tReps,
+      rewriter, loc, tElemsPerInstr, warpId, laneId, numOfElems, tReps,
       tOffsets, vectorSize, nonKDim, kDim);
 
   const auto numBlocks = tReps[0];
@@ -306,7 +306,7 @@ bool hasSwizzleEnabled(const SharedEncodingAttr &srcEncoding) {
 // @param loc
 // @param elemsPerInstr operand tile shape [K, nonK] consumed by one MFMA
 // instruction
-// @param waveId wave id for the "non K" axis
+// @param warpId warp id for the "non K" axis
 // @param laneId lane id in warp [0..63]
 // @param warpsPerBlock number of warps per horizontal axis
 // @param numOfElems number of elements accessed by threads per repetition
@@ -314,7 +314,7 @@ bool hasSwizzleEnabled(const SharedEncodingAttr &srcEncoding) {
 // @param cSwizzleOffset
 llvm::SmallVector<Value>
 fastPathComputeOffsets(ConversionPatternRewriter &rewriter, Location loc,
-                       const ArrayRef<int64_t> &elemsPerInstr, Value waveId,
+                       const ArrayRef<int64_t> &elemsPerInstr, Value warpId,
                        Value laneId, int warpsPerBlock, int numOfElems,
                        ArrayRef<int64_t> reps, Value cSwizzleOffset) {
   auto numK = reps[0];
@@ -325,7 +325,7 @@ fastPathComputeOffsets(ConversionPatternRewriter &rewriter, Location loc,
   auto iNonKDim = elemsPerInstr[1];
   int lineSize = warpsPerBlock * iNonKDim * numN;
   Value _nonKDim = i32_val(iNonKDim);
-  Value waveOffset = mul(waveId, i32_val(iNonKDim));
+  Value warpOffset = mul(warpId, i32_val(iNonKDim));
   Value colOffset = urem(laneId, _nonKDim);
 
   for (int block = 0; block < numN; ++block) {
@@ -333,15 +333,15 @@ fastPathComputeOffsets(ConversionPatternRewriter &rewriter, Location loc,
     for (int tile = 0; tile < numK; ++tile) {
       Value tileOffset = i32_val(tile * iKDim * lineSize);
       for (int elem = 0; elem < numOfElems; ++elem) {
-        // halfOffset is an offset related to wrapping of wave in the tile.
+        // halfOffset is an offset related to wrapping of warp in the tile.
         // for example, mfma 32 case (mapping of tensor elements to lane ids in
-        // wave):
+        // warp):
         //
         //  0  1  2  3 ... 31
         //  0  1  2  3 ... 31
         //  0  1  2  3 ... 31
         //  0  1  2  3 ... 31
-        // 32 33 34 35 ... 63  <- at this point wave is wrapping
+        // 32 33 34 35 ... 63  <- at this point warp is wrapping
         // 32 33 34 35 ... 63
         // 32 33 34 35 ... 63
         // 32 33 34 35 ... 63
@@ -354,7 +354,7 @@ fastPathComputeOffsets(ConversionPatternRewriter &rewriter, Location loc,
         Value rowOffset = add(i32_val(elem * lineSize), halfOffset);
         Value elemOffset = add(rowOffset, colOffset);
         Value offset =
-            add(add(add(waveOffset, blockOffset), tileOffset), elemOffset);
+            add(add(add(warpOffset, blockOffset), tileOffset), elemOffset);
         offsets[numK * numOfElems * block + numOfElems * tile + elem] = offset;
       }
     }
@@ -442,21 +442,21 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
   auto numRepNonK = numReps[nonKDimIdx];
   auto numRepK = numReps[kDimIdx];
 
-  unsigned iWaveSize = triton::gpu::getWarpSize(mfmaLayout);
-  assert(iWaveSize == 64);
-  Value waveSize = i32_val(iWaveSize);
-  Value linearWaveId = udiv(thread, waveSize);
-  Value lane = urem(thread, waveSize);
+  unsigned iWarpSize = triton::gpu::getWarpSize(mfmaLayout);
+  assert(iWarpSize == 64);
+  Value warpSize = i32_val(iWarpSize);
+  Value linearWarpId = udiv(thread, warpSize);
+  Value lane = urem(thread, warpSize);
 
-  Value spatialWaveId =
-      getWaveIdInBlock(rewriter, loc, linearWaveId, warpsPerCTA, mfmaInstrNonK,
+  Value spatialWarpId =
+      getWarpIdInBlock(rewriter, loc, linearWarpId, warpsPerCTA, mfmaInstrNonK,
                        shape[nonKDimIdx], nonKDimIdx);
-  // number of duplicates of elements in wave
+  // number of duplicates of elements in warp
   // In case of 64x4 x 4x4 multiplication, 4x4 B operand is duplicated 16 times
   int numSubBlocks = 1;
   if ((mfmaInstrK == 4 || mfmaInstrK == 1) && mfmaInstrNonK == 4)
     numSubBlocks = 16;
-  int numOfElems = mfmaInstrNonK * mfmaInstrK * numSubBlocks / iWaveSize;
+  int numOfElems = mfmaInstrNonK * mfmaInstrK * numSubBlocks / iWarpSize;
   assert(numOfElems >= 1);
 
   unsigned int maxNumWarps = shape[nonKDimIdx] / mfmaInstrNonK;
@@ -478,7 +478,7 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
         SmallVector<int64_t> elemsPerInstr{mfmaInstrK, mfmaInstrNonK};
         SmallVector<int64_t> reps{numReps[1], numReps[0]};
         offsets = fastPathComputeOffsets(rewriter, loc, elemsPerInstr,
-                                         spatialWaveId, lane, warpsPerBlockNonK,
+                                         spatialWarpId, lane, warpsPerBlockNonK,
                                          numOfElems, reps, cSwizzleOffset);
       } else {
         llvm_unreachable(
@@ -490,7 +490,7 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
             "col major operand B should be handled in the normal path");
       } else {
         offsets = fastPathComputeOffsets(rewriter, loc, elemsPerInstr,
-                                         spatialWaveId, lane, warpsPerBlockNonK,
+                                         spatialWarpId, lane, warpsPerBlockNonK,
                                          numOfElems, numReps, cSwizzleOffset);
       }
     }
@@ -506,11 +506,11 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
         sharedLayout, opIdx, shape, mfmaInstrNonK, warpsPerBlockNonK));
     if (opIdx == 0) {
       offsets = computeOffsetsAType(
-          rewriter, loc, elemsPerInstr, spatialWaveId, lane, warpsPerBlockNonK,
+          rewriter, loc, elemsPerInstr, spatialWarpId, lane, warpsPerBlockNonK,
           numOfElems, numReps, smemObj, sharedLayout, mDim, mfmaInstrK);
     } else {
       offsets = computeOffsetsBType(
-          rewriter, loc, elemsPerInstr, spatialWaveId, lane, warpsPerBlockNonK,
+          rewriter, loc, elemsPerInstr, spatialWarpId, lane, warpsPerBlockNonK,
           numOfElems, numReps, smemObj, sharedLayout, nDim, mfmaInstrK);
     }
     smemBase = computeBasePtr(rewriter, loc, smemObj);

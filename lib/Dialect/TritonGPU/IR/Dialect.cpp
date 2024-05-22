@@ -1101,10 +1101,10 @@ DotOperandEncodingAttr::getMFMAElemsPerInstr() const {
   assert((mDim == nDim) && (mDim == 32 || mDim == 16 || mDim == 4) ||
          (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64));
   int64_t kWidth = getKWidth();
-  constexpr int waveSize = 64; // MFMA is used on wave64 architectures only
+  constexpr int warpSize = 64; // MFMA is used on wave64 architectures only
   int kGroups = -1;
   if (mDim == nDim)
-    kGroups = waveSize / mDim;
+    kGroups = warpSize / mDim;
   if (mDim == 64 && nDim == 4 || mDim == 4 && nDim == 64)
     kGroups = 1;
   int64_t kDim = kWidth * kGroups;
@@ -1142,7 +1142,7 @@ unsigned DotOperandEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
   if (auto mfmaParent = getParent().dyn_cast<MfmaEncodingAttr>()) {
     int warpsPerCTAM = mfmaParent.getWarpsPerCTA()[0];
     int warpsPerCTAN = mfmaParent.getWarpsPerCTA()[1];
-    constexpr int waveSize = 64;
+    constexpr int warpSize = 64;
     auto tileSize = getMFMAElemsPerInstr();
     auto rep = getMFMARep(shape);
     return rep[0] * rep[1];
