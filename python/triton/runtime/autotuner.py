@@ -90,8 +90,9 @@ class Autotuner(KernelInterface):
             self.base_fn = self.base_fn.fn
         self.num_warmups = warmup
         self.num_reps = rep
-        import torch
-        self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
+        #import torch
+        #self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
+        self.use_cuda_graph = False
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
@@ -123,7 +124,7 @@ class Autotuner(KernelInterface):
                     raise
 
             self.post_hook(args, exception=None)
-
+        '''
         try:
             if self.use_cuda_graph:
                 import torch
@@ -133,6 +134,9 @@ class Autotuner(KernelInterface):
             return do_bench(kernel_call, warmup=self.num_warmups, rep=self.num_reps, quantiles=(0.5, 0.2, 0.8))
         except (OutOfResources, CompileTimeAssertionFailure):
             return float("inf") if self.use_cuda_graph else [float("inf"), float("inf"), float("inf")]
+        '''
+
+        return float("inf") if self.use_cuda_graph else [float("inf"), float("inf"), float("inf")]
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
@@ -239,6 +243,17 @@ class Config:
         self.pre_hook = pre_hook
 
     def all_kwargs(self):
+        return {
+            **self.kwargs, **{
+                k: v
+                for (k, v) in (
+                    ("num_warps", self.num_warps),
+                    ("num_ctas", self.num_ctas),
+                    ("num_stages", self.num_stages),
+                    ("maxnreg", self.maxnreg),
+                ) if v is not None
+            }
+        }
         return self.kwargs | {
             k: v
             for (k, v) in (

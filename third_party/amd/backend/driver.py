@@ -427,8 +427,9 @@ class HIPDriver(GPUDriver):
 
     @staticmethod
     def is_active():
-        import torch
-        return torch.version.hip is not None
+        return True
+        #import torch
+        #return torch.version.hip is not None
 
     def get_current_target(self):
         device = self.get_current_device()
