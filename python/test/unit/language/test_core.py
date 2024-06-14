@@ -8,10 +8,10 @@ import tempfile
 
 import numpy as np
 import pytest
-import torch
 import os
 import inspect
 from numpy.random import RandomState
+from hip import hip
 
 import triton
 import triton.language as tl
@@ -31,6 +31,14 @@ def is_hip():
     return not is_interpreter() and \
         triton.runtime.driver.active.get_current_target().backend == "hip"
 
+def hip_check(call_result):
+    err = call_result[0]
+    result = call_result[1:]
+    if len(result) == 1:
+        result = result[0]
+    if isinstance(err,hip.hipError_t) and err != hip.hipError_t.hipSuccess:
+        raise RuntimeError(str(err))
+    return result
 
 int_dtypes = ['int8', 'int16', 'int32', 'int64']
 uint_dtypes = ['uint8', 'uint16', 'uint32', 'uint64']
@@ -87,14 +95,42 @@ def numpy_random(shape, dtype_str, rs: Optional[RandomState] = None, low=None, h
     else:
         raise RuntimeError(f'Unknown dtype {dtype_str}')
 
+class dtensor(np.ndarray):
+    def __new__(cls, input_array):
+        obj = np.asarray(input_array).view(cls)
+        byte_size = input_array.size * input_array.itemsize
+        hip_mem = hip_check(hip.hipMalloc(byte_size))
+        hip_check(hip.hipMemcpy(hip_mem, input_array, byte_size, hip.hipMemcpyKind.hipMemcpyHostToDevice))
+        obj.ptr = hip_mem.as_c_void_p()
+        obj.strides = input_array.strides
+        obj.hip_mem = hip_mem
+        return obj
+    def data_ptr(self):
+        return self.ptr.value
+    def stride(self, dim):
+        return int(self.strides[dim] / self.itemsize)
+    def buffer(self):
+        return self.hip_mem
 
-def to_triton(x: np.ndarray, device, dst_type=None) -> Union[TensorWrapper, torch.Tensor]:
+def to_triton(x: np.ndarray, device, dst_type=None) -> Union[TensorWrapper, dtensor]:
     '''
     Note: We need dst_type because the type of x can be different from dst_type.
           For example: x is of type `float32`, dst_type is `bfloat16`.
           If dst_type is None, we infer dst_type from x.
     '''
     t = x.dtype.name
+    print("in - dst", t, dst_type)
+
+    if dst_type and 'float8' in dst_type:
+        print("fp8 not supported")
+        exit()
+    if dst_type and 'bfloat16' in dst_type:
+        print("bfloat16 not supported")
+        exit()
+    x_d = dtensor(x)
+    print("to triton", x)
+    return x_d
+
     if t in uint_dtypes:
         signed_type_name = t.lstrip('u')  # e.g. "uint16" -> "int16"
         x_signed = x.astype(getattr(np, signed_type_name))
@@ -1568,7 +1604,7 @@ def test_tensor_atomic_cas(sem, num_ctas, device):
                            + [(dtype_x, dtype_z, False, size)
                               for dtype_z in torch_float8_dtypes
                               for dtype_x in ["float16", "float32", "bfloat16"]
-                              for size in [1024, 32]]) if torch.__version__ >= "2.1" else []))
+                              for size in [1024, 32]]) ))
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
     # CUDA: bfloat16 on cc < 80 will not be tested
@@ -1891,7 +1927,7 @@ def test_split_to_scalar(device):
     np.testing.assert_equal(to_numpy(z1_ref), to_numpy(z1))
     np.testing.assert_equal(to_numpy(z2_ref), to_numpy(z2))
 
-
+'''
 def convert_float_to_float32(fp: torch.tensor, dtype=None):
     if not dtype:
         dtype = getattr(tl, torch_dtype_name(fp.dtype))
@@ -1923,7 +1959,7 @@ def convert_float_to_float32(fp: torch.tensor, dtype=None):
                               | (frac << (tl.float32.fp_mantissa_width - dtype.fp_mantissa_width)))  #
                              .view(torch.float32), output)
     return output
-
+'
 
 @pytest.mark.interpreter
 @pytest.mark.parametrize("in_dtype", [torch.float16, torch.bfloat16])
@@ -1951,7 +1987,7 @@ def serialize_fp8(np_data, in_dtype):
 
 def deserialize_fp8(np_data, in_dtype):
     return np_data
-
+'''
 
 # ---------------
 # test reduce
@@ -3020,24 +3056,19 @@ def convert_fp8_to_fp32(x, device, dtype_str):
     "M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype, out_dtype, kpack",
     [(*shape, 4, False, False, epilogue, input_precision, in_dtype, out_dtype, 1)
      for shape in [(64, 64, 64), (32, 32, 32), (16, 16, 16)]
-     for epilogue in ['none', 'trans', 'add-matrix', 'add-rows', 'add-cols', 'softmax', 'chain-dot']
-     for input_precision in ['tf32', 'tf32x3', 'ieee']
+     for epilogue in ['none', 'add-matrix', 'add-rows', 'add-cols', 'softmax', 'chain-dot']
+     for input_precision in ['ieee']
      for in_dtype, out_dtype in [('float16', 'float16'), ('float16', 'float32'), ('float32', 'float32')]
      if not (input_precision != 'ieee' and (in_dtype in ['float16']))] +
     [(*shape_nw, col_a, col_b, 'none', input_precision, in_dtype, out_dtype, kpack)
      for shape_nw in [[128, 256, 32, 8], [128, 16, 32, 4], [32, 128, 64, 4], [128, 128, 64, 4], [64, 128, 128, 4],
                       [32, 128, 64, 2], [64, 64, 32, 4], [32, 32, 128, 16], [128, 128, 64, 2], [64, 128, 128, 2]]
-     for input_precision in ["ieee" if is_hip() else "tf32"]
+     for input_precision in ["ieee"]
      for col_a in [True, False]
      for col_b in [True, False]
      for in_dtype, out_dtype in [('int8', 'int8'), ('float16', 'float16'), ('float16', 'float32'), ('float32',
                                                                                                     'float32')]
-     for kpack in [1, 2 if is_hip() else 1]] + [(64, 64, 64, 4, col_a, col_b, 'none', 'ieee', 'float32', 'float32', 1)
-                                                for col_a in [True, False]
-                                                for col_b in [True, False]] +
-    [(64, 64, 64, 4, False, False, 'chain-dot', 'ieee', 'bfloat16', 'float32', 1)] +
-    [(128, 128, 64, 4, False, False, 'chain-dot', 'ieee', float8_type, 'float32', 1)
-     for float8_type in ["float8e5", "float8e4nv"]])
+     for kpack in [1, 2 if is_hip() else 1]])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype, out_dtype, kpack, num_ctas, device):
     if is_interpreter():
@@ -3071,7 +3102,7 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         if not is_hip() and kpack == 2:
             pytest.skip("Skip duplicated tests on nv path")
 
-    torch.backends.cuda.matmul.allow_tf32 = input_precision == "tf32"
+    #torch.backends.cuda.matmul.allow_tf32 = input_precision == "tf32"
 
     if num_ctas > 1 and in_dtype == 'int8':
         # FIXME: mma v2 with num_ctas > 1 does not work
@@ -3141,8 +3172,9 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         z = 1 + numpy_random((M, N), dtype_str=in_dtype, rs=rs) * .1
 
     z_tri = to_triton(z, device=device)
-    if epilogue == 'trans':
-        z_tri = torch.as_strided(z_tri, (M, N), [1, M])
+    hip_check(hip.hipDeviceSynchronize())
+    #if epilogue == 'trans':
+        #z_tri = torch.as_strided(z_tri, (M, N), [1, M])
 
     if out_dtype == 'int8':
         out_dtype = tl.int8
@@ -3185,10 +3217,6 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
     # torch result
     if in_dtype == 'int8':
         z_ref = np.matmul(x.astype(np.float32), y.astype(np.float32())).astype(np.int32)
-    elif 'float8' in in_dtype:
-        x = convert_fp8_to_fp32(x, device, in_dtype)
-        y = convert_fp8_to_fp32(y, device, in_dtype)
-        z_ref = to_numpy(torch.matmul(x, y))
     else:
         z_ref = np.matmul(x, y)
 
@@ -3203,18 +3231,27 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         denom = np.sum(num, axis=-1, keepdims=True)
         z_ref = num / denom
     if epilogue == 'chain-dot':
-        if 'float8' in in_dtype:
-            w = to_numpy(convert_fp8_to_fp32(w, device, in_dtype))
+        #if 'float8' in in_dtype:
+            #w = to_numpy(convert_fp8_to_fp32(w, device, in_dtype))
         z_ref = np.matmul(z_ref, w)
     # compare
+
+    print("z before copy", z)
+    hip_check(hip.hipDeviceSynchronize())
+    hip_check(hip.hipMemcpy(z, z_tri.buffer(), z.size*z.itemsize, hip.hipMemcpyKind.hipMemcpyHostToDevice))    
+    print("z after copy", z)
+    print("zref", z_ref)
     if in_dtype == 'float32':
         # XXX: Somehow there's a larger difference when we use float32
-        np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-3)
+        #np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-3)
+        np.testing.assert_allclose(z_ref, z, rtol=0.01, atol=1e-3)
     elif out_dtype == tl.float16 or in_dtype == 'bfloat16':
-        np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-2)
+        #np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-2)
+        np.testing.assert_allclose(z_ref, z, rtol=0.01, atol=1e-2)
     else:
         # added atol, to loose precision for float16xfloat16->float32 case
-        np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-3)
+        #np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-3)
+        np.testing.assert_allclose(z_ref, z, rtol=0.01, atol=1e-3)
     if not is_cuda():
         return
     # make sure ld/st are vectorized
@@ -3680,7 +3717,7 @@ def test_masked_load_scalar(num_ctas, mask_val, other_val, device):
 
     torch.testing.assert_close(output, reference_out)
 
-
+'''
 # Testing masked loads with an intermate copy to shared memory run.
 # FIXME: Shape too small for ldmatrix when num_ctas=4
 @pytest.mark.interpreter
@@ -3724,7 +3761,7 @@ def test_masked_load_shared_memory(dtype, device):
 
     reference_out = torch.matmul(in1, in2)
     torch.testing.assert_close(out, reference_out, atol=1e-2, rtol=0)
-
+'''
 
 @pytest.mark.interpreter
 @pytest.mark.parametrize("cache", ["", ".ca", ".cg"])

@@ -604,9 +604,9 @@ class JITFunction(KernelInterface[T]):
 
     def run(self, *args, grid, warmup, **kwargs):
         # parse options
-        print (driver)
-        print (driver.active.get_current_device)
-        print (driver.active.stream)
+        #print (driver)
+        #print (driver.active.get_current_device)
+        #print (driver.active.stream)
         device = driver.active.get_current_device()
         #stream = driver.active.get_current_stream(device)
         stream = 0
