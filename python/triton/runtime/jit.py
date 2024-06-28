@@ -926,6 +926,9 @@ class TensorWrapper:
     def data_ptr(self):
         return self.base.data_ptr()
 
+    def buffer(self):
+        return self.base.buffer()
+
     def stride(self, i):
         return self.base.stride(i)
 

@@ -96,7 +96,7 @@ def numpy_random(shape, dtype_str, rs: Optional[RandomState] = None, low=None, h
         raise RuntimeError(f'Unknown dtype {dtype_str}')
 
 class dtensor(np.ndarray):
-    def __new__(cls, input_array):
+    def __new__(cls, input_array, device):
         obj = np.asarray(input_array).view(cls)
         byte_size = input_array.size * input_array.itemsize
         hip_mem = hip_check(hip.hipMalloc(byte_size))
@@ -104,6 +104,7 @@ class dtensor(np.ndarray):
         obj.ptr = hip_mem.as_c_void_p()
         obj.strides = input_array.strides
         obj.hip_mem = hip_mem
+        obj.device = device
         return obj
     def data_ptr(self):
         return self.ptr.value
@@ -113,6 +114,7 @@ class dtensor(np.ndarray):
         return self.hip_mem
 
 def to_triton(x: np.ndarray, device, dst_type=None) -> Union[TensorWrapper, dtensor]:
+#def to_triton(x: np.ndarray, device, dst_type=None) -> dtensor:
     '''
     Note: We need dst_type because the type of x can be different from dst_type.
           For example: x is of type `float32`, dst_type is `bfloat16`.
@@ -121,16 +123,19 @@ def to_triton(x: np.ndarray, device, dst_type=None) -> Union[TensorWrapper, dten
     t = x.dtype.name
     print("in - dst", t, dst_type)
 
-    if dst_type and 'float8' in dst_type:
-        print("fp8 not supported")
-        exit()
+    #if dst_type and 'float8' in dst_type:
+    #    print("fp8 not supported")
+    #    exit()
     if dst_type and 'bfloat16' in dst_type:
         print("bfloat16 not supported")
         exit()
-    x_d = dtensor(x)
+    x_d = dtensor(x, device)
     print("to triton", x)
+    if dst_type and 'float8' in dst_type:
+        return reinterpret(x_d, getattr(tl, dst_type))
     return x_d
 
+    '''
     if t in uint_dtypes:
         signed_type_name = t.lstrip('u')  # e.g. "uint16" -> "int16"
         x_signed = x.astype(getattr(np, signed_type_name))
@@ -141,6 +146,7 @@ def to_triton(x: np.ndarray, device, dst_type=None) -> Union[TensorWrapper, dten
         if t == 'float32' and dst_type == 'bfloat16':
             return torch.tensor(x, device=device).bfloat16()
         return torch.tensor(x, device=device)
+    '''
 
 
 def torch_dtype_name(dtype) -> str:
@@ -157,10 +163,12 @@ def torch_dtype_name(dtype) -> str:
 def to_numpy(x):
     if isinstance(x, TensorWrapper):
         return x.base.cpu().numpy().astype(getattr(np, torch_dtype_name(x.dtype)))
-    elif isinstance(x, torch.Tensor):
-        if x.dtype is torch.bfloat16:
-            return x.cpu().float().numpy()
-        return x.cpu().numpy()
+    #elif isinstance(x, torch.Tensor):
+    elif isinstance(x, dtensor):
+        #if x.dtype is torch.bfloat16:
+        #    return x.cpu().float().numpy()
+        return reinterpret(x, getattr(tl, 'int8'))
+        #return x.cpu().numpy()
     else:
         raise ValueError(f"Not a triton-compatible tensor: {x}")
 
@@ -1927,6 +1935,47 @@ def test_split_to_scalar(device):
     np.testing.assert_equal(to_numpy(z1_ref), to_numpy(z1))
     np.testing.assert_equal(to_numpy(z2_ref), to_numpy(z2))
 
+def convert_fakeFP_to_fp32(intfp: np.ndarray, dtype=None):
+    #'float8e4nv' or 'float8e5'
+    f32 = intfp.astype(np.float32)
+    if dtype == 'float8e4nv':
+        # float8 e4m3, exp bias 7
+        exp_width = 4
+        exp_bias = 7
+        primitive_bitwidth = 8
+        fp_mantissa_width = 3
+    elif dtype == 'float8e5':
+        # float8 e4m3, exp bias 7
+        exp_width = 5
+        exp_bias = 15
+        primitive_bitwidth = 8
+        fp_mantissa_width = 2
+    else:
+        return None
+
+    # sign = ((fp >> (dtype.primitive_bitwidth - 1)) & 0x01).int()
+    # exp = ((fp >> dtype.fp_mantissa_width) & ((1 << exp_width) - 1)).int()
+    # frac = (fp & ((1 << dtype.fp_mantissa_width) - 1)).int()
+
+    for idx, x in np.ndenumerate(intfp):
+        sign = ((x >> (primitive_bitwidth - 1)) & 0x01)
+        exp = ((x >> fp_mantissa_width) & ((1 << exp_width) - 1))
+        frac = (x & ((1 << fp_mantissa_width) - 1))
+        if exp == 0:
+            f32[idx] = (((-1.0)**sign) * (2.0**(1 - exp_bias)) * (frac / (2.0**fp_mantissa_width)))
+        else:
+            f32[idx] = (((-1.0)**sign) * (2.0**(exp - exp_bias)) * (1.0 + frac / (2.0**fp_mantissa_width)))
+        if idx == (0,0):
+            print (sign, exp, frac, f32[idx])
+            print((-1.0)**sign)
+            print(2.0**(exp - exp_bias))
+            print(1.0 + frac / (2.0**fp_mantissa_width))
+
+        if x == 0b01111111 or x == 0b11111111 :
+            f32[idx] = np.nan
+
+    return f32
+
 '''
 def convert_float_to_float32(fp: torch.tensor, dtype=None):
     if not dtype:
@@ -3068,7 +3117,9 @@ def convert_fp8_to_fp32(x, device, dtype_str):
      for col_b in [True, False]
      for in_dtype, out_dtype in [('int8', 'int8'), ('float16', 'float16'), ('float16', 'float32'), ('float32',
                                                                                                     'float32')]
-     for kpack in [1, 2 if is_hip() else 1]])
+     for kpack in [1, 2 if is_hip() else 1]] + 
+    [(128, 128, 64, 4, False, False, 'none', 'ieee', float8_type, 'float32', 1)
+     for float8_type in ["float8e5", "float8e4nv"]])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype, out_dtype, kpack, num_ctas, device):
     if is_interpreter():
@@ -3093,7 +3144,9 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
                     pytest.skip("Only test out_dtype=float16 on devices with sm >=80")
             if capability[0] < 9 and in_dtype == 'float8e4nv':
                 pytest.skip("float8e4nv not supported on sm <= 80")
-        if is_hip() and (in_dtype == 'float8e4nv' or in_dtype == 'float8e5'):
+        #if is_hip() and (in_dtype == 'float8e4nv' or in_dtype == 'float8e5'):
+        if is_hip() and (in_dtype != 'float8e5'):
+        #if is_hip() and (in_dtype != 'float8e4nv'):
             pytest.skip("float8e4nv and float8e5 not supported on HIP")
         if is_hip() and (input_precision != "ieee"):
             pytest.skip(f"{input_precision} not supported on HIP")
@@ -3169,8 +3222,10 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
     if out_dtype == 'int8':
         z = 1 + numpy_random((M, N), dtype_str='int32', rs=rs)
     else:
+        #z = 1 + numpy_random((M, N), dtype_str='int8', rs=rs)
         z = 1 + numpy_random((M, N), dtype_str=in_dtype, rs=rs) * .1
 
+    #z_tri = to_triton(z, device=device, dst_type=in_dtype)
     z_tri = to_triton(z, device=device)
     hip_check(hip.hipDeviceSynchronize())
     #if epilogue == 'trans':
@@ -3236,11 +3291,17 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         z_ref = np.matmul(z_ref, w)
     # compare
 
+    if 'float8' in in_dtype:
+        z_ref = np.matmul(convert_fakeFP_to_fp32(x, dtype=in_dtype), convert_fakeFP_to_fp32(y, dtype=in_dtype))
+    print("matmul (x conv, y conv)", z_ref)
     print("z before copy", z)
     hip_check(hip.hipDeviceSynchronize())
-    hip_check(hip.hipMemcpy(z, z_tri.buffer(), z.size*z.itemsize, hip.hipMemcpyKind.hipMemcpyHostToDevice))    
+    hip_check(hip.hipMemcpy(z, z_tri.buffer(), z.size*z.itemsize, hip.hipMemcpyKind.hipMemcpyDeviceToHost))    
     print("z after copy", z)
+    print("z tri", z_tri)
     print("zref", z_ref)
+    exit()
+
     if in_dtype == 'float32':
         # XXX: Somehow there's a larger difference when we use float32
         #np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-3)
