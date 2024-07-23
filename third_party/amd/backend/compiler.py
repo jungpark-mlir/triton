@@ -136,9 +136,11 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
-        if options.num_stages == 0 and amd.has_matrix_core_feature(options.arch):
-            amd.passes.ttgpuir.add_stream_pipeline(pm)
-            passes.common.add_canonicalizer(pm)
+        #if options.num_stages == 0 and amd.has_matrix_core_feature(options.arch):
+        #    amd.passes.ttgpuir.add_stream_pipeline(pm)
+        #    passes.common.add_canonicalizer(pm)
+        passes.ttgpuir.add_pipeline(pm, 2)
+
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)

@@ -369,8 +369,8 @@ loadOpsToIndirectionLevelAndUse(scf::ForOp forOp) {
       };
 
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    if (!op.hasTrait<OpTrait::DotLike>())
-      continue;
+    //if (!op.hasTrait<OpTrait::DotLike>())
+    //  continue;
     seen.clear();
     dfs(&op, 0, &op);
   }

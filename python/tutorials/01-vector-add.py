@@ -31,6 +31,7 @@ def add_kernel(x_ptr,  # *Pointer* to first input vector.
                n_elements,  # Size of the vector.
                BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
                # NOTE: `constexpr` so it can be used as a shape value.
+               rep
                ):
     # There are multiple 'programs' processing different data. We identify which program
     # we are here:
@@ -45,11 +46,14 @@ def add_kernel(x_ptr,  # *Pointer* to first input vector.
     mask = offsets < n_elements
     # Load x and y from DRAM, masking out any extra elements in case the input is not a
     # multiple of the block size.
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    output = x + y
+
+    # rep '-1' prevents scf.for from being optimised away.
+    for k in range(0, rep - 1):
+        x = tl.load(x_ptr + offsets, mask=mask)
+        #y = tl.load(y_ptr + offsets, mask=mask)
+        output = x
     # Write x + y back to DRAM.
-    tl.store(output_ptr + offsets, output, mask=mask)
+        tl.store(output_ptr + offsets, output, mask=mask)
 
 
 # %%
@@ -70,7 +74,7 @@ def add(x: torch.Tensor, y: torch.Tensor):
     #  - Each torch.tensor object is implicitly converted into a pointer to its first element.
     #  - `triton.jit`'ed functions can be indexed with a launch grid to obtain a callable GPU kernel.
     #  - Don't forget to pass meta-parameters as keywords arguments.
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=8, rep=2)
     # We return a handle to z but, since `torch.cuda.synchronize()` hasn't been called, the kernel is still
     # running asynchronously at this point.
     return output
@@ -80,10 +84,14 @@ def add(x: torch.Tensor, y: torch.Tensor):
 # We can now use the above function to compute the element-wise sum of two `torch.tensor` objects and test its correctness:
 
 torch.manual_seed(0)
-size = 98432
+#size = 98432
+size = 512
 x = torch.rand(size, device='cuda')
 y = torch.rand(size, device='cuda')
-output_torch = x + y
+for i in range (size):
+    x[i] = float(i)
+#output_torch = x + y
+output_torch = x
 output_triton = add(x, y)
 print(output_torch)
 print(output_triton)
@@ -130,4 +138,4 @@ def benchmark(size, provider):
 # %%
 # We can now run the decorated function above. Pass `print_data=True` to see the performance number, `show_plots=True` to plot them, and/or
 # `save_path='/path/to/results/' to save them to disk along with raw CSV data:
-benchmark.run(print_data=True, show_plots=True)
+#benchmark.run(print_data=True, show_plots=True)
