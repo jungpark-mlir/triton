@@ -163,16 +163,45 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
         use_new_pipeliner = os.getenv("TRITON_HIP_USE_NEW_STREAM_PIPELINE", "0") == "1"
         if amd.has_matrix_core_feature(options.arch):
-            if use_new_pipeliner:
+            #if use_new_pipeliner:
+            if True:
+            #if False:
                 # In the old pipeliner we only support num_stages = 0/1, which means something
                 # different than the NVIDIA side. In the new pipeliner we unify the num_stages
                 # interpretation. Default to use 2 stages if not explicitly set.
                 num_stages = options.num_stages if options.num_stages != 0 else 2
                 amd.passes.ttgpuir.add_stream_pipelinev2(pm, num_stages)
             else:
-                if options.num_stages == 0:
-                    amd.passes.ttgpuir.add_stream_pipeline(pm)
+                amd.passes.ttgpuir.add_stream_pipeline(pm)
             passes.common.add_canonicalizer(pm)
+        passes.ttgpuir.add_prefetch(pm)
+
+        pm.run(mod)
+        from subprocess import call
+        #with tempfile.NamedTemporaryFile() as tmp_in:
+        tname = "./cache.ir"
+        outname = "./tempout.ir"
+        with open(outname, 'wb') as fd_out:
+            fd_out.write(str(mod).encode())
+            fd_out.close()
+        # provide ./cache.ir or vim will be invoked.
+        # don't forget TRITON_ALWAYS_COMPILE=1
+        if os.path.isfile(tname) is False:
+            with open(tname, 'wb') as fd_in:
+                fd_in.write(str(mod).encode())
+                fd_in.close()
+            EDITOR = os.environ.get('EDITOR', 'vim')
+            call([EDITOR, tname])
+        with open(tname, 'rb') as fd_in:
+            fd_in.seek(0)
+            ret = fd_in.read()
+            fd_in.close()
+
+        mod2 = ir.parse_mlir_module(tname, mod.context)
+        mod2.context = mod.context
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
+
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
@@ -182,8 +211,8 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        pm.run(mod)
-        return mod
+        pm.run(mod2)
+        return mod2
 
     @staticmethod
     def make_llir(src, metadata, options):
