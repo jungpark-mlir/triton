@@ -182,6 +182,24 @@ class HIPBackend(BaseBackend):
                     amd.passes.ttgpuir.add_stream_pipeline(pm)
             passes.common.add_canonicalizer(pm)
         amd.passes.ttgpuir.insert_instruction_sched_hints(pm)
+
+        '''
+        pm.run(mod)
+        tname = "./cache.ir"
+        outname = "./tempout.ir"
+        with open(outname, 'wb') as fd_out:
+            fd_out.write(str(mod).encode())
+            fd_out.close()
+        if os.path.isfile(tname) is False:
+            tname = outname
+        mod2 = ir.parse_mlir_module(tname, mod.context)
+        mod2.context = mod.context
+
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
+        mod = mod2
+        '''
+
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
@@ -240,6 +258,19 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm)
         pm.run(mod)
 
+        '''
+        tname = "./cache.ll"
+        outname = "./tempout.ll"
+        with open(outname, 'wb') as fd_out:
+            fd_out.write(str(mod).encode())
+            fd_out.close()
+        if os.path.isfile(tname) is False:
+            tname = outname
+        mod2 = ir.parse_mlir_module(tname, mod.context)
+        mod2.context = mod.context
+        mod = mod2
+        '''
+
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
         context = llvm.context()
@@ -290,6 +321,23 @@ class HIPBackend(BaseBackend):
         if os.environ.get("AMDGCN_ENABLE_DUMP", "0") == "1":
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
+
+        '''
+        from subprocess import call
+        tname = "./cache.as"
+        outname = "./tempout.as"
+        with open(outname, 'wb') as fd_out:
+            fd_out.write(str(amdgcn).encode())
+            fd_out.close()
+        if os.path.isfile(tname) is False:
+            tname = outname
+        with open(tname, 'rb') as fd_in:
+            fd_in.seek(0)
+            ret = fd_in.read()
+            fd_in.close()
+            amdgcn = ret
+        '''
+
         return amdgcn
 
     @staticmethod
