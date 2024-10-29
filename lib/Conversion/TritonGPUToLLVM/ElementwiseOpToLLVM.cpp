@@ -41,8 +41,46 @@ SmallVector<Value> reorderValues(const SmallVector<Value> &values, Type inType,
   if (inBitWidth == ouBitWidth)
     return values;
   if (inBitWidth == 16 && ouBitWidth == 32) {
+    // Register layout conversion:
+    //
+    //   [0, 1], [4, 5]  ⟶  [0], [1], [4], [5]
+    //   [2, 3], [6, 7]      [2], [3], [6], [7]
+    //
+    // Original access order:
+    //
+    //   [0, 1], [2, 3], [4, 5], [6, 7]
+    //
+    // Transformed access order:
+    //
+    //   [0], [2], [1], [3], [4], [6], [5], [7]
     SmallVector<Value> ret;
     for (unsigned i = 0; i < values.size(); i += 8) {
+      ret.push_back(values[i]);
+      ret.push_back(values[i + 2]);
+      ret.push_back(values[i + 1]);
+      ret.push_back(values[i + 3]);
+      ret.push_back(values[i + 4]);
+      ret.push_back(values[i + 6]);
+      ret.push_back(values[i + 5]);
+      ret.push_back(values[i + 7]);
+    }
+    return ret;
+  }
+  if (inBitWidth == 8 && ouBitWidth == 16) {
+    // Register layout conversion:
+    //
+    //   [0, 1, 2, 3], [8, 9, 10, 11]  ⟶  [0, 1], [2, 3], [8, 9], [10, 11]
+    //   [4, 5, 6, 7], [12, 13, 14, 15]    [4, 5], [6, 7], [12, 13], [14, 15]
+    //
+    // Original access order:
+    //
+    //   [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]
+    //
+    // Transformed access order:
+    //
+    //   [0, 1], [4, 5], [2, 3], [6, 7], [8, 9], [12, 13], [10, 11], [14, 15]
+    SmallVector<Value> ret;
+    for (unsigned i = 0; i < values.size(); i += 16) {
       ret.push_back(values[i]);
       ret.push_back(values[i + 1]);
       ret.push_back(values[i + 4]);
@@ -51,77 +89,18 @@ SmallVector<Value> reorderValues(const SmallVector<Value> &values, Type inType,
       ret.push_back(values[i + 3]);
       ret.push_back(values[i + 6]);
       ret.push_back(values[i + 7]);
-    }
-    return ret;
-  }
-  if (inBitWidth == 8 && ouBitWidth == 16) {
-    SmallVector<Value> ret;
-    for (unsigned i = 0; i < values.size(); i += 16) {
-      ret.push_back(values[i + 0]);
-      ret.push_back(values[i + 1]);
-      ret.push_back(values[i + 2]);
-      ret.push_back(values[i + 3]);
       ret.push_back(values[i + 8]);
       ret.push_back(values[i + 9]);
-      ret.push_back(values[i + 10]);
-      ret.push_back(values[i + 11]);
-      ret.push_back(values[i + 4]);
-      ret.push_back(values[i + 5]);
-      ret.push_back(values[i + 6]);
-      ret.push_back(values[i + 7]);
       ret.push_back(values[i + 12]);
       ret.push_back(values[i + 13]);
+      ret.push_back(values[i + 10]);
+      ret.push_back(values[i + 11]);
       ret.push_back(values[i + 14]);
       ret.push_back(values[i + 15]);
     }
     return ret;
   }
   llvm_unreachable("unimplemented code path");
-}
-
-SmallVector<Value> unpackI32(const SmallVector<Value> &inValues, Type srcTy,
-                             ConversionPatternRewriter &rewriter, Location loc,
-                             const LLVMTypeConverter *typeConverter) {
-  auto tensorTy = dyn_cast<RankedTensorType>(srcTy);
-  if (!tensorTy)
-    return inValues;
-  auto encoding = dyn_cast<DotOperandEncodingAttr>(tensorTy.getEncoding());
-  if (!(encoding && isa<NvidiaMmaEncodingAttr>(encoding.getParent())))
-    return inValues;
-  SmallVector<Value> outValues;
-  for (auto v : inValues) {
-    // cast i32 to appropriate eltType vector and extract elements
-    auto eltType = typeConverter->convertType(tensorTy.getElementType());
-    auto vecType = vec_ty(eltType, 32 / eltType.getIntOrFloatBitWidth());
-    auto vec = bitcast(v, vecType);
-    for (int i = 0; i < 32 / eltType.getIntOrFloatBitWidth(); i++) {
-      outValues.push_back(extract_element(vec, i32_val(i)));
-    }
-  }
-  return outValues;
-}
-
-SmallVector<Value> packI32(const SmallVector<Value> &inValues, Type srcTy,
-                           ConversionPatternRewriter &rewriter, Location loc,
-                           const LLVMTypeConverter *typeConverter) {
-  auto tensorTy = dyn_cast<RankedTensorType>(srcTy);
-  if (!tensorTy)
-    return inValues;
-  auto encoding = dyn_cast<DotOperandEncodingAttr>(tensorTy.getEncoding());
-  if (!(encoding && isa<NvidiaMmaEncodingAttr>(encoding.getParent())))
-    return inValues;
-  SmallVector<Value> outValues;
-  auto eltType = typeConverter->convertType(tensorTy.getElementType());
-  int vecWidth = 32 / eltType.getIntOrFloatBitWidth();
-  auto vecType = vec_ty(eltType, vecWidth);
-  for (int i = 0; i < inValues.size(); i += vecWidth) {
-    Value vec = undef(vecType);
-    for (int j = 0; j < vecWidth; j++) {
-      vec = insert_element(vec, inValues[i + j], i32_val(j));
-    }
-    outValues.push_back(bitcast(vec, i32_ty));
-  }
-  return outValues;
 }
 
 int getNumElementsPerThreads(Type type,
@@ -476,7 +455,7 @@ struct ElementwiseInlineAsmOpConversion
       auto argTy = op->getOperand(0).getType();
       auto subOperands = unpackLLElements(loc, operand, rewriter);
       unpackedOperands.push_back(
-          unpackI32(subOperands, argTy, rewriter, loc, getTypeConverter()));
+          unpackI32s(subOperands, argTy, rewriter, loc, getTypeConverter()));
     }
 
     int numElemsPerThread = getNumElementsPerThreads(op->getResult(0).getType(),
@@ -536,10 +515,11 @@ struct ElementwiseInlineAsmOpConversion
             unpackedResults[i], /*inType=*/op->getOperand(0).getType(),
             /*ouType=*/op->getResult(i).getType());
       }
-      auto packed = packI32(unpackedResults[i], op->getResult(i).getType(),
-                            rewriter, loc, getTypeConverter());
-      outs.push_back(packLLElements(loc, getTypeConverter(), packed, rewriter,
-                                    op->getResult(i).getType()));
+      auto dstTy = op->getResult(i).getType();
+      unpackedResults[i] = packI32s(unpackedResults[i], dstTy, rewriter, loc,
+                                    getTypeConverter());
+      outs.push_back(packLLElements(loc, getTypeConverter(), unpackedResults[i],
+                                    rewriter, op->getResult(i).getType()));
     }
 
     rewriter.replaceOp(op, outs);

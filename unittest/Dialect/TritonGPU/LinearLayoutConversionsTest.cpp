@@ -41,9 +41,9 @@ public:
         CTALayoutAttr::get(&ctx, cpg, cSplit, cOrd), instrShape);
   }
 
-  DotOperandEncodingAttr dotMMAv2(int idx, int kWidth, ArrayRef<unsigned> warps,
-                                  ArrayRef<unsigned> order) {
-    auto mmaLayout = mma(2, 0, {16, 8}, warps, {1, 1}, {1, 1}, order);
+  DotOperandEncodingAttr dotMMAv2(int idx, int kWidth,
+                                  ArrayRef<unsigned> warps) {
+    auto mmaLayout = mma(2, 0, {16, 8}, warps, {1, 1}, {1, 1}, {1, 0});
     return DotOperandEncodingAttr::get(&ctx, idx, mmaLayout, /*kWidth=*/kWidth);
   }
 
@@ -58,8 +58,8 @@ public:
         isTransposed, CTALayoutAttr::get(&ctx, cpg, cSplit, cOrd));
   }
 
-  DotOperandEncodingAttr mfmaDot(AMDMfmaEncodingAttr mfma, unsigned opIdx,
-                                 unsigned kWidth) {
+  DotOperandEncodingAttr mfmaDotOp(AMDMfmaEncodingAttr mfma, unsigned opIdx,
+                                   unsigned kWidth) {
     return DotOperandEncodingAttr::get(&ctx, opIdx, mfma, kWidth);
   }
 
@@ -301,6 +301,19 @@ TEST_F(LinearLayoutConversionsTest, Blocked4D) {
                     {S("dim0"), S("dim1"), S("dim2"), S("dim3")}));
 }
 
+TEST_F(LinearLayoutConversionsTest, MMAv2_16x16) {
+  EXPECT_EQ(toLinearLayout({16, 16},
+                           mma(2, 0, {16, 8}, {1, 1}, {1, 1}, {1, 1}, {0, 1})),
+            LinearLayout(
+                {
+                    {S("register"), {{0, 1}, {8, 0}, {0, 8}}},
+                    {S("lane"), {{0, 2}, {0, 4}, {1, 0}, {2, 0}, {4, 0}}},
+                    {S("warp"), {}},
+                    {S("block"), {}},
+                },
+                {S("dim0"), S("dim1")}));
+}
+
 TEST_F(LinearLayoutConversionsTest, MMAv2_32x32) {
   EXPECT_EQ(toLinearLayout({32, 32},
                            mma(2, 0, {16, 8}, {1, 1}, {1, 1}, {1, 1}, {0, 1})),
@@ -502,7 +515,7 @@ TEST_F(LinearLayoutConversionsTest, MMAv3_4x4Warps) {
 }
 
 TEST_F(LinearLayoutConversionsTest, DotMMAv2_tile_kwidth8) {
-  EXPECT_EQ(toLinearLayout({16, 64}, dotMMAv2(0, 8, {1, 1}, {1, 0})),
+  EXPECT_EQ(toLinearLayout({16, 64}, dotMMAv2(0, 8, {1, 1})),
             LinearLayout(
                 {
                     {S("register"), {{0, 1}, {0, 2}, {0, 4}, {8, 0}, {0, 32}}},
@@ -511,7 +524,7 @@ TEST_F(LinearLayoutConversionsTest, DotMMAv2_tile_kwidth8) {
                     {S("block"), {}},
                 },
                 {S("dim0"), S("dim1")}));
-  EXPECT_EQ(toLinearLayout({64, 8}, dotMMAv2(1, 8, {1, 1}, {1, 0})),
+  EXPECT_EQ(toLinearLayout({64, 8}, dotMMAv2(1, 8, {1, 1})),
             LinearLayout(
                 {
                     {S("register"), {{1, 0}, {2, 0}, {4, 0}, {32, 0}}},
@@ -524,7 +537,7 @@ TEST_F(LinearLayoutConversionsTest, DotMMAv2_tile_kwidth8) {
 
 TEST_F(LinearLayoutConversionsTest, DotMMAv2_large_warp4_kwidth8) {
   EXPECT_EQ(
-      toLinearLayout({128, 128}, dotMMAv2(0, 8, {4, 1}, {1, 0})),
+      toLinearLayout({128, 128}, dotMMAv2(0, 8, {4, 1})),
       LinearLayout(
           {
               {S("register"),
@@ -534,7 +547,7 @@ TEST_F(LinearLayoutConversionsTest, DotMMAv2_large_warp4_kwidth8) {
               {S("block"), {}},
           },
           {S("dim0"), S("dim1")}));
-  EXPECT_EQ(toLinearLayout({128, 64}, dotMMAv2(1, 8, {4, 1}, {1, 0})),
+  EXPECT_EQ(toLinearLayout({128, 64}, dotMMAv2(1, 8, {4, 1})),
             LinearLayout(
                 {
                     {S("register"),
@@ -554,7 +567,7 @@ TEST_F(LinearLayoutConversionsTest, DotMMAv2_large_warp4_kwidth8) {
                     {S("block"), {}},
                 },
                 {S("dim0"), S("dim1")}));
-  EXPECT_EQ(toLinearLayout({64, 128}, dotMMAv2(1, 8, {4, 1}, {1, 0})),
+  EXPECT_EQ(toLinearLayout({64, 128}, dotMMAv2(1, 8, {4, 1})),
             LinearLayout(
                 {
                     {S("register"),
@@ -738,10 +751,82 @@ TEST_F(LinearLayoutConversionsTest, MFMA32_2x4x1Warps) {
                 {S("dim0"), S("dim1"), S("dim2")}));
 }
 
+TEST_F(LinearLayoutConversionsTest, warp1onK_mfma32_lhs_kwidth8) {
+  auto parentMfma_1_8 = mfma(/*warps=*/{1, 8}, /*mDim=*/32, /*nDim=*/32,
+                             /*isTransposed=*/false);
+  auto mfmaDot_1_8 = mfmaDotOp(parentMfma_1_8, /*opIdx=*/0, /*kWidth=*/8);
+  EXPECT_EQ(toLinearLayout({128, 128}, mfmaDot_1_8),
+            LinearLayout(
+                {{S("register"),
+                  {{0, 1},
+                   {0, 2},
+                   {0, 4},
+                   {0, 16},
+                   {0, 32},
+                   {0, 64},
+                   {32, 0},
+                   {64, 0}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 8}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  EXPECT_EQ(toLinearLayout({128, 256}, mfmaDot_1_8),
+            LinearLayout(
+                {{S("register"),
+                  {{0, 1},
+                   {0, 2},
+                   {0, 4},
+                   {0, 16},
+                   {0, 32},
+                   {0, 64},
+                   {0, 128},
+                   {32, 0},
+                   {64, 0}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 8}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  EXPECT_EQ(toLinearLayout({32, 64}, mfmaDot_1_8),
+            LinearLayout(
+                {{S("register"), {{0, 1}, {0, 2}, {0, 4}, {0, 16}, {0, 32}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 8}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  EXPECT_EQ(toLinearLayout({256, 256}, mfmaDot_1_8),
+            LinearLayout(
+                {{S("register"),
+                  {{0, 1},
+                   {0, 2},
+                   {0, 4},
+                   {0, 16},
+                   {0, 32},
+                   {0, 64},
+                   {0, 128},
+                   {32, 0},
+                   {64, 0},
+                   {128, 0}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 8}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  EXPECT_EQ(toLinearLayout({16, 16}, mfmaDot_1_8),
+            LinearLayout(
+                {{S("register"), {{0, 1}, {0, 2}, {0, 4}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 0}, {0, 8}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+}
+
 TEST_F(LinearLayoutConversionsTest, warp1onK_mfma32_rhs_kwidth8) {
   auto parentMfma_1_8 = mfma(/*warps=*/{1, 8}, /*mDim=*/32, /*nDim=*/32,
                              /*isTransposed=*/false);
-  auto mfmaDot_1_8 = mfmaDot(parentMfma_1_8, /*opIdx=*/1, /*kWidth=*/8);
+  auto mfmaDot_1_8 = mfmaDotOp(parentMfma_1_8, /*opIdx=*/1, /*kWidth=*/8);
   EXPECT_EQ(
       toLinearLayout({128, 128}, mfmaDot_1_8),
       LinearLayout(
@@ -778,9 +863,17 @@ TEST_F(LinearLayoutConversionsTest, warp1onK_mfma32_rhs_kwidth8) {
            {S("block"), {}}},
           {S("dim0"), S("dim1")}));
 
+  EXPECT_EQ(toLinearLayout({16, 16}, mfmaDot_1_8),
+            LinearLayout(
+                {{S("register"), {{1, 0}, {2, 0}, {4, 0}}},
+                 {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 0}, {8, 0}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
   auto parentMfma_1_4 = mfma(/*warps=*/{1, 4}, /*mDim=*/32, /*nDim=*/32,
                              /*isTransposed=*/false);
-  auto mfmaDot_1_4 = mfmaDot(parentMfma_1_4, /*opIdx=*/1, /*kWidth=*/8);
+  auto mfmaDot_1_4 = mfmaDotOp(parentMfma_1_4, /*opIdx=*/1, /*kWidth=*/8);
   EXPECT_EQ(toLinearLayout({256, 256}, mfmaDot_1_4),
             LinearLayout(
                 {{S("register"),
@@ -798,10 +891,129 @@ TEST_F(LinearLayoutConversionsTest, warp1onK_mfma32_rhs_kwidth8) {
                 {S("dim0"), S("dim1")}));
 }
 
+TEST_F(LinearLayoutConversionsTest, warp1onK_mfma16_lhs_kwidth8) {
+  auto parentMfma_1_4 = mfma(/*warps=*/{1, 4}, /*mDim=*/16, /*nDim=*/16,
+                             /*isTransposed=*/false);
+  auto mfmaDot_1_4 = mfmaDotOp(parentMfma_1_4, /*opIdx=*/0, /*kWidth=*/8);
+  EXPECT_EQ(toLinearLayout({128, 128}, mfmaDot_1_4),
+            LinearLayout(
+                {{S("register"),
+                  {{0, 1},
+                   {0, 2},
+                   {0, 4},
+                   {0, 32},
+                   {0, 64},
+                   {16, 0},
+                   {32, 0},
+                   {64, 0}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 8}, {0, 16}}},
+                 {S("warp"), {{0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  EXPECT_EQ(toLinearLayout({1, 128}, mfmaDot_1_4),
+            LinearLayout(
+                {{S("register"),
+                  {
+                      {0, 1},
+                      {0, 2},
+                      {0, 4},
+                      {0, 32},
+                      {0, 64},
+                  }},
+                 {S("lane"), {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 8}, {0, 16}}},
+                 {S("warp"), {{0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  EXPECT_EQ(
+      toLinearLayout({128, 1}, mfmaDot_1_4),
+      LinearLayout(
+          {{S("register"), {{0, 0}, {0, 0}, {0, 0}, {16, 0}, {32, 0}, {64, 0}}},
+           {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 0}, {0, 0}}},
+           {S("warp"), {{0, 0}, {0, 0}}},
+           {S("block"), {}}},
+          {S("dim0"), S("dim1")}));
+
+  EXPECT_EQ(toLinearLayout({256, 256}, mfmaDot_1_4),
+            LinearLayout(
+                {{S("register"),
+                  {{0, 1},
+                   {0, 2},
+                   {0, 4},
+                   {0, 32},
+                   {0, 64},
+                   {0, 128},
+                   {16, 0},
+                   {32, 0},
+                   {64, 0},
+                   {128, 0}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 8}, {0, 16}}},
+                 {S("warp"), {{0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  EXPECT_EQ(toLinearLayout({16, 16}, mfmaDot_1_4),
+            LinearLayout(
+                {{S("register"), {{0, 1}, {0, 2}, {0, 4}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 8}, {0, 0}}},
+                 {S("warp"), {{0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  auto parentMfma_1_8 = mfma(/*warps=*/{1, 8}, /*mDim=*/16, /*nDim=*/16,
+                             /*isTransposed=*/false);
+  auto mfmaDot_1_8 = mfmaDotOp(parentMfma_1_8, /*opIdx=*/0, /*kWidth=*/8);
+  EXPECT_EQ(toLinearLayout({256, 256}, mfmaDot_1_8),
+            LinearLayout(
+                {{S("register"),
+                  {{0, 1},
+                   {0, 2},
+                   {0, 4},
+                   {0, 32},
+                   {0, 64},
+                   {0, 128},
+                   {16, 0},
+                   {32, 0},
+                   {64, 0},
+                   {128, 0}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 8}, {0, 16}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  auto parentMfma_1_8_1 = mfma(/*warps=*/{1, 1, 8}, /*mDim=*/16, /*nDim=*/16,
+                               /*isTransposed=*/false);
+  auto mfmaDot_1_8_1 = mfmaDotOp(parentMfma_1_8_1, /*opIdx=*/0, /*kWidth=*/8);
+
+  EXPECT_EQ(toLinearLayout({1, 256, 256}, mfmaDot_1_8_1),
+            LinearLayout({{S("register"),
+                           {{0, 0, 1},
+                            {0, 0, 2},
+                            {0, 0, 4},
+                            {0, 0, 32},
+                            {0, 0, 64},
+                            {0, 0, 128},
+                            {0, 16, 0},
+                            {0, 32, 0},
+                            {0, 64, 0},
+                            {0, 128, 0}}},
+                          {S("lane"),
+                           {{0, 1, 0},
+                            {0, 2, 0},
+                            {0, 4, 0},
+                            {0, 8, 0},
+                            {0, 0, 8},
+                            {0, 0, 16}}},
+                          {S("warp"), {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+                          {S("block"), {}}},
+                         {S("dim0"), S("dim1"), S("dim2")}));
+}
+
 TEST_F(LinearLayoutConversionsTest, warp1onK_mfma16_rhs_kwidth8) {
   auto parentMfma_1_4 = mfma(/*warps=*/{1, 4}, /*mDim=*/16, /*nDim=*/16,
                              /*isTransposed=*/false);
-  auto mfmaDot_1_4 = mfmaDot(parentMfma_1_4, /*opIdx=*/1, /*kWidth=*/8);
+  auto mfmaDot_1_4 = mfmaDotOp(parentMfma_1_4, /*opIdx=*/1, /*kWidth=*/8);
   EXPECT_EQ(
       toLinearLayout({128, 128}, mfmaDot_1_4),
       LinearLayout(
@@ -843,9 +1055,17 @@ TEST_F(LinearLayoutConversionsTest, warp1onK_mfma16_rhs_kwidth8) {
                  {S("block"), {}}},
                 {S("dim0"), S("dim1")}));
 
+  EXPECT_EQ(toLinearLayout({16, 16}, mfmaDot_1_4),
+            LinearLayout(
+                {{S("register"), {{1, 0}, {2, 0}, {4, 0}}},
+                 {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {8, 0}, {0, 0}}},
+                 {S("warp"), {{0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
   auto parentMfma_1_8 = mfma(/*warps=*/{1, 8}, /*mDim=*/16, /*nDim=*/16,
                              /*isTransposed=*/false);
-  auto mfmaDot_1_8 = mfmaDot(parentMfma_1_8, /*opIdx=*/1, /*kWidth=*/8);
+  auto mfmaDot_1_8 = mfmaDotOp(parentMfma_1_8, /*opIdx=*/1, /*kWidth=*/8);
   EXPECT_EQ(
       toLinearLayout({256, 256}, mfmaDot_1_8),
       LinearLayout(
@@ -858,7 +1078,7 @@ TEST_F(LinearLayoutConversionsTest, warp1onK_mfma16_rhs_kwidth8) {
 
   auto parentMfma_1_8_1 = mfma(/*warps=*/{1, 1, 8}, /*mDim=*/16, /*nDim=*/16,
                                /*isTransposed=*/false);
-  auto mfmaDot_1_8_1 = mfmaDot(parentMfma_1_8_1, /*opIdx=*/1, /*kWidth=*/8);
+  auto mfmaDot_1_8_1 = mfmaDotOp(parentMfma_1_8_1, /*opIdx=*/1, /*kWidth=*/8);
 
   EXPECT_EQ(toLinearLayout({1, 256, 256}, mfmaDot_1_8_1),
             LinearLayout({{S("register"),
@@ -879,6 +1099,167 @@ TEST_F(LinearLayoutConversionsTest, warp1onK_mfma16_rhs_kwidth8) {
                           {S("warp"), {{0, 0, 16}, {0, 0, 32}, {0, 0, 64}}},
                           {S("block"), {}}},
                          {S("dim0"), S("dim1"), S("dim2")}));
+}
+
+TEST_F(LinearLayoutConversionsTest, mfma32_dot_op_lhs_kwidth4) {
+  auto parentMfma32 = mfma(/*warps=*/{2, 4}, /*mDim=*/32, /*nDim=*/32,
+                           /*isTransposed=*/false);
+  auto mfmaDotOp0_32 = mfmaDotOp(parentMfma32, /*opIdx=*/0, /*kWidth=*/4);
+  EXPECT_EQ(toLinearLayout({128, 128}, mfmaDotOp0_32),
+            LinearLayout(
+                {{S("register"),
+                  {{0, 1}, {0, 2}, {0, 8}, {0, 16}, {0, 32}, {0, 64}, {64, 0}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 4}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {32, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+  EXPECT_EQ(toLinearLayout({64, 32}, mfmaDotOp0_32),
+            LinearLayout(
+                {{S("register"), {{0, 1}, {0, 2}, {0, 8}, {0, 16}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 4}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {32, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+  EXPECT_EQ(toLinearLayout({16, 16}, mfmaDotOp0_32),
+            LinearLayout(
+                {{S("register"), {{0, 1}, {0, 2}, {0, 8}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 0}, {0, 4}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  // Dot operand based on transposed mfma layout has same layout as ordinary
+  auto parentTMfma32 = mfma(/*warps=*/{2, 4}, /*mDim=*/32, /*nDim=*/32,
+                            /*isTransposed=*/true);
+  auto tmfmaDotOp0_32 = mfmaDotOp(parentTMfma32, /*opIdx=*/0, /*kWidth=*/4);
+
+  EXPECT_EQ(toLinearLayout({128, 128}, tmfmaDotOp0_32),
+            toLinearLayout({128, 128}, mfmaDotOp0_32));
+  EXPECT_EQ(toLinearLayout({64, 32}, tmfmaDotOp0_32),
+            toLinearLayout({64, 32}, mfmaDotOp0_32));
+  EXPECT_EQ(toLinearLayout({16, 16}, tmfmaDotOp0_32),
+            toLinearLayout({16, 16}, mfmaDotOp0_32));
+}
+
+TEST_F(LinearLayoutConversionsTest, mfma16_dot_op_lhs_kwidth4) {
+  auto parentMfma16 = mfma(/*warps=*/{2, 4}, /*mDim=*/16, /*nDim=*/16,
+                           /*isTransposed=*/false);
+  auto mfmaDotOp0_16 = mfmaDotOp(parentMfma16, /*opIdx=*/0, /*kWidth=*/4);
+  EXPECT_EQ(
+      toLinearLayout({128, 128}, mfmaDotOp0_16),
+      LinearLayout(
+          {{S("register"),
+            {{0, 1}, {0, 2}, {0, 16}, {0, 32}, {0, 64}, {32, 0}, {64, 0}}},
+           {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 4}, {0, 8}}},
+           {S("warp"), {{0, 0}, {0, 0}, {16, 0}}},
+           {S("block"), {}}},
+          {S("dim0"), S("dim1")}));
+  EXPECT_EQ(toLinearLayout({64, 32}, mfmaDotOp0_16),
+            LinearLayout(
+                {{S("register"), {{0, 1}, {0, 2}, {0, 16}, {32, 0}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 4}, {0, 8}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {16, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+  EXPECT_EQ(toLinearLayout({16, 16}, mfmaDotOp0_16),
+            LinearLayout(
+                {{S("register"), {{0, 1}, {0, 2}}},
+                 {S("lane"), {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 4}, {0, 8}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  // Dot operand based on transposed mfma layout has same layout as ordinary
+  auto parentTMfma16 = mfma(/*warps=*/{2, 4}, /*mDim=*/16, /*nDim=*/16,
+                            /*isTransposed=*/true);
+  auto tmfmaDotOp0_16 = mfmaDotOp(parentTMfma16, /*opIdx=*/0, /*kWidth=*/4);
+
+  EXPECT_EQ(toLinearLayout({128, 128}, tmfmaDotOp0_16),
+            toLinearLayout({128, 128}, mfmaDotOp0_16));
+  EXPECT_EQ(toLinearLayout({64, 32}, tmfmaDotOp0_16),
+            toLinearLayout({64, 32}, mfmaDotOp0_16));
+  EXPECT_EQ(toLinearLayout({16, 16}, tmfmaDotOp0_16),
+            toLinearLayout({16, 16}, mfmaDotOp0_16));
+}
+
+TEST_F(LinearLayoutConversionsTest, mfma32_dot_op_rhs_kwidth4) {
+  auto parentMfma32 = mfma(/*warps=*/{2, 4}, /*mDim=*/32, /*nDim=*/32,
+                           /*isTransposed=*/false);
+  auto mfmaDotOp1_32 = mfmaDotOp(parentMfma32, /*opIdx=*/1, /*kWidth=*/4);
+  EXPECT_EQ(
+      toLinearLayout({128, 128}, mfmaDotOp1_32),
+      LinearLayout(
+          {{S("register"), {{1, 0}, {2, 0}, {8, 0}, {16, 0}, {32, 0}, {64, 0}}},
+           {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {4, 0}}},
+           {S("warp"), {{0, 32}, {0, 64}, {0, 0}}},
+           {S("block"), {}}},
+          {S("dim0"), S("dim1")}));
+  EXPECT_EQ(toLinearLayout({32, 64}, mfmaDotOp1_32),
+            LinearLayout(
+                {{S("register"), {{1, 0}, {2, 0}, {8, 0}, {16, 0}}},
+                 {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {4, 0}}},
+                 {S("warp"), {{0, 32}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+  EXPECT_EQ(toLinearLayout({16, 16}, mfmaDotOp1_32),
+            LinearLayout(
+                {{S("register"), {{1, 0}, {2, 0}, {8, 0}}},
+                 {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 0}, {4, 0}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  // Dot operand based on transposed mfma layout has same layout as ordinary
+  auto parentTMfma32 = mfma(/*warps=*/{2, 4}, /*mDim=*/32, /*nDim=*/32,
+                            /*isTransposed=*/true);
+  auto tmfmaDotOp1_32 = mfmaDotOp(parentTMfma32, /*opIdx=*/1, /*kWidth=*/4);
+
+  EXPECT_EQ(toLinearLayout({128, 128}, tmfmaDotOp1_32),
+            toLinearLayout({128, 128}, mfmaDotOp1_32));
+  EXPECT_EQ(toLinearLayout({64, 32}, tmfmaDotOp1_32),
+            toLinearLayout({64, 32}, mfmaDotOp1_32));
+  EXPECT_EQ(toLinearLayout({16, 16}, tmfmaDotOp1_32),
+            toLinearLayout({16, 16}, mfmaDotOp1_32));
+}
+
+TEST_F(LinearLayoutConversionsTest, mfma16_dot_op_rhs_kwidth4) {
+  auto parentMfma16 = mfma(/*warps=*/{2, 4}, /*mDim=*/16, /*nDim=*/16,
+                           /*isTransposed=*/false);
+  auto mfmaDotOp1_16 = mfmaDotOp(parentMfma16, /*opIdx=*/1, /*kWidth=*/4);
+  EXPECT_EQ(toLinearLayout({128, 128}, mfmaDotOp1_16),
+            LinearLayout(
+                {{S("register"),
+                  {{1, 0}, {2, 0}, {16, 0}, {32, 0}, {64, 0}, {0, 64}}},
+                 {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {4, 0}, {8, 0}}},
+                 {S("warp"), {{0, 16}, {0, 32}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+  EXPECT_EQ(toLinearLayout({32, 64}, mfmaDotOp1_16),
+            LinearLayout(
+                {{S("register"), {{1, 0}, {2, 0}, {16, 0}}},
+                 {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {4, 0}, {8, 0}}},
+                 {S("warp"), {{0, 16}, {0, 32}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+  EXPECT_EQ(toLinearLayout({16, 16}, mfmaDotOp1_16),
+            LinearLayout(
+                {{S("register"), {{1, 0}, {2, 0}}},
+                 {S("lane"), {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {4, 0}, {8, 0}}},
+                 {S("warp"), {{0, 0}, {0, 0}, {0, 0}}},
+                 {S("block"), {}}},
+                {S("dim0"), S("dim1")}));
+
+  // Dot operand based on transposed mfma layout has same layout as ordinary
+  auto parentTMfma16 = mfma(/*warps=*/{2, 4}, /*mDim=*/16, /*nDim=*/16,
+                            /*isTransposed=*/true);
+  auto tmfmaDotOp1_16 = mfmaDotOp(parentTMfma16, /*opIdx=*/1, /*kWidth=*/4);
+
+  EXPECT_EQ(toLinearLayout({128, 128}, tmfmaDotOp1_16),
+            toLinearLayout({128, 128}, mfmaDotOp1_16));
+  EXPECT_EQ(toLinearLayout({64, 32}, tmfmaDotOp1_16),
+            toLinearLayout({64, 32}, mfmaDotOp1_16));
+  EXPECT_EQ(toLinearLayout({16, 16}, tmfmaDotOp1_16),
+            toLinearLayout({16, 16}, mfmaDotOp1_16));
 }
 
 TEST_F(LinearLayoutConversionsTest, WMMA_2x4Warps) {

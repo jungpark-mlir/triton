@@ -3,19 +3,6 @@
 
 include "mlir/Pass/PassBase.td"
 
-def TritonAMDGPUStreamPipeline : Pass<"tritonamdgpu-stream-pipeline", "mlir::ModuleOp"> {
-  let summary = "pipeline";
-
-  let description = [{
-    Pipeline global loads through registers to shared memory while computing on previous
-    tile
-  }];
-
-  let constructor = "mlir::createTritonAMDGPUStreamPipelinePass()";
-
-  let dependentDialects = [];
-}
-
 def TritonAMDGPUStreamPipelineV2 : Pass<"tritonamdgpu-stream-pipeline-v2", "mlir::ModuleOp"> {
   let summary = "pipeline";
 
@@ -124,13 +111,23 @@ def TritonAMDGPUReorderInstructions: Pass<"tritonamdgpu-reorder-instructions", "
   let dependentDialects = [];
 }
 
+def TritonAMDGPUConvertToBufferOps : Pass<"tritonamdgpu-convert-buffer-ops", "mlir::ModuleOp"> {
+  let summary = "Convert memory operations to buffer operations";
+
+  let description = "This pass converts memory operations (e.g., tt.load/tt.store) to  amdgpu buffer operations, if possible";
+
+  let constructor = "mlir::createTritonAMDGPUConvertToBufferOpsPass()";
+
+  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
+}
+
 def TritonAMDGPUBlockPingpong: Pass<"tritonamdgpu-block-pingpong", "mlir::ModuleOp"> {
   let summary = "Transform into 2 block ping-pong";
 
   let description = "This pass reorder instructions to better fit the ping-pong pattern "
                     "Where two warps from different blocks run concurrently in the synchronized fashion"
-                    "This block ping-pong pattern only works under the certain condition including"
-                    "Total register usage. Only apply this under known configs.";
+                    "This block ping-pong pattern could be beneficial under few conditions including"
+                    "occupancy and number of warps.";
 
   let constructor = "mlir::createTritonAMDGPUBlockPingpongPass()";
 
