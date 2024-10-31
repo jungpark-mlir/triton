@@ -1,6 +1,6 @@
 add_triton_library(TritonNVIDIAGPUToLLVM
     ConvertLayoutOpToLLVM/SharedToDotOperandMMAv1.cpp
-    ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp
+    ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2OrV3.cpp
     ConvertLayoutOpToLLVM.cpp
     DotOpToLLVM/MMAv1.cpp
     DotOpToLLVM/MMAv2.cpp
@@ -17,6 +17,7 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     ClusterOpsToLLVM.cpp
     PTXAsmFormat.cpp
     Utility.cpp
+    UpcastMXFPToLLVM.cpp
     TargetInfo.cpp
 
     DEPENDS

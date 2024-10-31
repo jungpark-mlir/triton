@@ -140,8 +140,15 @@ By default, proton profiles are in the *json* format and can be read by *Hatchet
 pip install llnl-hatchet
 proton-viewer -m time/s <profile.hatchet>
 ```
-
 NOTE: `pip install hatchet` does not work because the API is slightly different.
+
+### Visualizing sorted profile data
+In addition visualizing the profile data on terminal through Hatchet. A sorted list of the kernels by the first metric can be done using the --print-sorted flag with proton-viewer
+
+```bash
+proton-viewer -m time/ns,time/% <profile.hatchet> --print-sorted
+```
+prints the sorted kernels by the time/ns since it is the first listed.
 
 More options can be found by running the following command.
 
@@ -160,7 +167,6 @@ The following example demonstrates how to use instruction sampling:
 
 ```python
 import triton.profiler as proton
-
 
 proton.start(name="profile_name", context="shadow", backend="cupti_pcsampling")
 ```
@@ -210,3 +216,7 @@ If you encounter permission related problems when using instruction sampling, yo
 
 The overhead of instruction sampling on NVIDIA GPUs is about 20x using Proton because we haven't enabled continuous sampling yet.
 Continuous sampling can allow for more runtime optimizations, but it makes it more challenging to attribute performance data back to the GPU kernels because: (1) it enables profiling of concurrent kernels, (2) it doesn't allow profiling of time and instruction samples simultaneously, and (3) it works best if we have a separate thread dedicated to attributing instruction samples to the GPU kernels
+
+- Visible devices on AMD GPUs
+
+Environment variables such as `HIP_VISIBLE_DEVICES`, and `CUDA_VISIBLE_DEVICES` are not supported on AMD GPUs. Once it's set, we cannot find a valid mapping between the device ID returned by RocTracer and the physical device ID. Instead, `ROCR_VISIBLE_DEVICES` is recommended to be used.

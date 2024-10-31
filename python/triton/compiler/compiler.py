@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import functools
 import os
+import sysconfig
 
 # - ^\s*tt\.func\s+ : match the start of the string, any leading whitespace, the keyword func,
 #    and any following whitespace
@@ -32,7 +33,7 @@ prototype_pattern = {
     "ptx": ptx_prototype_pattern,
 }
 
-mlir_arg_type_pattern = r'%\w+: ((?:[^,\s<)]+|<[^>]+>)+),?'
+mlir_arg_type_pattern = r'%\w+: ((?:[^,\s<)]+|<[^>]+>)+(?: {[^}]+})?),?'
 ptx_arg_type_pattern = r"\.param\s+\.(\w+)"
 arg_type_pattern = {
     "ttir": mlir_arg_type_pattern,
@@ -45,6 +46,10 @@ def convert_type_repr(x):
     # Currently we only capture the pointer type and assume the pointer is on global memory.
     # TODO: Capture and support shared memory space
     match = re.search(r'!tt\.ptr<([^,]+)', x)
+    tma = re.search(r'tt.nv_tma_desc = 1', x)
+    if tma is not None:
+        return 'nvTmaDesc'
+    x = re.sub(r' {[^}]+}', '', x)
     if match is not None:
         return '*' + convert_type_repr(match.group(1))
     return x
@@ -147,7 +152,8 @@ def triton_key():
 
     # backend
     libtriton_hash = hashlib.sha256()
-    with open(os.path.join(TRITON_PATH, "_C/libtriton.so"), "rb") as f:
+    ext = sysconfig.get_config_var("EXT_SUFFIX").split(".")[-1]
+    with open(os.path.join(TRITON_PATH, f"_C/libtriton.{ext}"), "rb") as f:
         while True:
             chunk = f.read(1024**2)
             if not chunk:
