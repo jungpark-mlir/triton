@@ -28,8 +28,11 @@ static MfmaTypeId chooseAppropriateMfmaId(mlir::Type dataTypeA,
   if (dataTypeA.isFloat8E5M2FNUZ() && dataTypeB.isFloat8E5M2FNUZ()) {
     return MfmaTypeId::Bf8Bf8TyId;
   }
+  if (dataTypeA.isFloat8E4M3FN() && dataTypeB.isFloat8E4M3FN()) {
+    return MfmaTypeId::Fp8Fp8TyId;
+  }
   if (dataTypeA.isFloat8E5M2() && dataTypeB.isFloat8E5M2()) {
-    return MfmaTypeId::Fp16TyId;
+    return MfmaTypeId::Fp8Fp8TyId;
   }
   llvm_unreachable("Unsupported input argument type.");
 }
