@@ -78,7 +78,7 @@ class HIPOptions:
     #                 Kernel library. Note, this variant requires the use of buffer load/store ops
     #                 and a special software pipelining style - i.e., 1x LDS and 1x register
     #                 prefetch buffers for each GEMM tile.
-    instruction_sched_variant: str = 'none'
+    instruction_sched_variant: str = "none"
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -225,6 +225,10 @@ class HIPBackend(BaseBackend):
         if options.instruction_sched_variant == "local-prefetch":
             stream_prefetch = True
 
+        use_buffer_ops = os.environ.get("AMDGCN_USE_BUFFER_OPS", "0") == "1"
+        if use_buffer_ops:
+            amd.passes.ttgpuir.add_infer_stride(pm)
+
         if amd.has_matrix_core_feature(options.arch):
             assert options.num_stages != 0, ("Triton AMD backend pipeliner has been updated. "
                                              "We used to trigger software pipelining with "
@@ -242,8 +246,6 @@ class HIPBackend(BaseBackend):
             use_block_pingpong = os.getenv("TRITON_HIP_USE_BLOCK_PINGPONG", "0") == "1"
             if use_block_pingpong and options.num_stages == 2:
                 amd.passes.ttgpuir.add_block_pingpong(pm)
-
-        use_buffer_ops = os.environ.get("AMDGCN_USE_BUFFER_OPS", "0") == "1"
         if use_buffer_ops:
             amd.passes.ttgpuir.add_canonicalize_pointers(pm)
             passes.common.add_canonicalizer(pm)
@@ -251,6 +253,8 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
+
+       
         pm.run(mod)
         return mod
 
@@ -289,8 +293,8 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        amd.passes.ttgpuir.lower_instruction_sched_hints(pm, options.arch, options.num_stages,
-                                                         options.instruction_sched_variant)
+        amd.passes.ttgpuir.lower_instruction_sched_hints(pm, options.arch, options.num_stages, 'none')
+        #                                                         options.instruction_sched_variant)
         if os.environ.get("TRITON_DISABLE_LINE_INFO", "0") == "0":
             passes.llvmir.add_di_scope(pm)
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, __HIP_FTZ)

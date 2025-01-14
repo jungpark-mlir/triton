@@ -238,4 +238,33 @@ def BufferStoreOp : TT_AMDGPU_Op<"buffer_store", [
     }];
 }
 
+def SetStrideOp : TT_AMDGPU_Op<"set_stride",
+            [MemoryEffects<[MemWrite<GlobalMemory>]>,
+             TypesMatchWith<"result type matches ptr type", "result", "ptr", "$_self">
+            ]>
+{
+    let summary = "set inferred stride accessing the addr";
+    let description = [{
+      Buffer ops support an option to swizzle the cache indexing.
+      Compiler can examine the code and try to infer the accessing
+      stride of the buffer. set_stride op can be used to hold the 
+      inferred accessing stride of the pointer so it can provide
+      a hint when lowering to the buffer ops. 
+    }];
+    let arguments = (
+      ins
+      TT_PtrLike:$ptr,
+      I32:$stride
+    );
+
+    let results = (outs TT_PtrLike:$result);
+//$ptr `,` $stride attr-dict `:` type($result) `,` type($stride)
+//$ptr `,` $stride attr-dict `:` type($ptr) `,` type($stride)
+    let assemblyFormat = [{
+      
+      $ptr `,` $stride attr-dict `:` type($result) `,` type($stride)
+    }];
+
+}
+
 #endif

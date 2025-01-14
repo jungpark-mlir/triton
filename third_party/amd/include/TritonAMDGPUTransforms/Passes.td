@@ -139,4 +139,16 @@ def TritonAMDGPUBlockPingpong: Pass<"tritonamdgpu-block-pingpong", "mlir::Module
   let dependentDialects = ["mlir::ROCDL::ROCDLDialect, mlir::triton::amdgpu::TritonAMDGPUDialect"];
 }
 
+def TritonAMDGPUInferStride: Pass<"tritonamdgpu-infer-stride", "mlir::ModuleOp"> {
+  let summary = "Infer stride of the buffers";
+
+  let description = [{
+    This pass .
+  }];
+
+  let constructor = "mlir::createTritonAMDGPUInferStridePass()";
+
+  let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect"];
+}
+
 #endif

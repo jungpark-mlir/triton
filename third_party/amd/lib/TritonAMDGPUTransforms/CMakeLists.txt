@@ -3,6 +3,7 @@ add_triton_library(TritonAMDGPUTransforms
   BlockPingpong.cpp
   CanonicalizePointers.cpp
   ConvertToBufferOps.cpp
+  InferStride.cpp
   OptimizeEpilogue.cpp
   ReorderInstructions.cpp
   StreamPipeline.cpp

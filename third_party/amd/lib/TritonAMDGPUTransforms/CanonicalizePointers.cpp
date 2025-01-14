@@ -17,6 +17,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -951,6 +952,7 @@ LogicalResult PointerCanonicalizer::rewritePointer(Value argPtr) {
         })
         .Case<triton::LoadOp, triton::StoreOp, triton::AtomicCASOp,
               triton::AtomicRMWOp, triton::PtrToIntOp>([&](Operation *op) {
+              //triton::AtomicRMWOp, triton::PtrToIntOp, triton::amdgpu::SetStrideOp>([&](Operation *op) {
           res = materializeFatPointer(curOp, curLoc, op->getOperand(0));
         })
         .Default([&](Operation *op) {
