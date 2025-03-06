@@ -51,6 +51,539 @@ SmallVector<Value, 4> upcast8xMxfp4(RewriterBase &rewriter,
   // 0.11.1 | 0x40c0 | 0x4600 | + 6.0
   //
   // Encode Byte #0 (M) for BF16/FP16 in a LUT.
+
+  //0x12341234
+#if 0
+  
+  Value res_10 = b.i32_val(0x06000800);
+  Value res_32 = b.i32_val(0x02000400);
+  Value res_54 = b.i32_val(0x06000800);
+  Value res_76 = b.i32_val(0x02000400);
+
+#endif
+
+// ref0
+#if 0
+  Type i32Ty = rewriter.getI32Type();
+  // Start with 8 mxfp4 elements in a single i32 register
+  // | e7e6 | e5e4 | e3e2 | e1e0 |
+  Value input = b.bitcast(packedVec, i32Ty);
+
+
+Value sShift0 = b.shl(input, b.i32_val(12));
+Value s0 = b.and_(sShift0, b.i32_val(0x8000));
+Value emShift0 = b.shl(input, b.i32_val(9));
+Value em0 = b.and_(emShift0, b.i32_val(0xE00));
+Value res0 = b.or_(s0, em0);
+
+Value sShift1 = b.shl(input, b.i32_val(24));
+Value s1 = b.and_(sShift1, b.i32_val(0x80000000));
+Value emShift1 = b.shl(input, b.i32_val(21));
+Value em1 = b.and_(emShift1, b.i32_val(0xE000000));
+Value res1 = b.or_(s1, em1);
+
+Value sShift2 = b.shl(input, b.i32_val(4));
+Value s2 = b.and_(sShift2, b.i32_val(0x8000));
+Value emShift2 = b.shl(input, b.i32_val(1));
+Value em2 = b.and_(emShift2, b.i32_val(0xE00));
+Value res2 = b.or_(s2, em2);
+
+Value sShift3 = b.shl(input, b.i32_val(16));
+Value s3 = b.and_(sShift3, b.i32_val(0x80000000));
+Value emShift3 = b.shl(input, b.i32_val(13));
+Value em3 = b.and_(emShift3, b.i32_val(0xE000000));
+Value res3 = b.or_(s3, em3);
+
+//////////////////
+
+Value sShift4 = b.lshr(input, b.i32_val(4));
+Value s4 = b.and_(sShift4, b.i32_val(0x8000));
+Value emShift4 = b.lshr(input, b.i32_val(7));
+Value em4 = b.and_(emShift4, b.i32_val(0xE00));
+Value res4 = b.or_(s4, em4);
+
+Value sShift5 = b.shl(input, b.i32_val(8));
+Value s5 = b.and_(sShift5, b.i32_val(0x80000000));
+Value emShift5 = b.shl(input, b.i32_val(5));
+Value em5 = b.and_(emShift5, b.i32_val(0xE000000));
+Value res5 = b.or_(s5, em5);
+
+Value sShift6 = b.lshr(input, b.i32_val(12));
+Value s6 = b.and_(sShift6, b.i32_val(0x8000));
+Value emShift6 = b.lshr(input, b.i32_val(15));
+Value em6 = b.and_(emShift6, b.i32_val(0xE00));
+Value res6 = b.or_(s6, em6);
+
+//Value sShift7 = b.shl(input, b.i32_val(16));
+Value s7 = b.and_(input, b.i32_val(0x80000000));
+Value emShift7 = b.lshr(input, b.i32_val(3));
+Value em7 = b.and_(emShift7, b.i32_val(0xE000000));
+Value res7 = b.or_(s7, em7);
+
+Value i16R0 = b.trunc(i16_ty, res0);
+  Value f16R0 = b.bitcast(i16R0, rewriter.getF16Type());
+  Value fRes0 = b.fmul(f16R0, b.f16_val(16384.0));
+  Value i16Res0 = b.bitcast(fRes0, i16_ty);
+  Value i32Res0Lo = b.zext(i32_ty, i16Res0);
+  
+  Value sres1 = b.lshr(res1, b.i32_val(16));
+  Value i16R1 = b.trunc(i16_ty, sres1);
+  Value f16R1 = b.bitcast(i16R1, rewriter.getF16Type());
+  Value fRes1 = b.fmul(f16R1, b.f16_val(16384.0));
+  Value i16Res1 = b.bitcast(fRes1, i16_ty);
+  Value i32Res1 = b.zext(i32_ty, i16Res1);
+  Value i32Res1Hi = b.shl(i32Res1, b.i32_val(16));
+  
+  
+  Value i16R2 = b.trunc(i16_ty, res2);
+  Value f16R2 = b.bitcast(i16R2, rewriter.getF16Type());
+  Value fRes2 = b.fmul(f16R2, b.f16_val(16384.0));
+  Value i16Res2 = b.bitcast(fRes2, i16_ty);
+  Value i32Res2Lo = b.zext(i32_ty, i16Res2);
+  
+  Value sres3 = b.lshr(res3, b.i32_val(16));
+  Value i16R3 = b.trunc(i16_ty, sres3);
+  Value f16R3 = b.bitcast(i16R3, rewriter.getF16Type());
+  Value fRes3 = b.fmul(f16R3, b.f16_val(16384.0));
+  Value i16Res3 = b.bitcast(fRes3, i16_ty);
+  Value i32Res3 = b.zext(i32_ty, i16Res3);
+  Value i32Res3Hi = b.shl(i32Res3, b.i32_val(16));
+  
+  
+  //////////////////
+  
+  Value i16R4 = b.trunc(i16_ty, res4);
+  Value f16R4 = b.bitcast(i16R4, rewriter.getF16Type());
+  Value fRes4 = b.fmul(f16R4, b.f16_val(16384.0));
+  Value i16Res4 = b.bitcast(fRes4, i16_ty);
+  Value i32Res4Lo = b.zext(i32_ty, i16Res4);
+  
+  Value sres5 = b.lshr(res5, b.i32_val(16));
+  Value i16R5 = b.trunc(i16_ty, sres5);
+  Value f16R5 = b.bitcast(i16R5, rewriter.getF16Type());
+  Value fRes5 = b.fmul(f16R5, b.f16_val(16384.0));
+  Value i16Res5 = b.bitcast(fRes5, i16_ty);
+  Value i32Res5 = b.zext(i32_ty, i16Res5);
+  Value i32Res5Hi = b.shl(i32Res5, b.i32_val(16));
+  
+  Value i16R6 = b.trunc(i16_ty, res6);
+  Value f16R6 = b.bitcast(i16R6, rewriter.getF16Type());
+  Value fRes6 = b.fmul(f16R6, b.f16_val(16384.0));
+  Value i16Res6 = b.bitcast(fRes6, i16_ty);
+  Value i32Res6Lo = b.zext(i32_ty, i16Res6);
+  
+  Value sres7 = b.lshr(res7, b.i32_val(16));
+  Value i16R7 = b.trunc(i16_ty, sres7);
+  Value f16R7 = b.bitcast(i16R7, rewriter.getF16Type());
+  Value fRes7 = b.fmul(f16R7, b.f16_val(16384.0));
+  Value i16Res7 = b.bitcast(fRes7, i16_ty);
+  Value i32Res7 = b.zext(i32_ty, i16Res7);
+  Value i32Res7Hi = b.shl(i32Res7, b.i32_val(16));
+  
+  
+  Value res_10 = b.or_(res1, res0);
+  Value res_32 = b.or_(res3, res2);
+  Value res_54 = b.or_(res5, res4);
+  Value res_76 = b.or_(res7, res6);
+  /*  
+  Value res_10 = b.or_(i32Res0Lo, i32Res1Hi);
+  Value res_32 = b.or_(i32Res2Lo, i32Res3Hi);
+  Value res_54 = b.or_(i32Res4Lo, i32Res5Hi);
+  Value res_76 = b.or_(i32Res6Lo, i32Res7Hi);
+*/
+#endif
+
+// ref
+#if 0
+  Type i32Ty = rewriter.getI32Type();
+  // Start with 8 mxfp4 elements in a single i32 register
+  // | e7e6 | e5e4 | e3e2 | e1e0 |
+  Value input = b.bitcast(packedVec, i32Ty);
+
+
+Value sShift0 = b.shl(input, b.i32_val(12));
+Value s0 = b.and_(sShift0, b.i32_val(0x8000));
+Value emShift0 = b.shl(input, b.i32_val(9));
+Value em0 = b.and_(emShift0, b.i32_val(0xE00));
+Value res0 = b.or_(s0, em0);
+
+Value i16R0 = b.trunc(i16_ty, res0);
+Value f16R0 = b.bitcast(i16R0, rewriter.getF16Type());
+Value fRes0 = b.fmul(f16R0, b.f16_val(16384.0));
+Value i16Res0 = b.bitcast(fRes0, i16_ty);
+Value i32Res0Lo = b.zext(i32_ty, i16Res0);
+
+Value sShift1 = b.shl(input, b.i32_val(24));
+Value s1 = b.and_(sShift1, b.i32_val(0x80000000));
+Value emShift1 = b.shl(input, b.i32_val(21));
+Value em1 = b.and_(emShift1, b.i32_val(0xE000000));
+Value res1 = b.or_(s1, em1);
+
+Value sres1 = b.lshr(res1, b.i32_val(16));
+Value i16R1 = b.trunc(i16_ty, sres1);
+Value f16R1 = b.bitcast(i16R1, rewriter.getF16Type());
+Value fRes1 = b.fmul(f16R1, b.f16_val(16384.0));
+Value i16Res1 = b.bitcast(fRes1, i16_ty);
+Value i32Res1 = b.zext(i32_ty, i16Res1);
+Value i32Res1Hi = b.shl(i32Res1, b.i32_val(16));
+
+
+Value sShift2 = b.shl(input, b.i32_val(4));
+Value s2 = b.and_(sShift2, b.i32_val(0x8000));
+Value emShift2 = b.shl(input, b.i32_val(1));
+Value em2 = b.and_(emShift2, b.i32_val(0xE00));
+Value res2 = b.or_(s2, em2);
+
+Value i16R2 = b.trunc(i16_ty, res2);
+Value f16R2 = b.bitcast(i16R2, rewriter.getF16Type());
+Value fRes2 = b.fmul(f16R2, b.f16_val(16384.0));
+Value i16Res2 = b.bitcast(fRes2, i16_ty);
+Value i32Res2Lo = b.zext(i32_ty, i16Res2);
+
+Value sShift3 = b.shl(input, b.i32_val(16));
+Value s3 = b.and_(sShift3, b.i32_val(0x80000000));
+Value emShift3 = b.shl(input, b.i32_val(13));
+Value em3 = b.and_(emShift3, b.i32_val(0xE000000));
+Value res3 = b.or_(s3, em3);
+
+Value sres3 = b.lshr(res3, b.i32_val(16));
+Value i16R3 = b.trunc(i16_ty, sres3);
+Value f16R3 = b.bitcast(i16R3, rewriter.getF16Type());
+Value fRes3 = b.fmul(f16R3, b.f16_val(16384.0));
+Value i16Res3 = b.bitcast(fRes3, i16_ty);
+Value i32Res3 = b.zext(i32_ty, i16Res3);
+Value i32Res3Hi = b.shl(i32Res3, b.i32_val(16));
+
+
+//////////////////
+
+Value sShift4 = b.lshr(input, b.i32_val(4));
+Value s4 = b.and_(sShift4, b.i32_val(0x8000));
+Value emShift4 = b.lshr(input, b.i32_val(7));
+Value em4 = b.and_(emShift4, b.i32_val(0xE00));
+Value res4 = b.or_(s4, em4);
+
+Value i16R4 = b.trunc(i16_ty, res4);
+Value f16R4 = b.bitcast(i16R4, rewriter.getF16Type());
+Value fRes4 = b.fmul(f16R4, b.f16_val(16384.0));
+Value i16Res4 = b.bitcast(fRes4, i16_ty);
+Value i32Res4Lo = b.zext(i32_ty, i16Res4);
+
+Value sShift5 = b.shl(input, b.i32_val(8));
+Value s5 = b.and_(sShift5, b.i32_val(0x80000000));
+Value emShift5 = b.shl(input, b.i32_val(5));
+Value em5 = b.and_(emShift5, b.i32_val(0xE000000));
+Value res5 = b.or_(s5, em5);
+
+Value sres5 = b.lshr(res5, b.i32_val(16));
+Value i16R5 = b.trunc(i16_ty, sres5);
+Value f16R5 = b.bitcast(i16R5, rewriter.getF16Type());
+Value fRes5 = b.fmul(f16R5, b.f16_val(16384.0));
+Value i16Res5 = b.bitcast(fRes5, i16_ty);
+Value i32Res5 = b.zext(i32_ty, i16Res5);
+Value i32Res5Hi = b.shl(i32Res5, b.i32_val(16));
+
+Value sShift6 = b.lshr(input, b.i32_val(12));
+Value s6 = b.and_(sShift6, b.i32_val(0x8000));
+Value emShift6 = b.lshr(input, b.i32_val(15));
+Value em6 = b.and_(emShift6, b.i32_val(0xE00));
+Value res6 = b.or_(s6, em6);
+
+Value i16R6 = b.trunc(i16_ty, res6);
+Value f16R6 = b.bitcast(i16R6, rewriter.getF16Type());
+Value fRes6 = b.fmul(f16R6, b.f16_val(16384.0));
+Value i16Res6 = b.bitcast(fRes6, i16_ty);
+Value i32Res6Lo = b.zext(i32_ty, i16Res6);
+
+//Value sShift7 = b.shl(input, b.i32_val(16));
+Value s7 = b.and_(input, b.i32_val(0x80000000));
+Value emShift7 = b.lshr(input, b.i32_val(3));
+Value em7 = b.and_(emShift7, b.i32_val(0xE000000));
+Value res7 = b.or_(s7, em7);
+
+Value sres7 = b.lshr(res7, b.i32_val(16));
+Value i16R7 = b.trunc(i16_ty, sres7);
+Value f16R7 = b.bitcast(i16R7, rewriter.getF16Type());
+Value fRes7 = b.fmul(f16R7, b.f16_val(16384.0));
+Value i16Res7 = b.bitcast(fRes7, i16_ty);
+Value i32Res7 = b.zext(i32_ty, i16Res7);
+Value i32Res7Hi = b.shl(i32Res7, b.i32_val(16));
+
+/*
+Value res_10 = b.or_(res1, res0);
+Value res_32 = b.or_(res3, res2);
+Value res_54 = b.or_(res5, res4);
+Value res_76 = b.or_(res7, res6);
+*/
+
+Value res_10 = b.or_(i32Res0Lo, i32Res1Hi);
+Value res_32 = b.or_(i32Res2Lo, i32Res3Hi);
+Value res_54 = b.or_(i32Res4Lo, i32Res5Hi);
+Value res_76 = b.or_(i32Res6Lo, i32Res7Hi);
+
+#endif
+
+// scramb
+#if 0
+  Type i32Ty = rewriter.getI32Type();
+  // Start with 8 mxfp4 elements in a single i32 register
+  // | e7e6 | e5e4 | e3e2 | e1e0 |
+  Value input = b.bitcast(packedVec, i32Ty);
+  //Value input = b.i32_val(0x08D108D1);
+
+//  (x << 0) & 0b1000111000000000 
+//  (x << 3) & 0b1000111000000000
+// ((x << 2) & 0b1000000000000000) | ((x << 6) & 0b0000111000000000) 
+// ((x << 1) & 0b1000000000000000) | ((x << 9) & 0b0000111000000000) 
+
+  Value res0 = b.and_(input, b.i32_val(0x8E00));
+  Value shl3 = b.shl(input, b.i32_val(19));
+  Value res1 = b.and_(shl3, b.i32_val(0x8E000000));
+  
+  Value shl2 = b.shl(input, b.i32_val(2));
+  Value sign2 = b.and_(shl2, b.i32_val(0x8000));
+  Value shl6 = b.shl(input, b.i32_val(6));
+  Value exp2 = b.and_(shl6, b.i32_val(0xE00));
+  Value res2 = b.or_(sign2, exp2);
+
+  Value shl1 = b.shl(input, b.i32_val(17));
+  Value sign3 = b.and_(shl1, b.i32_val(0x80000000));
+  Value shl9 = b.shl(input, b.i32_val(25));
+  Value exp3 = b.and_(shl9, b.i32_val(0xE000000));
+  Value res3 = b.or_(sign3, exp3);
+
+//  (x << 0) & 0b1000111000000000 
+//  (x << 3) & 0b1000111000000000
+// ((x << 2) & 0b1000000000000000) | ((x << 6) & 0b0000111000000000) 
+// ((x << 1) & 0b1000000000000000) | ((x << 9) & 0b0000111000000000) 
+
+  Value shl0B = b.lshr(input, b.i32_val(16));
+  Value res4 = b.and_(shl0B, b.i32_val(0x8E00));
+  Value shl3B = b.shl(input, b.i32_val(3));
+  Value res5 = b.and_(shl3B, b.i32_val(0x8E000000));
+  
+  Value shl2B = b.lshr(input, b.i32_val(14));
+  Value sign6 = b.and_(shl2B, b.i32_val(0x8000));
+  Value shl6B = b.lshr(input, b.i32_val(10));
+  Value exp6 = b.and_(shl6B, b.i32_val(0xE00));
+  Value res6 = b.or_(sign6, exp6);
+
+  Value shl1B = b.shl(input, b.i32_val(1));
+  Value sign7 = b.and_(shl1B, b.i32_val(0x80000000));
+  Value shl9B = b.shl(input, b.i32_val(9));
+  Value exp7 = b.and_(shl9B, b.i32_val(0xE000000));
+  Value res7 = b.or_(sign7, exp7);
+
+  Value i16R0 = b.trunc(i16_ty, res0);
+  Value f16R0 = b.bitcast(i16R0, rewriter.getF16Type());
+  Value fRes0 = b.fmul(f16R0, b.f16_val(16384.0));
+  Value i16Res0 = b.bitcast(fRes0, i16_ty);
+  Value i32Res0Lo = b.zext(i32_ty, i16Res0);
+  
+  Value sres1 = b.lshr(res1, b.i32_val(16));
+  Value i16R1 = b.trunc(i16_ty, sres1);
+  Value f16R1 = b.bitcast(i16R1, rewriter.getF16Type());
+  Value fRes1 = b.fmul(f16R1, b.f16_val(16384.0));
+  Value i16Res1 = b.bitcast(fRes1, i16_ty);
+  Value i32Res1 = b.zext(i32_ty, i16Res1);
+  Value i32Res1Hi = b.shl(i32Res1, b.i32_val(16));
+  
+  
+  Value i16R2 = b.trunc(i16_ty, res2);
+  Value f16R2 = b.bitcast(i16R2, rewriter.getF16Type());
+  Value fRes2 = b.fmul(f16R2, b.f16_val(16384.0));
+  Value i16Res2 = b.bitcast(fRes2, i16_ty);
+  Value i32Res2Lo = b.zext(i32_ty, i16Res2);
+  
+  Value sres3 = b.lshr(res3, b.i32_val(16));
+  Value i16R3 = b.trunc(i16_ty, sres3);
+  Value f16R3 = b.bitcast(i16R3, rewriter.getF16Type());
+  Value fRes3 = b.fmul(f16R3, b.f16_val(16384.0));
+  Value i16Res3 = b.bitcast(fRes3, i16_ty);
+  Value i32Res3 = b.zext(i32_ty, i16Res3);
+  Value i32Res3Hi = b.shl(i32Res3, b.i32_val(16));
+  
+  
+  //////////////////
+  
+  Value i16R4 = b.trunc(i16_ty, res4);
+  Value f16R4 = b.bitcast(i16R4, rewriter.getF16Type());
+  Value fRes4 = b.fmul(f16R4, b.f16_val(16384.0));
+  Value i16Res4 = b.bitcast(fRes4, i16_ty);
+  Value i32Res4Lo = b.zext(i32_ty, i16Res4);
+  
+  Value sres5 = b.lshr(res5, b.i32_val(16));
+  Value i16R5 = b.trunc(i16_ty, sres5);
+  Value f16R5 = b.bitcast(i16R5, rewriter.getF16Type());
+  Value fRes5 = b.fmul(f16R5, b.f16_val(16384.0));
+  Value i16Res5 = b.bitcast(fRes5, i16_ty);
+  Value i32Res5 = b.zext(i32_ty, i16Res5);
+  Value i32Res5Hi = b.shl(i32Res5, b.i32_val(16));
+  
+  Value i16R6 = b.trunc(i16_ty, res6);
+  Value f16R6 = b.bitcast(i16R6, rewriter.getF16Type());
+  Value fRes6 = b.fmul(f16R6, b.f16_val(16384.0));
+  Value i16Res6 = b.bitcast(fRes6, i16_ty);
+  Value i32Res6Lo = b.zext(i32_ty, i16Res6);
+  
+  Value sres7 = b.lshr(res7, b.i32_val(16));
+  Value i16R7 = b.trunc(i16_ty, sres7);
+  Value f16R7 = b.bitcast(i16R7, rewriter.getF16Type());
+  Value fRes7 = b.fmul(f16R7, b.f16_val(16384.0));
+  Value i16Res7 = b.bitcast(fRes7, i16_ty);
+  Value i32Res7 = b.zext(i32_ty, i16Res7);
+  Value i32Res7Hi = b.shl(i32Res7, b.i32_val(16));
+  
+  /*
+  Value res_10 = b.or_(i32Res0Lo, i32Res1Hi);
+  Value res_32 = b.or_(i32Res2Lo, i32Res3Hi);
+  Value res_54 = b.or_(i32Res4Lo, i32Res5Hi);
+  Value res_76 = b.or_(i32Res6Lo, i32Res7Hi);
+*/
+  
+  Value res_10 = b.or_(res1, res0);
+  Value res_32 = b.or_(res3, res2);
+  Value res_54 = b.or_(res5, res4);
+  Value res_76 = b.or_(res7, res6);
+
+
+#endif
+
+// scramb vec2
+#if 1
+  Type i32Ty = rewriter.getI32Type();
+  // Start with 8 mxfp4 elements in a single i32 register
+  // | e7e6 | e5e4 | e3e2 | e1e0 |
+  Value input = b.bitcast(packedVec, i32Ty);
+  //Value input = b.i32_val(0x08D108D1);
+
+//  (x << 0) & 0b1000111000000000 
+//  (x << 3) & 0b1000111000000000
+// ((x << 2) & 0b1000000000000000) | ((x << 6) & 0b0000111000000000) 
+// ((x << 1) & 0b1000000000000000) | ((x << 9) & 0b0000111000000000) 
+
+
+  //res40  
+  Value res40 = b.and_(input, b.i32_val(0x8E008E00));
+
+  Value shl3 = b.shl(input, b.i32_val(3));
+  Value res51 = b.and_(shl3, b.i32_val(0x8E008E00));
+  
+  Value shl2 = b.shl(input, b.i32_val(2));
+  Value sign2 = b.and_(shl2, b.i32_val(0x80008000));
+  Value shl6 = b.shl(input, b.i32_val(6));
+  Value exp2 = b.and_(shl6, b.i32_val(0x0E000E00));
+  Value res62 = b.or_(sign2, exp2);
+
+  Value shl1 = b.shl(input, b.i32_val(1));
+  Value sign3 = b.and_(shl1, b.i32_val(0x80008000));
+  Value shl9 = b.shl(input, b.i32_val(9));
+  Value exp3 = b.and_(shl9, b.i32_val(0x0E000E00));
+  Value res73 = b.or_(sign3, exp3);
+
+/*
+// 40 51 62 73  
+Value i32Res0Lo = b.and_(res40, b.i32_val(0xFFFF));
+
+Value i32Res1 = b.shl(res51, b.i32_val(16));
+Value i32Res1Hi = b.and_(i32Res1, b.i32_val(0xFFFF0000));
+
+Value i32Res2Lo = b.and_(res62, b.i32_val(0xFFFF));
+
+Value i32Res3 = b.shl(res73, b.i32_val(16));
+Value i32Res3Hi = b.and_(i32Res3, b.i32_val(0xFFFF0000));
+
+Value i32Res4 = b.lshr(res40, b.i32_val(16));
+Value i32Res4Lo = b.and_(i32Res4, b.i32_val(0xFFFF));
+
+Value i32Res5Hi = b.and_(res51, b.i32_val(0xFFFF0000));
+
+Value i32Res6 = b.lshr(res62, b.i32_val(16));
+Value i32Res6Lo = b.and_(i32Res6, b.i32_val(0xFFFF));
+
+Value i32Res7Hi = b.and_(res73, b.i32_val(0xFFFF0000));
+
+Value res_10 = b.or_(i32Res0Lo, i32Res1Hi);
+Value res_32 = b.or_(i32Res2Lo, i32Res3Hi);
+Value res_54 = b.or_(i32Res4Lo, i32Res5Hi);
+Value res_76 = b.or_(i32Res6Lo, i32Res7Hi);
+*/
+
+
+  // 40 51 62 73  
+  Value i16R0 = b.trunc(i16_ty, res40);
+  Value f16R0 = b.bitcast(i16R0, rewriter.getF16Type());
+  Value fRes0 = b.fmul(f16R0, b.f16_val(16384.0));
+  Value i16Res0 = b.bitcast(fRes0, i16_ty);
+  Value i32Res0Lo = b.zext(i32_ty, i16Res0);
+
+  Value i16R1 = b.trunc(i16_ty, res51);
+  Value f16R1 = b.bitcast(i16R1, rewriter.getF16Type());
+  Value fRes1 = b.fmul(f16R1, b.f16_val(16384.0));
+  Value i16Res1 = b.bitcast(fRes1, i16_ty);
+  Value i32Res1 = b.zext(i32_ty, i16Res1);
+  Value i32Res1Hi = b.shl(i32Res1, b.i32_val(16));
+  
+  
+  Value i16R2 = b.trunc(i16_ty, res62);
+  Value f16R2 = b.bitcast(i16R2, rewriter.getF16Type());
+  Value fRes2 = b.fmul(f16R2, b.f16_val(16384.0));
+  Value i16Res2 = b.bitcast(fRes2, i16_ty);
+  Value i32Res2Lo = b.zext(i32_ty, i16Res2);
+  
+  Value i16R3 = b.trunc(i16_ty, res73);
+  Value f16R3 = b.bitcast(i16R3, rewriter.getF16Type());
+  Value fRes3 = b.fmul(f16R3, b.f16_val(16384.0));
+  Value i16Res3 = b.bitcast(fRes3, i16_ty);
+  Value i32Res3 = b.zext(i32_ty, i16Res3);
+  Value i32Res3Hi = b.shl(i32Res3, b.i32_val(16));
+  
+  
+  //////////////////
+  
+  // 40 51 62 73 
+  Value sres4 = b.lshr(res40, b.i32_val(16));
+  Value i16R4 = b.trunc(i16_ty, sres4);
+  Value f16R4 = b.bitcast(i16R4, rewriter.getF16Type());
+  Value fRes4 = b.fmul(f16R4, b.f16_val(16384.0));
+  Value i16Res4 = b.bitcast(fRes4, i16_ty);
+  Value i32Res4Lo = b.zext(i32_ty, i16Res4);
+  
+  Value sres5 = b.lshr(res51, b.i32_val(16));
+  Value i16R5 = b.trunc(i16_ty, sres5);
+  Value f16R5 = b.bitcast(i16R5, rewriter.getF16Type());
+  Value fRes5 = b.fmul(f16R5, b.f16_val(16384.0));
+  Value i16Res5 = b.bitcast(fRes5, i16_ty);
+  Value i32Res5 = b.zext(i32_ty, i16Res5);
+  Value i32Res5Hi = b.shl(i32Res5, b.i32_val(16));
+  
+  Value sres6 = b.lshr(res62, b.i32_val(16));
+  Value i16R6 = b.trunc(i16_ty, sres6);
+  Value f16R6 = b.bitcast(i16R6, rewriter.getF16Type());
+  Value fRes6 = b.fmul(f16R6, b.f16_val(16384.0));
+  Value i16Res6 = b.bitcast(fRes6, i16_ty);
+  Value i32Res6Lo = b.zext(i32_ty, i16Res6);
+  
+  Value sres7 = b.lshr(res73, b.i32_val(16));
+  Value i16R7 = b.trunc(i16_ty, sres7);
+  Value f16R7 = b.bitcast(i16R7, rewriter.getF16Type());
+  Value fRes7 = b.fmul(f16R7, b.f16_val(16384.0));
+  Value i16Res7 = b.bitcast(fRes7, i16_ty);
+  Value i32Res7 = b.zext(i32_ty, i16Res7);
+  Value i32Res7Hi = b.shl(i32Res7, b.i32_val(16));
+  
+  
+  Value res_10 = b.or_(i32Res0Lo, i32Res1Hi);
+  Value res_32 = b.or_(i32Res2Lo, i32Res3Hi);
+  Value res_54 = b.or_(i32Res4Lo, i32Res5Hi);
+  Value res_76 = b.or_(i32Res6Lo, i32Res7Hi);
+
+  
+#endif
+
+
+// original
+#if 0
   Value resB0LutLo = tofp16 ? b.i32_val(0) : b.i32_val(0xc0800000);
   Value resB0LutHi = tofp16 ? b.i32_val(0) : b.i32_val(0xc0804000);
   // Encode Byte #1 (EM, non-S part) for BF16/FP16 in a LUT.
@@ -158,6 +691,7 @@ SmallVector<Value, 4> upcast8xMxfp4(RewriterBase &rewriter,
   Value res_76 = LLVM::createLLVMCallOp(rewriter, loc, funcOp,
                                         {res_75, res_64, b.i32_val(0x07060302)})
                      .getResult();
+#endif
 
   return {res_10, res_32, res_54, res_76};
 }
