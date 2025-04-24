@@ -574,54 +574,24 @@ LogicalResult Pingponger::transformFourPPClusters(OpBuilder &builder,
 // cluster scheduling.
 LogicalResult Pingponger::transformTwoPPClusters(OpBuilder &builder,
                                                  Location loc) {
-  // First, slice local_loads and dot into 2 parts
-  if (sliceDot(builder, loc, dotOps[0], 2).failed())
-    return failure();
-  builder.setInsertionPointAfter(gLoadOps[1]);
-  // Reorder operations into two mem/dot clusters
+  builder.setInsertionPointAfter(gLoadOps[0]);
+  auto d0 = dotOps[0]->getPrevNode();
+  updateOpInsertion(gLoadOps[0]);
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+  appendOp(builder.create<ROCDL::SetPrioOp>(loc, 3));
+  //updateOpInsertion(d0);
+  updateOpInsertion(dotOps[0]);
+  appendOp(builder.create<ROCDL::SetPrioOp>(loc, 1));
 
-  // Memory cluster #0
-  // interleave local_loads and global_loads to minimize the stalling
-  // cycles, sched.barrier prevents backend from canceling the interleaved order
+
   updateOpInsertion(gLoadOps[1]);
-  appendSlicedLoadAB(/*slice=*/0);
   appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
-  appendOp(gLoadOps[0]);
-  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
-  appendSlicedLoadAB(/*slice=*/1);
-  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
-  appendOp(gLoadOps[1]);
-  // The first cluster just fits into the two cluster pingpong and cannot
-  // include wait of the local_load inserted by the gpu.barrier, using s.barrier
-  // instead. backend will schedule the local memory fences later in the dot0
-  // cluster.
-  appendOp(builder.create<ROCDL::SBarrierOp>(loc));
-  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+  appendOp(builder.create<ROCDL::SetPrioOp>(loc, 2));
+  auto d1 = dotOps[1]->getPrevNode();
+  //updateOpInsertion(d1);
+  updateOpInsertion(dotOps[1]);
+  appendOp(builder.create<ROCDL::SetPrioOp>(loc, 0));
 
-  // dot0 (1/2)
-  appendOpWithPrio(builder, dotSliceOps[0], loc);
-  appendClusterBarrier(builder, loc);
-
-  // mem1: local store A and B
-  // Matmul kernels may use the output of the dot product in another operation
-  // before the local store (e.g. persistent matmul epilogue). To accommodate
-  // such cases, we need to move the local store up in the loop.
-  moveOpAndPredecessorsUpSameBlock(lStoreOps[0]);
-  moveOpAndPredecessorsUpSameBlock(lStoreOps[1]);
-  appendClusterBarrier(builder, loc);
-
-  // dot1 (2/2)
-  appendOpWithPrio(builder, dotSliceOps[1], loc);
-
-  // Move the cluster barrier to the end of the main loop.
-  // This helps ensure that with persistent GEMMs the epilogue
-  // and prologue aren't grouped into the same long cluster.
-  updateOpInsertion(lastInsertedOp->getBlock()->getTerminator());
-  prependClusterBarrier(builder, loc);
-
-  // Add a remark for user feedback
-  dotSliceOps[0]->emitRemark()
-      << "Performed two ping pong cluster transformation\n";
   return success();
 }
 
@@ -688,12 +658,8 @@ void Pingponger::getDotPingponged() {
         dotOps.push_back(pingpongDot);
   });
 
-  // Currently, pingpong scheduling is known as helpful under limited condition.
-  // Individual conditions are checked while collecting each operation such as
-  // software pipelining and dot rank=2. Also only accept the for-loop with
-  // supported combination of operations because this transformation is very
-  // tightly scheduling the latencies.
-  if (gLoadOps.size() < 2 || lLoadOps.size() < 2 || dotOps.size() != 1) {
+
+  if (gLoadOps.size() < 2 || dotOps.size() != 2) {
     std::stringstream message;
     message << "Unable to match ping pong scheduling pattern. Details: "
             << gLoadOps.size() << " global loads, " << lLoadOps.size()
@@ -701,6 +667,19 @@ void Pingponger::getDotPingponged() {
     LDBG(message.str());
     return;
   }
+  // Experimental FA pingpong
+  if (transformTwoPPClusters(builder, dotOps[0]->getLoc()).failed()) {
+    LDBG("Encountered failure when trying to execute the two ping pong "
+         "cluster transformation");
+    return;
+  }
+  return;
+
+  // Currently, pingpong scheduling is known as helpful under limited condition.
+  // Individual conditions are checked while collecting each operation such as
+  // software pipelining and dot rank=2. Also only accept the for-loop with
+  // supported combination of operations because this transformation is very
+  // tightly scheduling the latencies.
 
   // Determine if we have a persistent GEMM. This will decide how we interpret
   // any memory operations that we find in conditionals.
