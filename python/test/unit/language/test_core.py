@@ -4185,7 +4185,7 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
 
 @pytest.mark.parametrize("M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, num_warps, mma, kpack",
                          [(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, 4, mma, kpack)
-                          for M, N, K in itertools.product([32, 64, 128], [32, 64, 128], [64, 128])
+                          for M, N, K in itertools.product([32, 64, 128], [32, 64, 128], [64, 128, 256])
                           for col_a, col_b in itertools.product([True, False], repeat=2)
                           for rhs_scale in [False, True]
                           for mxfp_type in ["e2m1", "e4m3", "e5m2"]
@@ -4220,7 +4220,9 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
                                                                                          BLOCK_N)[None, :] * stride_b1
 
         a = tl.load(a_ptr)
+        a0, a1 = a.reshape(BLOCK_M, 2, PACKED_BLOCK_K_A // 2).trans(0, 2, 1).split()
         b = tl.load(b_ptr)
+        b0, b1 = b.reshape(2, PACKED_BLOCK_K_B // 2, BLOCK_N).trans(1, 2, 0).split()
         SCALE_BLOCK_K: tl.constexpr = BLOCK_K // 32
         if a_scale is not None:
             scale_a_ptr = a_scale + tl.arange(0, BLOCK_M)[:, None] * SCALE_BLOCK_K + tl.arange(0,
@@ -4230,7 +4232,10 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
             scale_b_ptr = b_scale + tl.arange(0, BLOCK_N)[:, None] * SCALE_BLOCK_K + tl.arange(0,
                                                                                                SCALE_BLOCK_K)[None, :]
             b_scale = tl.load(scale_b_ptr)
-        c = tl.dot_scaled(a, a_scale, type_a, b, b_scale, type_b)
+            bs0, bs1 = b_scale.reshape(BLOCK_N, 2, SCALE_BLOCK_K // 2).trans(0, 2, 1).split()
+        c0 = tl.dot_scaled(a0, None, type_a, b0, bs0, type_b)
+        c1 = tl.dot_scaled(a1, None, type_a, b1, bs1, type_b)
+        c = c0 + c1
         out_ptr = out + tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
         tl.store(out_ptr, c.to(tl.bfloat16))
 
