@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .._core import builtin, _unwrap_if_constexpr
 
 
 class warp_pipeline_stage:
@@ -71,3 +72,14 @@ class warp_pipeline_stage:
         prio = self.priority if self.priority is not None else -1
         self._semantic.builder.create_warp_pipeline_border(marker, prio)
         return False
+
+
+@builtin
+def sched_barrier(mask, _semantic = None):
+    """
+    sched_barrier to help instruction scheduling
+    Args:
+        mask (i32): mask for the types of instructions that may be allowed to cross the SCHED_BARRIER during scheduling
+    """
+    mask = _unwrap_if_constexpr(mask)
+    _semantic.builder.create_sched_barrier(mask)
