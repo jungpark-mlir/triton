@@ -365,6 +365,15 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     insertBarrier(op, builder);
     blockInfo->sync();
   }
+  // Async writes (DMA to shared memory) are in-flight and cannot be made
+  // visible by a thread-level barrier — only an explicit wait can do that.
+  // The write was available in curBlockInfo for WAR/WAW detection above
+  // (isIntersected runs before this point).  Clear it now so it doesn't
+  // propagate into blockInfo where it would cause false RAW/WAW against
+  // subsequent ops.
+  if (op->hasTrait<OpTrait::MemAsyncWriteOpTrait>())
+    curBlockInfo.syncWriteSlices.clear();
+
   // Update the region info, even if barrier is inserted, we have to maintain
   // the current op's read/write buffers.
   blockInfo->join(curBlockInfo);
