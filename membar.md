@@ -10,8 +10,6 @@ In a warp-pipelined GEMM kernel with triple-buffered shared memory, the loop bod
 
 ```
 scf.for ... {
-    ttg.barrier local                          // user-placed barrier
-
     scf.execute_region {                       // stage0
         async_tdm_copy → a_buffer[prod%3]      // async Write to shared memory
         async_tdm_copy → b_buffer[prod%3]      // async Write to shared memory
@@ -28,7 +26,7 @@ scf.for ... {
 }
 ```
 
-The membar analysis inserts an extra `ttg.barrier local` between the `async_tdm_copy` ops and the `local_load` ops inside stage0. This barrier is unnecessary because:
+The `MemWaitOpTrait` on `async_tdm_wait` already causes the membar analysis to auto-insert a `ttg.barrier local` after the wait, which provides cross-iteration synchronization. Yet the analysis **also** inserts a spurious `ttg.barrier local` between the `async_tdm_copy` ops and the `local_load` ops inside stage0. This barrier is unnecessary because:
 
 1. The async DMA write has **not completed yet** — the data written by `async_tdm_copy` is not visible until after `async_tdm_wait` + barrier. There is no RAW (Read After Write) hazard.
 2. The producer and consumer access **different slots** of the triple buffer (`prod%3 != cons%3`). They never alias.
@@ -81,7 +79,7 @@ blockInfo->join(curBlockInfo);
 
 - **Eventual RAW handled by MemWaitOpTrait**: The `async_tdm_wait` op has `MemWaitOpTrait`, which causes the membar analysis to auto-insert a `ttg.barrier local` after it and sync all state. This ensures the async write is visible before anything downstream of the wait reads the data.
 
-- **Works without a manual barrier at the top**: If there is no user-placed barrier, the `local_load` reads still accumulate in `blockInfo.syncReadSlices`. On the loop back-edge, these reads flow to the next iteration. When the `async_tdm_copy` fires, `isIntersected` detects the WAR and auto-inserts a barrier. If a `MemWaitOpTrait` auto-barrier already provides this fence, the back-edge state is empty and no extra barrier is needed.
+- **Cross-iteration WAR is correctly handled**: The `MemWaitOpTrait` auto-barrier after `async_tdm_wait` syncs all state, so the back-edge carries empty `blockInfo` to the next iteration. The WAR between a prior iteration's `local_load` and the current iteration's `async_tdm_copy` is already fenced by that auto-barrier. If the auto-barrier were absent (e.g., no wait in the loop), the `local_load` reads would accumulate in `blockInfo.syncReadSlices`, flow via the back-edge, and `isIntersected` would correctly detect the WAR when the next `async_tdm_copy` fires — auto-inserting a barrier exactly where needed.
 
 ### Long-term: Proper async dependency tracking in BlockInfo
 
