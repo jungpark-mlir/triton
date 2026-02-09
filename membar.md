@@ -53,7 +53,9 @@ Two independent analysis limitations contribute:
 
 ### Near-term fix: Clear async writes before join
 
-**Concept**: Keep `MemWrite<SharedMemory>` on the async op (so WAR is still detected), but prevent the write from propagating into `blockInfo.syncWriteSlices` (so it doesn't trigger false RAW with subsequent reads).
+**Concept**: Keep `MemWrite<SharedMemory>` on the async op so that `isIntersected` still detects hazards where the async write is the *current* op (WAR and WAW against prior state). But prevent the write from propagating into `blockInfo.syncWriteSlices`, so it doesn't trigger false hazards where the async write is a *prior* op (RAW or WAW from subsequent ops).
+
+This is correct because a `ttg.barrier local` is a thread-level shared memory fence. It synchronizes accesses made by threads (`local_store`/`local_load`), not in-flight DMA operations. An async DMA write that hasn't completed cannot be made visible by a barrier — only `async_tdm_wait` can do that. Therefore, an async write that is still in-flight should not appear as a prior write in `blockInfo`, since no barrier the analysis could insert would resolve a hazard against it.
 
 **Implementation**:
 
@@ -62,24 +64,35 @@ Two independent analysis limitations contribute:
 2. In `Membar.cpp:update()`, after `isIntersected` but before `blockInfo->join(curBlockInfo)`:
 
 ```cpp
-// Async writes aren't visible yet — keep for WAR detection (already
-// checked by isIntersected above) but don't propagate into blockInfo
-// where they would cause false RAW with subsequent reads.
+// Async writes aren't visible yet and cannot be made visible by a
+// barrier — only by an explicit wait. Keep the write in curBlockInfo
+// for hazard detection against prior state (WAR, WAW checked by
+// isIntersected above), but don't propagate it into blockInfo where
+// it would cause false positives against subsequent ops.
 if (op->hasTrait<OpTrait::MemAsyncWriteOpTrait>())
     curBlockInfo.syncWriteSlices.clear();
 
 blockInfo->join(curBlockInfo);
 ```
 
-**Why this is correct**:
+**Hazard analysis**:
 
-- **WAR preserved**: `isIntersected(blockInfo, curBlockInfo)` runs *before* the clear. If a prior `local_load` read from the same buffer, the async write's entry in `curBlockInfo.syncWriteSlices` intersects with `blockInfo.syncReadSlices` → WAR detected → barrier inserted. This is correct: we must ensure prior reads complete before overwriting.
+The `isIntersected` check covers three hazards. The async write's `curBlockInfo.syncWriteSlices` is populated when `isIntersected` runs (before the clear), so all three checks fire correctly for the async write as a *current* op:
 
-- **False RAW eliminated**: After clearing, the async write doesn't enter `blockInfo.syncWriteSlices`. When a subsequent `local_load` is processed, there's no pending write to intersect with → no barrier.
+| Hazard | Check | Detected? | Correct? |
+|--------|-------|-----------|----------|
+| **WAR** — async write vs prior read | `curBlockInfo.syncWriteSlices` vs `blockInfo.syncReadSlices` | Yes (before clear) | Yes — prior reads must complete before DMA overwrites the location |
+| **WAW** — async write vs prior sync write | `curBlockInfo.syncWriteSlices` vs `blockInfo.syncWriteSlices` | Yes (before clear) | Yes — prior sync write must be visible before DMA starts |
+| **RAW** — async write as prior, subsequent read | `blockInfo.syncWriteSlices` (would contain async write) vs future `curBlockInfo.syncReadSlices` | No (cleared) | Correct — DMA write is not visible yet; barrier can't help |
+| **WAW** — async write as prior, subsequent write | `blockInfo.syncWriteSlices` (would contain async write) vs future `curBlockInfo.syncWriteSlices` | No (cleared) | Correct — barrier can't order a thread write against an in-flight DMA write; `async_tdm_wait` is needed |
 
-- **Eventual RAW handled by MemWaitOpTrait**: The `async_tdm_wait` op has `MemWaitOpTrait`, which causes the membar analysis to auto-insert a `ttg.barrier local` after it and sync all state. This ensures the async write is visible before anything downstream of the wait reads the data.
+After the clear, the async write does not enter `blockInfo.syncWriteSlices`. Subsequent ops see no pending write from it. The eventual visibility of the async write is handled by `MemWaitOpTrait` on `async_tdm_wait`, which auto-inserts a barrier and syncs all state.
 
-- **Cross-iteration WAR is correctly handled**: The `MemWaitOpTrait` auto-barrier after `async_tdm_wait` syncs all state, so the back-edge carries empty `blockInfo` to the next iteration. The WAR between a prior iteration's `local_load` and the current iteration's `async_tdm_copy` is already fenced by that auto-barrier. If the auto-barrier were absent (e.g., no wait in the loop), the `local_load` reads would accumulate in `blockInfo.syncReadSlices`, flow via the back-edge, and `isIntersected` would correctly detect the WAR when the next `async_tdm_copy` fires — auto-inserting a barrier exactly where needed.
+**Cross-iteration correctness**:
+
+The `MemWaitOpTrait` auto-barrier after `async_tdm_wait` syncs all state, so the back-edge carries empty `blockInfo` to the next iteration. The WAR between a prior iteration's `local_load` and the current iteration's `async_tdm_copy` is already fenced by that auto-barrier.
+
+If the auto-barrier were absent (e.g., no wait in the loop), the `local_load` reads would accumulate in `blockInfo.syncReadSlices`, flow via the back-edge, and `isIntersected` would correctly detect the WAR when the next `async_tdm_copy` fires — auto-inserting a barrier exactly where needed.
 
 ### Long-term: Proper async dependency tracking in BlockInfo
 
@@ -87,9 +100,9 @@ blockInfo->join(curBlockInfo);
 
 ```
 BlockInfo:
-    syncWriteSlices   — committed writes (trigger RAW with subsequent reads)
+    syncWriteSlices   — committed writes (trigger RAW and WAW with subsequent ops)
     syncReadSlices    — reads (trigger WAR with subsequent writes)
-    asyncWriteSlices  — in-flight writes (trigger WAR only, NOT RAW)
+    asyncWriteSlices  — in-flight writes (trigger WAR and WAW as current op only)
 ```
 
 **Rules**:
@@ -99,7 +112,11 @@ BlockInfo:
 | Read            | `syncWriteSlices` (committed)  | RAW    | Yes      |
 | Read            | `asyncWriteSlices` (in-flight) | —      | No       |
 | Write (sync)    | `syncReadSlices`               | WAR    | Yes      |
+| Write (sync)    | `syncWriteSlices` (committed)  | WAW    | Yes      |
+| Write (sync)    | `asyncWriteSlices` (in-flight) | —      | No (barrier can't help) |
 | Write (async)   | `syncReadSlices`               | WAR    | Yes      |
+| Write (async)   | `syncWriteSlices` (committed)  | WAW    | Yes      |
+| Write (async)   | `asyncWriteSlices` (in-flight) | —      | No (DMA ordering) |
 
 **Transitions**:
 - **Async copy** → adds entry to `asyncWriteSlices`
@@ -110,7 +127,7 @@ For count-based waits (`async_tdm_wait {num = N}`), promotion rule: all entries 
 
 **Advantages over the near-term fix**:
 - Correct by construction; no post-hoc clearing
-- Eliminates the `MemWaitOpTrait` auto-barrier heuristic entirely; the wait promotes async writes and normal RAW/WAR logic decides if a barrier is needed
+- Eliminates the `MemWaitOpTrait` auto-barrier heuristic entirely; the wait promotes async writes and normal RAW/WAR/WAW logic decides if a barrier is needed
 - Composes with multiple async streams and partial waits
 - General: works for AMD TDM, NVIDIA TMA, `ttg.async_copy_global_to_local`, future async ops
 
