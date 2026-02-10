@@ -51,48 +51,50 @@ Two independent analysis limitations contribute:
 
 ## Proposed Solutions
 
-### Near-term fix: Clear async writes before join
+### Near-term fix: Backend filter using `MemAsyncWriteOpTrait`
 
-**Concept**: Keep `MemWrite<SharedMemory>` on the async op so that `isIntersected` still detects hazards where the async write is the *current* op (WAR and WAW against prior state). But prevent the write from propagating into `blockInfo.syncWriteSlices`, so it doesn't trigger false hazards where the async write is a *prior* op (RAW or WAW from subsequent ops).
-
-This is correct because a `ttg.barrier local` is a thread-level shared memory fence. It synchronizes accesses made by threads (`local_store`/`local_load`), not in-flight DMA operations. An async DMA write that hasn't completed cannot be made visible by a barrier — only `async_tdm_wait` can do that. Therefore, an async write that is still in-flight should not appear as a prior write in `blockInfo`, since no barrier the analysis could insert would resolve a hazard against it.
+**Concept**: A `ttg.barrier local` emits `s_barrier`, which synchronizes all threads in the workgroup and fences shared memory. However, it does not synchronize the DMA engine — async DMA writes are in-flight until an explicit wait (`async_tdm_wait`) completes them. Therefore, hazard pairs involving async writes should be filtered out of the membar analysis.
 
 **Implementation**:
 
-1. Add a trait (e.g., `MemAsyncWriteOpTrait`) to `AsyncTDMCopyGlobalToLocalOp` and similar async-to-shared-memory ops.
+1. Define `MemAsyncWriteOpTrait` in `include/triton/Dialect/TritonGPU/IR/Traits.h` and register it in `TritonGPUAttrBase.td`.
 
-2. In `Membar.cpp:update()`, after `isIntersected` but before `blockInfo->join(curBlockInfo)`:
+2. Add the trait to all async-to-shared-memory ops (see [Affected Ops](#affected-ops)).
+
+3. In the AMD backend filter (`MembarUtility.cpp`), use the trait to suppress false hazard pairs:
 
 ```cpp
-// Async writes aren't visible yet and cannot be made visible by a
-// barrier — only by an explicit wait. Keep the write in curBlockInfo
-// for hazard detection against prior state (WAR, WAW checked by
-// isIntersected above), but don't propagate it into blockInfo where
-// it would cause false positives against subsequent ops.
-if (op->hasTrait<OpTrait::MemAsyncWriteOpTrait>())
-    curBlockInfo.syncWriteSlices.clear();
+bool isAsyncWrite(Operation *op) {
+  return op->hasTrait<OpTrait::MemAsyncWriteOpTrait>();
+}
 
-blockInfo->join(curBlockInfo);
+bool filterAsyncWriteDependencies(Operation *op1, Operation *op2) {
+  bool op1Async = isAsyncWrite(op1);
+  bool op2Async = isAsyncWrite(op2);
+  if (op1Async && op2Async)
+    return true;   // WAW between two DMA ops — barrier can't help
+  if (!op1Async && !op2Async)
+    return false;   // neither async — don't filter
+  // One async, one not — filter if the non-async side is a LocalLoad
+  // synced via AsyncWait (the wait already provides ordering).
+  return isLocalLoadSyncedViaWait(op1) || isLocalLoadSyncedViaWait(op2);
+}
 ```
+
+The core `Membar.cpp` is unchanged. The filter is passed into `isIntersected()` via the existing `MembarFilterFn` mechanism, so it only applies to backends that register it.
 
 **Hazard analysis**:
 
-The `isIntersected` check covers three hazards. The async write's `curBlockInfo.syncWriteSlices` is populated when `isIntersected` runs (before the clear), so all three checks fire correctly for the async write as a *current* op:
-
-| Hazard | Check | Detected? | Correct? |
-|--------|-------|-----------|----------|
-| **WAR** — async write vs prior read | `curBlockInfo.syncWriteSlices` vs `blockInfo.syncReadSlices` | Yes (before clear) | Yes — prior reads must complete before DMA overwrites the location |
-| **WAW** — async write vs prior sync write | `curBlockInfo.syncWriteSlices` vs `blockInfo.syncWriteSlices` | Yes (before clear) | Yes — prior sync write must be visible before DMA starts |
-| **RAW** — async write as prior, subsequent read | `blockInfo.syncWriteSlices` (would contain async write) vs future `curBlockInfo.syncReadSlices` | No (cleared) | Correct — DMA write is not visible yet; barrier can't help |
-| **WAW** — async write as prior, subsequent write | `blockInfo.syncWriteSlices` (would contain async write) vs future `curBlockInfo.syncWriteSlices` | No (cleared) | Correct — barrier can't order a thread write against an in-flight DMA write; `async_tdm_wait` is needed |
-
-After the clear, the async write does not enter `blockInfo.syncWriteSlices`. Subsequent ops see no pending write from it. The eventual visibility of the async write is handled by `MemWaitOpTrait` on `async_tdm_wait`, which auto-inserts a barrier and syncs all state.
+| Pair | Hazard | Filtered? | Correct? |
+|------|--------|-----------|----------|
+| async write vs async write | WAW | Yes | Barrier can't order two DMA ops |
+| async write vs local_load (synced via wait) | RAW | Yes | Wait already ensures visibility |
+| local_load (synced via wait) vs async write | WAR | Yes | Wait + auto-barrier already fences the read |
+| async write vs non-synced op | any | No | Conservative — correct |
 
 **Cross-iteration correctness**:
 
-The `MemWaitOpTrait` auto-barrier after `async_tdm_wait` syncs all state, so the back-edge carries empty `blockInfo` to the next iteration. The WAR between a prior iteration's `local_load` and the current iteration's `async_tdm_copy` is already fenced by that auto-barrier.
-
-If the auto-barrier were absent (e.g., no wait in the loop), the `local_load` reads would accumulate in `blockInfo.syncReadSlices`, flow via the back-edge, and `isIntersected` would correctly detect the WAR when the next `async_tdm_copy` fires — auto-inserting a barrier exactly where needed.
+The `MemWaitOpTrait` auto-barrier after `async_tdm_wait` syncs all state, so the back-edge carries empty `blockInfo` to the next iteration. If the auto-barrier were absent, reads would accumulate in `blockInfo.syncReadSlices`, flow via the back-edge, and `isIntersected` would correctly detect the WAR — inserting a barrier exactly where needed.
 
 ### Long-term: Proper async dependency tracking in BlockInfo
 
@@ -126,10 +128,10 @@ BlockInfo:
 For count-based waits (`async_tdm_wait {num = N}`), promotion rule: all entries except the N most recent are promoted. This requires `asyncWriteSlices` to be ordered.
 
 **Advantages over the near-term fix**:
-- Correct by construction; no post-hoc clearing
-- Eliminates the `MemWaitOpTrait` auto-barrier heuristic entirely; the wait promotes async writes and normal RAW/WAR/WAW logic decides if a barrier is needed
+- Correct by construction; async writes live in their own container rather than being filtered after the fact
+- Eliminates the `MemWaitOpTrait` auto-barrier heuristic; the wait promotes async writes and normal RAW/WAR/WAW logic decides if a barrier is needed
 - Composes with multiple async streams and partial waits
-- General: works for AMD TDM, NVIDIA TMA, `ttg.async_copy_global_to_local`, future async ops
+- Backend-agnostic: works for AMD TDM, NVIDIA TMA, `ttg.async_copy_global_to_local`, future async ops without per-backend filters
 
 ---
 
@@ -150,12 +152,19 @@ Better offset tracking would independently help a **different class** of false p
 
 ## Affected Ops
 
-Async-to-shared-memory ops that would benefit from the `MemAsyncWriteOpTrait`:
+Ops carrying `MemAsyncWriteOpTrait`:
 
-| Op | Dialect | Currently has |
-|----|---------|---------------|
-| `AsyncTDMCopyGlobalToLocalOp` | TritonAMDGPU | `MemWrite<SharedMemory>` on `$result` |
-| `AsyncTDMGatherOp` | TritonAMDGPU | `MemWrite<SharedMemory>` on `$dst` |
-| `AsyncCopyGlobalToLocalOp` | TritonGPU | `MemWrite<SharedMemory>` on `$result` |
-| `AsyncTMACopyGlobalToLocalOp` | TritonNvidiaGPU | `MemWrite<SharedMemory>` on `$result` |
-| `AsyncTMAGatherOp` | TritonNvidiaGPU | `MemWrite<SharedMemory>` on `$result` |
+| Op | Dialect |
+|----|---------|
+| `AsyncCopyGlobalToLocalOp` | TritonGPU |
+| `BufferLoadToLocalOp` | TritonAMDGPU |
+| `AsyncTDMCopyGlobalToLocalOp` | TritonAMDGPU |
+| `AsyncTDMCopyLocalToGlobalOp` | TritonAMDGPU |
+| `AsyncTDMGatherOp` | TritonAMDGPU |
+
+Candidates not yet carrying the trait:
+
+| Op | Dialect |
+|----|---------|
+| `AsyncTMACopyGlobalToLocalOp` | TritonNvidiaGPU |
+| `AsyncTMAGatherOp` | TritonNvidiaGPU |

@@ -335,6 +335,7 @@ def BufferLoadOp : TT_AMDGPU_Op<"buffer_load", [
 
 def BufferLoadToLocalOp : TT_AMDGPU_Op<"buffer_load_to_local", [
   AttrSizedOperandSegments,
+  MemAsyncWriteOpTrait,
   BufferOpInterface,
   TypesMatchWith<"dest element type matches pointee type of ptr", "dest", "ptr", "getPointerTypeToElement($_self)">,
   TypesMatchWith<"infer mask shape from offsets",
@@ -803,7 +804,7 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
 // AsyncTDMCopyLocalToGlobalOp
 //===----------------------------------------------------------------------===//
 
-def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global", [AttrSizedOperandSegments]> {
+def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global", [AttrSizedOperandSegments, MemAsyncWriteOpTrait]> {
   let summary = "Copy data based on descriptor from local memory to global memory asynchronously";
 
   let description = [{

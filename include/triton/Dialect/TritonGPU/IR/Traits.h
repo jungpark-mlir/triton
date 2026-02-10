@@ -44,10 +44,7 @@ class MemWaitOpTrait
   // Optional: Add methods or verification logic here
 };
 
-// Trait for async ops that write to shared memory via DMA.  The write is
-// in-flight and not visible until an explicit wait (MemWaitOpTrait) completes.
-// A thread-level barrier cannot make these writes visible, so the membar
-// analysis should not treat them as pending synchronous writes.
+// Async DMA write to shared memory, visible only after an explicit wait.
 template <typename ConcreteType>
 class MemAsyncWriteOpTrait
     : public mlir::OpTrait::TraitBase<ConcreteType, MemAsyncWriteOpTrait> {};
