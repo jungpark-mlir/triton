@@ -187,12 +187,17 @@ How to read: time flows left→right; each block is a stage, and the groups alte
 
 ```mermaid
 flowchart LR
-  subgraph A[Group A (early)]
-    A0[Memory/Prep i] --> A1[Compute i] --> A2[Memory/Prep i+1]
+  subgraph A[Group A]
+    direction LR
+    A0[Memory/Prep i]:::mem --> A1[Compute i]:::compute --> A2[Memory/Prep i+1]:::mem
   end
-  subgraph B[Group B (phase-shifted)]
-    B0[Phase shift (cond_barrier)] --> B1[Memory/Prep i] --> B2[Compute i]
+  subgraph B[Group B]
+    direction LR
+    B0[Phase shift]:::phase --> B1[Memory/Prep i]:::mem --> B2[Compute i]:::compute
   end
+  classDef mem fill:#f7e36b,stroke:#b59b00,color:#000;
+  classDef compute fill:#8bd17c,stroke:#2f7d32,color:#000;
+  classDef phase fill:#d9d9d9,stroke:#7a7a7a,color:#000;
 ```
 
 ## Barrier and membar semantics and performance pitfalls
