@@ -4,7 +4,7 @@ Author: Jungwook Park
 
 ## Executive Summary
 
-Warp-pipelining in the provided Triton AMDGPU repository is a **phase-shifted, barrier-rendezvous scheduling scheme** designed to increase **MFMA/WMMA compute utilization** in compute-bound GEMM-like kernels. It does this by forcing two warp-/wave-groups within a work-group to remain **out of phase**: while one group executes a **compute stage (MFMA-heavy)**, the other executes a **memory/prep stage (loads, LDS traffic, address updates, waits)**, then they swap. The key enabler is a *partial synchronization primitive*, `amdg.cond_barrier`, which Triton defines as a conditional execution barrier that **does not set any memory fence** and requires explicit reconvergence. 
+Warp-pipelining in the provided Triton AMDGPU repository is a **phase-shifted, barrier-rendezvous scheduling scheme** designed to increase **MFMA/WMMA compute utilization** in compute-bound GEMM-like kernels. It does this by forcing two warp-/wave-groups within a work-group to remain **out of phase**: while one group executes a **compute stage (MFMA-heavy)**, the other executes a **memory/prep stage (loads, LDS traffic, address updates, waits)**, then they swap. The key enabler is a *partial synchronization primitive*, `amdg.cond_barrier`, which Triton defines as a conditional execution barrier that **does not set any memory fence** and requires explicit reconvergence. citeturn0search2
 
 The earlier BlockPingpong pass in the repo provides the clearest intent statements and concrete scheduling patterns. Its comments explain: (a) the goal is to “interleav[e]” two warps, (b) to separate “Dot and Memory clusters,” (c) to use `s_setprio` and conditional barriers for synchronization, and (d) that it primarily targets **compute-bound** regimes and relies on software pipelining rather than “improving memory latency itself.” (Repo: `third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp:L29-L37`.)
 
@@ -57,35 +57,45 @@ The goal is to create a **stable, systematic phase offset** between two warp-/wa
 
 Besides “phase shift barrier rendezvous,” compiler/scheduling discussions sometimes use short terms like phase, offset, shift, or lag.
 
-### Prototype mechanism as a universal rendezvous pattern
+### Early Prototype: Converging at a Barrier from Different Program Points
 
-This is a universal pattern whenever the barrier is a **rendezvous**: early arrivals wait; late arrivals eventually reach the same rendezvous; then all proceed. The key restriction is that participating threads must encounter barriers (and barrier-like regions) in the same order, otherwise deadlock/undefined behavior is possible.
+This early LLVM-IR prototype demonstrated that different warp groups can
+arrive at the *same barrier instruction* from different program regions
+and still synchronize correctly. The core idea is to **converge at the
+same barrier PC**, not to force identical execution paths beforehand.
 
-#### Explicit prototype proof sketch
+Instead of placing the barrier at a single dominating block, selected
+warps were routed through a small helper block containing the barrier.
+Other warps skipped that path, continued, and later reached an
+unconditional barrier. Convergence happened when all participating
+warps reached the same barrier instruction, even if they arrived via
+different control-flow edges.
 
-A minimal LLVM-like IR sketch representing “conditional branch + barrier rendezvous”:
+Simplified LLVM IR:
 
 ```llvm
-; %late partitions the team into early vs late arrivals
-br i1 %late, label %park, label %cont
+%tid      = call i32 @llvm.amdgcn.workitem.id.x()
+%warp     = udiv i32 %tid, 16
+%is_late  = icmp ne i32 %warp, 0
 
-park:
-  call void @barrier_exec()     ; execution rendezvous
-  br label %cont
+br i1 %is_late, label %conditional_barrier, label %continue
 
-cont:
-  ; ... extra work for early arrivals ...
-  call void @barrier_exec()     ; shared rendezvous point
-  ; ... continue ...
+conditional_barrier:
+  call void @llvm.amdgcn.s.barrier()
+  br label %continue
+
+continue:
+  ; later, inside the loop
+  call void @llvm.amdgcn.s.barrier()
 ```
 
-**Why it rendezvous:** if the barrier is a team rendezvous, the early group blocks at `@barrier_exec()` until the remaining participants arrive at the same barrier instance; then everyone proceeds. That’s the conventional definition of a barrier. 
-
-**Deadlock/undefined-behavior conditions:** if some threads take a path that reaches the barrier while others permanently miss it (or reach a different barrier first), the program can hang or become unspecified/undefined. 
+The key observation is that the ping-pong scheduling pattern can be
+expressed directly in IR using only control flow and standard barriers,
+without requiring backend-specific synchronization primitives.
 
 ### How BlockPingpong uses phase shift barrier rendezvous
 
-BlockPingpong wraps the loop with conditional barriers to create the phase offset: it “hold[s] half of the warps … before the loop” and then “hold[s] proceeding warps … after the loop” (Repo: `third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp:L914-L917`). The key semantic point matches Triton’s definition of `amdg.cond_barrier`: it conditionally executes a barrier, deliberately diverges execution, requires explicit reconvergence, and **does not set any memory fence**. 
+BlockPingpong wraps the loop with conditional barriers to create the phase offset: it “hold[s] half of the warps … before the loop” and then “hold[s] proceeding warps … after the loop” (Repo: `third_party/amd/lib/TritonAMDGPUTransforms/BlockPingpong.cpp:L914-L917`). The key semantic point matches Triton’s definition of `amdg.cond_barrier`: it conditionally executes a barrier, deliberately diverges execution, requires explicit reconvergence, and **does not set any memory fence**. citeturn0search2
 
 ### How warp-pipelining realizes phase shift barrier rendezvous
 
@@ -95,7 +105,7 @@ Warp-pipelining uses the same concept in a stage-driven form:
 - In-loop: keep groups phase-locked by repeatedly placing cluster boundaries; the conversion emits a **scheduler barrier** and then either a **local-fencing barrier** or an **execution rendezvous barrier** depending on dependence requirements. (Repo: `ConvertWarpPipeline.cpp:L83-L91`.)  
 - Post-loop: reconverge the phase shift with a complementary `amdg.cond_barrier`. (Repo: `ConvertWarpPipeline.cpp` post-loop insertion; same design as BlockPingpong’s wrap.)  
 
-The same Triton op semantics apply: `amdg.cond_barrier` is a partial synchronization tool and it explicitly has **no memory fence**. 
+The same Triton op semantics apply: `amdg.cond_barrier` is a partial synchronization tool and it explicitly has **no memory fence**. citeturn0search2
 
 ## Block-pingpong variants and performance tradeoffs
 
@@ -108,9 +118,9 @@ This section covers only the requested variants (**two**, **four**, **async**, *
 **Compute–memory overlap mechanism:** slice dot/LDS loads into two parts, and place a memory cluster that interleaves some local/global ops before dot0, then dot0, then a barrier, then memory1+dot1. (Repo: structure visible immediately after `transformTwoPPClusters` begins, `L588+`.)
 
 **Primitives used:**  
-- `rocdl.s.setprio` (mapped to ISA `S_SETPRIO`) to keep the pattern stable by preventing overtaking when two warps contend for the same instruction unit. (Repo: `BlockPingpong.cpp:L54-L60`; ISA semantics: `S_SETPRIO` modifies wave priority 0–3. )  
-- `rocdl.sched.barrier` with mask 0 to freeze backend scheduling across boundaries. Mask guidance is documented in LLVM’s sched.barrier review: mask 0 blocks instructions crossing the barrier during scheduling.   
-- `amdg.cond_barrier` around the loop to phase-shift and reconverge. (Repo: `BlockPingpong.cpp:L914-L945`; op semantics. )
+- `rocdl.s.setprio` (mapped to ISA `S_SETPRIO`) to keep the pattern stable by preventing overtaking when two warps contend for the same instruction unit. (Repo: `BlockPingpong.cpp:L54-L60`; ISA semantics: `S_SETPRIO` modifies wave priority 0–3. citeturn5view1)  
+- `rocdl.sched.barrier` with mask 0 to freeze backend scheduling across boundaries. Mask guidance is documented in LLVM’s sched.barrier review: mask 0 blocks instructions crossing the barrier during scheduling. citeturn0search6  
+- `amdg.cond_barrier` around the loop to phase-shift and reconverge. (Repo: `BlockPingpong.cpp:L914-L945`; op semantics. citeturn0search2)
 
 **Key tradeoff/risk: membar/wait placement**  
 This variant explicitly avoids inserting a local-fencing barrier at a particular boundary because it would pull in waits related to local loads (“cannot include wait … inserted by the ttg.barrier”). (Repo: `BlockPingpong.cpp:L607-L610`.) The performance risk is that if later passes materialize local-memory fences or waits inside the compute slice, MFMA continuity can fragment.
@@ -122,11 +132,11 @@ This variant explicitly avoids inserting a local-fencing barrier at a particular
 **Compute–memory overlap mechanism:** shorter compute slices (dot0..dot3) interleaved with memory phases (mem0..mem3) provide more opportunities for the hardware to overlap memory/prep work with MFMA-heavy compute and reduce live-range pressure per compute slice.
 
 **Primitives used (explicitly documented):** The comment lists three “guards” at each cluster boundary:  
-- `sched.barrier` mask 0 to prevent backend reordering across the boundary. (Repo: `BlockPingpong.cpp:L508-L510`; LLVM mask behavior. )  
-- `ttg.barrier` for synchronization/ordering at each point (in this implementation: local-fencing barrier op inserted). (Repo: `BlockPingpong.cpp:L511-L513`; `ttg.barrier` semantics. )  
-- `setprio (1->0)` to reduce overtaking/resource contention during co-execution. (Repo: `BlockPingpong.cpp:L512-L513`; ISA semantics. )
+- `sched.barrier` mask 0 to prevent backend reordering across the boundary. (Repo: `BlockPingpong.cpp:L508-L510`; LLVM mask behavior. citeturn0search6)  
+- `ttg.barrier` for synchronization/ordering at each point (in this implementation: local-fencing barrier op inserted). (Repo: `BlockPingpong.cpp:L511-L513`; `ttg.barrier` semantics. citeturn0search1)  
+- `setprio (1->0)` to reduce overtaking/resource contention during co-execution. (Repo: `BlockPingpong.cpp:L512-L513`; ISA semantics. citeturn5view1)
 
-**Key tradeoff/risk:** More boundaries increase overhead and increase sensitivity to any later insertion/motion of wait instructions (`S_WAITCNT`-like) into compute slices; AMD ISA explicitly notes that some dependencies must be explicitly handled with wait instructions. 
+**Key tradeoff/risk:** More boundaries increase overhead and increase sensitivity to any later insertion/motion of wait instructions (`S_WAITCNT`-like) into compute slices; AMD ISA explicitly notes that some dependencies must be explicitly handled with wait instructions. citeturn5view2
 
 ### Async two-cluster (scaled-dot + async copy specialization)
 
@@ -135,8 +145,8 @@ This variant explicitly avoids inserting a local-fencing barrier at a particular
 **Compute–memory overlap mechanism:** isolate async copy (and inherent completion management) from the bulk compute region, then rely on controlled lowering to keep LDS reads in a predictable position relative to MFMA.
 
 **Primitives used:**  
-- Phase shift with `amdg.cond_barrier` via `addAsymmetricSyncToLoop` (called after this transform triggers under specific shape/element-width conditions). (Repo: selection and call: `BlockPingpong.cpp:L1029-L1047`; barrier semantics. )  
-- Boundary freezing with `rocdl.sched.barrier` and a rendezvous barrier. (Repo: `BlockPingpong.cpp:L659-L661`; scheduler barrier docs. )  
+- Phase shift with `amdg.cond_barrier` via `addAsymmetricSyncToLoop` (called after this transform triggers under specific shape/element-width conditions). (Repo: selection and call: `BlockPingpong.cpp:L1029-L1047`; barrier semantics. citeturn0search2)  
+- Boundary freezing with `rocdl.sched.barrier` and a rendezvous barrier. (Repo: `BlockPingpong.cpp:L659-L661`; scheduler barrier docs. citeturn0search6)  
 
 **Key tradeoff/risk:** This variant is coupled to backend lowering (“requires additional second step”), so performance stability depends on that lowering remaining aligned with the scheduling intent. It is also highly sensitive to where any memory-fence or wait gets placed relative to MFMA slices.
 
@@ -147,10 +157,10 @@ This variant explicitly avoids inserting a local-fencing barrier at a particular
 **Compute–memory overlap mechanism:** keep compute clusters “clean” and ensure the memory cluster can always issue its necessary VALU address-update instructions even while compute is MFMA-heavy. The comment explains why: both clusters contain `v_xxx` (VALU); if compute has higher priority, it can monopolize those issue slots and eliminate overlap. (Repo: `BlockPingpong.cpp:L683-L697`.)
 
 **Primitives used:**  
-- `s_setprio` to give memory cluster higher priority. (Repo: `BlockPingpong.cpp:L681-L697`; priority semantics. )  
-- `s_waitcnt` placement discipline: place `s_waitcnt lgkmcnt(0)` at the end of the memory cluster to prevent the backend from inserting waits inside compute. (Repo: `BlockPingpong.cpp:L730-L743`; AMD wait semantics. )  
-- `rocdl.s.barrier` inserted at the beginning of the loop (not the end) to avoid backend moving loop-control scalar ops into compute. (Repo: `BlockPingpong.cpp:L834-L838`; ISA `S_BARRIER` definition. )  
-- Phase shift via `addAsymmetricSyncToLoop`. (Repo: `BlockPingpong.cpp:L1002-L1012` plus `L914-L945`; cond-barrier semantics. )
+- `s_setprio` to give memory cluster higher priority. (Repo: `BlockPingpong.cpp:L681-L697`; priority semantics. citeturn5view1)  
+- `s_waitcnt` placement discipline: place `s_waitcnt lgkmcnt(0)` at the end of the memory cluster to prevent the backend from inserting waits inside compute. (Repo: `BlockPingpong.cpp:L730-L743`; AMD wait semantics. citeturn5view2)  
+- `rocdl.s.barrier` inserted at the beginning of the loop (not the end) to avoid backend moving loop-control scalar ops into compute. (Repo: `BlockPingpong.cpp:L834-L838`; ISA `S_BARRIER` definition. citeturn5view2)  
+- Phase shift via `addAsymmetricSyncToLoop`. (Repo: `BlockPingpong.cpp:L1002-L1012` plus `L914-L945`; cond-barrier semantics. citeturn0search2)
 
 **Key tradeoff/risk: membar/wait interference**  
 The implementation explicitly notes that membar can reorder the desired start-of-cluster sequencing: membar moves `s_waitcnt` before `s_barrier` (Repo: `BlockPingpong.cpp:L784-L791`). That is a performance risk because it can blur the intended separation between memory and compute phases.
@@ -161,15 +171,15 @@ Warp-pipelining keeps the same performance target as pingpong—stable compute/m
 
 ### Runtime semantics in one paragraph
 
-In the conversion pass, each warp-pipelining cluster boundary is emitted as: a scheduler boundary, then either a **local-fencing barrier** (when `needLocal`) or an **execution rendezvous** barrier (when not), then another scheduler boundary (Repo: `third_party/amd/lib/TritonAMDGPUToLLVM/ConvertWarpPipeline.cpp:L83-L91`). The conversion also computes a pipeline group size and states its conceptual model: a block runs on 4 SIMDs with 2 warps per SIMD, and warp-pipelining splits them into two groups that execute different stages at different times (Repo: `ConvertWarpPipeline.cpp:L371-L375`). Finally, it wraps the loop with conditional barriers to phase-shift and reconverge. (Repo: `ConvertWarpPipeline.cpp:L138-L158`; `amdg.cond_barrier` semantics. )
+In the conversion pass, each warp-pipelining cluster boundary is emitted as: a scheduler boundary, then either a **local-fencing barrier** (when `needLocal`) or an **execution rendezvous** barrier (when not), then another scheduler boundary (Repo: `third_party/amd/lib/TritonAMDGPUToLLVM/ConvertWarpPipeline.cpp:L83-L91`). The conversion also computes a pipeline group size and states its conceptual model: a block runs on 4 SIMDs with 2 warps per SIMD, and warp-pipelining splits them into two groups that execute different stages at different times (Repo: `ConvertWarpPipeline.cpp:L371-L375`). Finally, it wraps the loop with conditional barriers to phase-shift and reconverge. (Repo: `ConvertWarpPipeline.cpp:L138-L158`; `amdg.cond_barrier` semantics. citeturn0search2)
 
 ### Why MFMA utilization improves
 
-Warp-pipelining’s benefit is a *scheduling shape* benefit: it tries to ensure that when one group is forced to stall (e.g., on LDS readiness or address computation), the other group can still issue MFMA-heavy work, keeping compute pipelines active. AMD ISA describes barriers as causing waves to wait until all reach the same barrier point, and it describes waits (`S_WAITCNT`) as how the program enforces certain dependency completions; both are exactly the kinds of events that can fragment MFMA issuance if placed in the wrong stage. 
+Warp-pipelining’s benefit is a *scheduling shape* benefit: it tries to ensure that when one group is forced to stall (e.g., on LDS readiness or address computation), the other group can still issue MFMA-heavy work, keeping compute pipelines active. AMD ISA describes barriers as causing waves to wait until all reach the same barrier point, and it describes waits (`S_WAITCNT`) as how the program enforces certain dependency completions; both are exactly the kinds of events that can fragment MFMA issuance if placed in the wrong stage. citeturn5view2
 
-The chained-dot commentary in BlockPingpong is especially instructive for *why priority matters*: if compute monopolizes shared VALU issue slots, the memory/prep group cannot advance its address updates, and overlap collapses. (Repo: `BlockPingpong.cpp:L689-L697`.) Warp-pipelining exposes stage-level priority as a first-class option in Gluon: priority 0–3 is lowered to `s_setprio`, is a hardware scheduling hint, and should be used judiciously. (Repo: `python/triton/experimental/gluon/language/amd/warp_pipeline.py:L17-L26`; ISA priority range. )
+The chained-dot commentary in BlockPingpong is especially instructive for *why priority matters*: if compute monopolizes shared VALU issue slots, the memory/prep group cannot advance its address updates, and overlap collapses. (Repo: `BlockPingpong.cpp:L689-L697`.) Warp-pipelining exposes stage-level priority as a first-class option in Gluon: priority 0–3 is lowered to `s_setprio`, is a hardware scheduling hint, and should be used judiciously. (Repo: `python/triton/experimental/gluon/language/amd/warp_pipeline.py:L17-L26`; ISA priority range. citeturn5view1)
 
-Occupancy remains the limiting background condition: if register/LDS usage prevents multiple warps/waves from being resident, there are fewer ready instruction streams to interleave, reducing the headroom for hiding stalls. 
+Occupancy remains the limiting background condition: if register/LDS usage prevents multiple warps/waves from being resident, there are fewer ready instruction streams to interleave, reducing the headroom for hiding stalls. citeturn10search0turn0search1
 
 ### Mermaid pipeline timeline
 
@@ -191,12 +201,12 @@ flowchart LR
 
 | Primitive | Intended role in warp-pipelining | Semantics anchor |
 |---|---|---|
-| `rocdl.s.barrier` (`S_BARRIER`) | Execution rendezvous (do not assume it orders memory by itself) | AMD ISA: `S_BARRIER` forces waves to wait until all reach barrier; surviving waves satisfy it.  |
-| `amdg.cond_barrier` | Conditional execution rendezvous for phase shift; requires reconvergence | Triton: similar to barrier in an if; “doesn’t set any memory fence.”  |
-| `ttg.barrier` | Barrier + explicit memory visibility for selected addrspaces (`none/local/...`) | TritonGPU ops: `none` is control-only; `local` makes shared-memory ops visible CTA-wide.  |
-| `rocdl.barrier` | Barrier with HIP `__syncthreads()` expansion | ROCDL dialect says it expands like HIP `__syncthreads()`.  HIP specifies sync functions include a threadfence for visibility.  |
-| `gpu.barrier memfence [workgroup]` | Barrier + LDS wait/fence when required | MLIR AMDGPU docs describe `amdgpu.lds_barrier` and recommend representing it as `gpu.barrier memfence [workgroup]`.  |
-| `rocdl.sched.barrier` | Scheduler wall to prevent backend reordering across boundary | LLVM sched.barrier: mask 0 blocks scheduling across.  |
+| `rocdl.s.barrier` (`S_BARRIER`) | Execution rendezvous (do not assume it orders memory by itself) | AMD ISA: `S_BARRIER` forces waves to wait until all reach barrier; surviving waves satisfy it. citeturn5view2 |
+| `amdg.cond_barrier` | Conditional execution rendezvous for phase shift; requires reconvergence | Triton: similar to barrier in an if; “doesn’t set any memory fence.” citeturn0search2 |
+| `ttg.barrier` | Barrier + explicit memory visibility for selected addrspaces (`none/local/...`) | TritonGPU ops: `none` is control-only; `local` makes shared-memory ops visible CTA-wide. citeturn0search1 |
+| `rocdl.barrier` | Barrier with HIP `__syncthreads()` expansion | ROCDL dialect says it expands like HIP `__syncthreads()`. citeturn0search0 HIP specifies sync functions include a threadfence for visibility. citeturn10search0 |
+| `gpu.barrier memfence [workgroup]` | Barrier + LDS wait/fence when required | MLIR AMDGPU docs describe `amdgpu.lds_barrier` and recommend representing it as `gpu.barrier memfence [workgroup]`. citeturn1search0 |
+| `rocdl.sched.barrier` | Scheduler wall to prevent backend reordering across boundary | LLVM sched.barrier: mask 0 blocks scheduling across. citeturn0search6 |
 
 ### Ambiguous uses to flag in this repo
 
@@ -208,7 +218,7 @@ Interpretation (performance-focused): this suggests the compiler authors treat *
 
 The two-cluster pingpong code provides an explicit warning: inserting a local-fencing `ttg.barrier` at the wrong boundary would pull in waits associated with local loads, so the implementation uses `s_barrier` instead at that point (Repo: `BlockPingpong.cpp:L607-L610`). The chained-dot variant similarly tries to keep `S_WAITCNT` at the memory→compute boundary to prevent the backend from inserting waits inside compute. (Repo: `BlockPingpong.cpp:L730-L743`.)
 
-These match general barrier semantics across parallel models: barriers commonly combine **execution synchronization** and **memory visibility**; but mixing them incorrectly in divergent/phase-shifted control flow can lead to deadlock or to performance collapse. 
+These match general barrier semantics across parallel models: barriers commonly combine **execution synchronization** and **memory visibility**; but mixing them incorrectly in divergent/phase-shifted control flow can lead to deadlock or to performance collapse. citeturn9search6turn0search1turn0search2
 
 ### Membar interaction as a persistent performance risk
 
@@ -271,8 +281,8 @@ classDiagram
 
 ### Recommendations for performance-focused use
 
-- Treat `amdg.cond_barrier` as **execution-only phase control** (no fence). Use it to create/resolve phase shifts and rely on explicit `ttg.barrier` or `gpu.barrier memfence` only for proven memory hazards.   
-- Keep compute stages “clean”: avoid pulling `S_WAITCNT`-like waits and memory-fencing barriers into MFMA-heavy regions unless correctness demands it. AMD explicitly describes `S_WAITCNT` as required in some cases for dependency handling; placing it at boundaries allows unrelated work to run before waiting.   
-- Use `sched.barrier` mask 0 sparingly but decisively at stage boundaries where the backend must not reorder across; LLVM’s intrinsic is explicitly intended as a scheduling-region wall.   
-- Use stage priority (`s_setprio`) primarily to prevent **memory-stage starvation** when both stages require VALU address work; chained-dot’s rationale applies directly to warp-pipelining. (Repo: `BlockPingpong.cpp:L689-L697`; priority semantics. )  
+- Treat `amdg.cond_barrier` as **execution-only phase control** (no fence). Use it to create/resolve phase shifts and rely on explicit `ttg.barrier` or `gpu.barrier memfence` only for proven memory hazards. citeturn0search2turn0search1turn1search0  
+- Keep compute stages “clean”: avoid pulling `S_WAITCNT`-like waits and memory-fencing barriers into MFMA-heavy regions unless correctness demands it. AMD explicitly describes `S_WAITCNT` as required in some cases for dependency handling; placing it at boundaries allows unrelated work to run before waiting. citeturn5view2  
+- Use `sched.barrier` mask 0 sparingly but decisively at stage boundaries where the backend must not reorder across; LLVM’s intrinsic is explicitly intended as a scheduling-region wall. citeturn0search6  
+- Use stage priority (`s_setprio`) primarily to prevent **memory-stage starvation** when both stages require VALU address work; chained-dot’s rationale applies directly to warp-pipelining. (Repo: `BlockPingpong.cpp:L689-L697`; priority semantics. citeturn5view1)  
 - Validate on representative compute-bound GEMM workloads (e.g., sufficiently large K with double/triple buffering): the scheme is designed to improve MFMA utilization, not to reduce raw memory latency. (Repo: `BlockPingpong.cpp:L35-L37`.)
