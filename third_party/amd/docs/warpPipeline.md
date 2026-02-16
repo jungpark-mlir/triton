@@ -2,6 +2,8 @@
 
 Author: Jungwook Park
 
+Note: This document is under revision and may contain incorrect information.
+
 ## Executive Summary
 
 Warp-pipelining in the provided Triton AMDGPU repository is a **phase-shifted, barrier-rendezvous scheduling scheme** designed to increase **MFMA/WMMA compute utilization** in compute-bound GEMM-like kernels. It does this by forcing two warp-/wave-groups within a work-group to remain **out of phase**: while one group executes a **compute stage (MFMA-heavy)**, the other executes a **memory/prep stage (loads, LDS traffic, address updates, waits)**, then they swap. The key enabler is a *partial synchronization primitive*, `amdg.cond_barrier`, which Triton defines as a conditional execution barrier that **does not set any memory fence** and requires explicit reconvergence.
