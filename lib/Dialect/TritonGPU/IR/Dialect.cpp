@@ -977,7 +977,9 @@ LinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 
   const auto &bases = linearLayout.getBases();
   auto nonZero = [](auto val) { return val != 0; };
-  for (const auto &dimBases : llvm::make_second_range(bases)) {
+  for (const auto &[dim, dimBases] : bases) {
+    if (dim.str() == "warp")
+      continue;
     if (!llvm::all_of(dimBases, [&](const auto &basis) {
           return std::count_if(basis.begin(), basis.end(), nonZero) <= 1;
         })) {
@@ -986,6 +988,9 @@ LinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                 "dimension.";
     }
   }
+
+  if (!mlir::triton::disjointBases(linearLayout))
+    return success();
 
   LinearLayout withoutBroadcast = linearLayout;
   for (auto inDim : linearLayout.getInDimNames()) {
