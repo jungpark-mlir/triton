@@ -38,12 +38,12 @@ This report focuses first on **phase shift barrier rendezvous**, then analyzes t
   - [Mermaid pipeline timeline](#mermaid-pipeline-timeline)
 - [Barrier and membar semantics and performance pitfalls](#barrier-and-membar-semantics-and-performance-pitfalls)
   - [Barrier taxonomy relevant to warp-pipelining](#barrier-taxonomy-relevant-to-warp-pipelining)
-  - [Ambiguous uses to flag in this repo](#ambiguous-uses-to-flag-in-this-repo)
   - [Why inserting memory fences mid-pipeline breaks pingpong overlap](#why-inserting-memory-fences-mid-pipeline-breaks-pingpong-overlap)
   - [Membar interaction as a persistent performance risk](#membar-interaction-as-a-persistent-performance-risk)
 - [Backend dependency model for warp-pipelining](#backend-dependency-model-for-warp-pipelining)
   - [Why Membar alone is not sufficient](#why-membar-alone-is-not-sufficient)
   - [Stage-level dependency reasoning](#stage-level-dependency-reasoning)
+  - [Why some LDS dependencies must be resolved one stage earlier](#why-some-lds-dependencies-must-be-resolved-one-stage-earlier)
   - [Circular (ring) dependencies across iterations](#circular-ring-dependencies-across-iterations)
 - [Practical usage, gfx1250 Gluon example, brief implementation notes, and recommendations](#practical-usage-gfx1250-gluon-example-brief-implementation-notes-and-recommendations)
   - [Gfx1250 Gluon example in the repo](#gfx1250-gluon-example-in-the-repo)
@@ -263,12 +263,6 @@ flowchart LR
 | `gpu.barrier memfence [workgroup]` | Barrier + LDS wait/fence when required | MLIR AMDGPU docs describe `amdgpu.lds_barrier` and recommend representing it as `gpu.barrier memfence [workgroup]`. |
 | `rocdl.sched.barrier` | Scheduler wall to prevent backend reordering across boundary | LLVM sched.barrier: mask 0 blocks scheduling across. |
 
-### Ambiguous uses to flag in this repo
-
-A critical code-level ambiguity is the distinction the warp-pipelining converter makes between **barriers that “wait local memory”** and plain execution rendezvous barriers. It explicitly accepts `ROCDL::BarrierOp` and `gpu::BarrierOp` as existing barriers between clusters, but rejects `s_barrier` and restricts multiple barriers without intervening clusters because it may cause “unpredictable timing.” (Repo: `third_party/amd/lib/TritonAMDGPUToLLVM/ConvertWarpPipeline.cpp:L180-L190`.)
-
-Interpretation (performance-focused): this suggests the compiler authors treat *memory-waiting barriers* as semantically safe boundaries (for correctness and timing control), while treating `s_barrier` as too timing-sensitive when injected ad hoc—because it can create pipeline bubbles or re-phase the schedule unexpectedly.
-
 ### Why inserting memory fences mid-pipeline breaks pingpong overlap
 
 The two-cluster pingpong code provides an explicit warning: inserting a local-fencing `ttg.barrier` at the wrong boundary would pull in waits associated with local loads, so the implementation uses `s_barrier` instead at that point (Repo: `BlockPingpong.cpp:L607-L610`). The chained-dot variant similarly tries to keep `S_WAITCNT` at the memory→compute boundary to prevent the backend from inserting waits inside compute. (Repo: `BlockPingpong.cpp:L730-L743`.)
@@ -296,6 +290,33 @@ Warp-pipeline dependency analysis should treat each cluster as a stage and reaso
 - allocation/lifetime intervals for those accesses
 
 The core question is not "can instruction A move past instruction B?", but "can stage S and stage T run concurrently on different warp groups safely?" If stage access sets intersect unsafely, a boundary barrier must prevent overlap.
+
+### Why some LDS dependencies must be resolved one stage earlier
+
+In a phase-shifted two-group schedule, one warp group can be one stage behind another. That lag changes where an LDS dependency must be closed.
+
+Example hazard:
+
+- Stage `S` writes to an LDS slot.
+- Stage `S+1` reads from the same LDS slot.
+- Warp0 reaches `S+1` while Warp1 is still at `S`.
+
+If the write is still being produced in `S` and the barrier is treated as only `S -> S+1`, Warp0 can arrive at the read boundary before Warp1 has completed the producer-side write for the shared slot. To keep `S+1` safe without polluting its critical path, the producer-side state should be completed at least by `S-1`, and the local-memory synchronization window should be reasoned across `S-1 -> S+1`.
+
+Practical rule for same-slot LDS reuse: dependency checks must look beyond adjacent stages (at least two stages apart), not only immediate neighbors.
+
+```mermaid
+flowchart LR
+  subgraph W0[Warp0 (ahead)]
+    W0m1["S-1"] --> W0s["S: other work"] --> W0p["barrier before S+1"] --> W0r["S+1: LDS read"]
+  end
+  subgraph W1[Warp1 (one stage behind)]
+    W1m1["S-1: complete LDS write"] --> W1s["S"] --> W1p["barrier before S+1"] --> W1r["S+1"]
+  end
+  W1m1 -. "producer must complete\nbefore consumer reads" .-> W0r
+```
+
+The same reasoning extends across iteration boundaries: phase lag is not only intra-iteration (`S-1 -> S+1`), but also inter-iteration via wrap-around edges.
 
 ### Circular (ring) dependencies across iterations
 
