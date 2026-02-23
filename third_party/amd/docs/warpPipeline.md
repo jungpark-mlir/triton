@@ -309,14 +309,14 @@ Practical rule for same-slot LDS reuse: dependency checks must look beyond adjac
 flowchart LR
   subgraph C0["Time slot T0"]
     direction TB
-    W0m1["Warp0 S-1"]
-    W1m2["Warp1 S-2"]
+    W0m1["Stage : S-1<br/>Warp0"]
+    W1m2["Stage : S-2<br/>Warp1"]
   end
 
   subgraph C1["Time slot T1"]
     direction TB
-    W0s["Warp0 S other work"]
-    W1m1["Warp1 S-1 complete LDS write"]
+    W0s["Stage : S<br/>Warp0 other work"]
+    W1m1["Stage : S-1<br/>Warp1 complete LDS write"]
   end
 
   B0(("local_barrier"))
@@ -324,18 +324,18 @@ flowchart LR
 
   subgraph C2["Time slot T2"]
     direction TB
-    W0r["Warp0 S+1 LDS read"]
-    W1s["Warp1 S"]
+    W0r["Stage : S+1<br/>Warp0 LDS read"]
+    W1s["Stage : S<br/>Warp1"]
   end
 
   W0m1 --> B0 --> W0s --> W0r
   W1m2 --> W1m1 --> B1 --> W1s
   W1m1 -. "producer completes before consumer read" .-> W0r
 
-  classDef stage_m2 fill:#f0f0f0,stroke:#8a8a8a,color:#000;
-  classDef stage_m1 fill:#e8f1ff,stroke:#4f83cc,color:#000;
-  classDef stage_s fill:#e8fbe8,stroke:#3a9c3a,color:#000;
-  classDef stage_p1 fill:#fff3e6,stroke:#d28a2f,color:#000;
+  classDef stage_m2 fill:#f0f0f0,stroke:#6a6a6a,stroke-width:2px,color:#000,font-weight:bold;
+  classDef stage_m1 fill:#e8f1ff,stroke:#2f6fbf,stroke-width:2px,color:#000,font-weight:bold;
+  classDef stage_s fill:#e8fbe8,stroke:#2f8a2f,stroke-width:2px,color:#000,font-weight:bold;
+  classDef stage_p1 fill:#fff3e6,stroke:#b87418,stroke-width:2px,color:#000,font-weight:bold;
   classDef barrier fill:#ffe6e6,stroke:#cc4b4b,color:#000;
   class W1m2 stage_m2;
   class W0m1,W1m1 stage_m1;
@@ -343,6 +343,51 @@ flowchart LR
   class W0r stage_p1;
   class B0,B1 barrier;
 ```
+
+Counterexample (back-to-back stage dependency): if the producer is only in `Stage : S` and the consumer is in `Stage : S+1` on the same LDS slot, one-stage phase lag can make the consumer arrive while the producer is still active. In that case, treating the dependency as only adjacent (`S -> S+1`) is insufficient for stable overlap.
+
+```mermaid
+flowchart LR
+  subgraph U0["Time slot T0"]
+    direction TB
+    U0w0["Stage : S-1<br/>Warp0"]
+    U0w1["Stage : S-2<br/>Warp1"]
+  end
+
+  subgraph U1["Time slot T1"]
+    direction TB
+    U1w0["Stage : S<br/>Warp0"]
+    U1w1["Stage : S-1<br/>Warp1"]
+  end
+
+  subgraph U2["Time slot T2"]
+    direction TB
+    U2w0["Stage : S+1<br/>Warp0 LDS read"]
+    U2w1["Stage : S<br/>Warp1 LDS write (still active)"]
+  end
+
+  UB0(("local_barrier"))
+  UB1(("local_barrier"))
+
+  U0w0 --> UB0 --> U1w0 --> U2w0
+  U0w1 --> U1w1 --> UB1 --> U2w1
+  U2w1 -. "unresolved RAW hazard on same LDS slot" .-> U2w0
+
+  classDef stage_m2 fill:#f0f0f0,stroke:#6a6a6a,stroke-width:2px,color:#000,font-weight:bold;
+  classDef stage_m1 fill:#e8f1ff,stroke:#2f6fbf,stroke-width:2px,color:#000,font-weight:bold;
+  classDef stage_s fill:#e8fbe8,stroke:#2f8a2f,stroke-width:2px,color:#000,font-weight:bold;
+  classDef stage_p1 fill:#fff3e6,stroke:#b87418,stroke-width:2px,color:#000,font-weight:bold;
+  classDef hazard fill:#ffe3e3,stroke:#c93a3a,stroke-width:2px,color:#000,font-weight:bold;
+  classDef barrier fill:#ffe6e6,stroke:#cc4b4b,color:#000;
+  class U0w1 stage_m2;
+  class U0w0,U1w1 stage_m1;
+  class U1w0,U2w1 stage_s;
+  class U2w0 stage_p1;
+  class U2w0,U2w1 hazard;
+  class UB0,UB1 barrier;
+```
+
+This is why same-slot LDS dependencies are modeled with a wider window (e.g., producer completion by `S-1` and consumer at `S+1`) instead of relying on a late, adjacent-only resolve point.
 
 The same reasoning extends across iteration boundaries: phase lag is not only intra-iteration (`S-1 -> S+1`), but also inter-iteration via wrap-around edges.
 
