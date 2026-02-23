@@ -16,6 +16,11 @@ This report focuses first on **phase shift barrier rendezvous**, then analyzes t
 
 - [Executive Summary](#executive-summary)
 - [Table of Contents](#table-of-contents)
+- [Conceptual model and terminology](#conceptual-model-and-terminology)
+  - [Warp-pipeline vs BlockPingpong](#warp-pipeline-vs-blockpingpong)
+  - [Warp-pipeline vs warp-specialization](#warp-pipeline-vs-warp-specialization)
+  - [Warp-pipeline vs instruction scheduling](#warp-pipeline-vs-instruction-scheduling)
+  - [Pipeline clusters as semantic units](#pipeline-clusters-as-semantic-units)
 - [Phase Shift Barrier Rendezvous](#phase-shift-barrier-rendezvous)
   - [Goal](#goal)
   - [Prototype mechanism as a universal rendezvous pattern](#prototype-mechanism-as-a-universal-rendezvous-pattern)
@@ -36,6 +41,10 @@ This report focuses first on **phase shift barrier rendezvous**, then analyzes t
   - [Ambiguous uses to flag in this repo](#ambiguous-uses-to-flag-in-this-repo)
   - [Why inserting memory fences mid-pipeline breaks pingpong overlap](#why-inserting-memory-fences-mid-pipeline-breaks-pingpong-overlap)
   - [Membar interaction as a persistent performance risk](#membar-interaction-as-a-persistent-performance-risk)
+- [Backend dependency model for warp-pipelining](#backend-dependency-model-for-warp-pipelining)
+  - [Why Membar alone is not sufficient](#why-membar-alone-is-not-sufficient)
+  - [Stage-level dependency reasoning](#stage-level-dependency-reasoning)
+  - [Circular (ring) dependencies across iterations](#circular-ring-dependencies-across-iterations)
 - [Practical usage, gfx1250 Gluon example, brief implementation notes, and recommendations](#practical-usage-gfx1250-gluon-example-brief-implementation-notes-and-recommendations)
   - [Gfx1250 Gluon example in the repo](#gfx1250-gluon-example-in-the-repo)
   - [Brief notes on where warp-pipelining runs in the compiler](#brief-notes-on-where-warp-pipelining-runs-in-the-compiler)
@@ -48,6 +57,47 @@ This document uses “warp‑pipelining” to refer specifically to the **phase�
 
 - **Buffer ping‑pong (double buffering)**: classic ping‑pong buffers swap two memory banks to hide transfer latency, as in a DMA double‑buffer scheme. That is *not* the “pingpong” discussed here. See the double‑buffer definition and example in Microchip’s ping‑pong buffer note: https://onlinedocs.microchip.com/oxy/GUID-324A966D-1464-4B35-A7D1-DCAE052AC22C-en-US-5/GUID-B6995A5F-E06B-4071-893E-BBC60082F576.html.
 - **Legacy “pingpong” overlap via `s_setprio` only**: before conditional‑barrier overlap, an AMDGPU‑style approach was to use priority toggling around an MFMA sequence to serialize MFMA issuance across warps. A typical pattern is `s_setprio 0` before the MFMA block, `s_setprio 1` after the first MFMA, and `s_setprio 0` after the last MFMA. Once one warp enters the MFMA series, its priority becomes 1 after the first MFMA, so a competing warp cannot issue its MFMA until the first warp returns to priority 0. This creates a crude compute/memory overlap but **does not address synchronization inefficiency**, which is often critical for shared‑memory usage.
+
+## Conceptual model and terminology
+
+### Warp-pipeline vs BlockPingpong
+
+Warp-pipeline preserves the same final overlap target as BlockPingpong: different warp groups execute different loop phases so memory/prep work and MFMA-heavy work overlap.
+
+The difference is *where the schedule is represented*:
+
+- BlockPingpong encodes a mostly concrete schedule directly in transformed IR and inserts synchronization as it builds the schedule.
+- Warp-pipeline encodes stage structure first (clusters), then decides concrete synchronization during lowering.
+
+This keeps the same runtime intent while making the schedule easier to analyze, compose, and eventually auto-partition.
+
+### Warp-pipeline vs warp-specialization
+
+Warp-pipeline and warp-specialization both give different roles to different warp groups, but they solve different problems:
+
+- Warp-pipeline: same kernel logic, but with a temporal phase offset between groups.
+- Warp-specialization: intentionally different code paths/tasks per group.
+
+In short, warp-pipeline is a scheduling shape; warp-specialization is a work partitioning shape.
+
+### Warp-pipeline vs instruction scheduling
+
+Warp-pipeline is a higher-level transformation than backend instruction scheduling.
+
+- Warp-pipeline decides which stage boundaries exist and which stages may overlap.
+- Instruction scheduling reorders instructions *within* already-established synchronization constraints.
+
+Because stage relationships are semantic, they must be explicit before lowering flattens structure into individual instructions.
+
+### Pipeline clusters as semantic units
+
+In warp-pipeline IR, a cluster is the primary unit of staging:
+
+- operations intended to execute as one stage slice
+- a boundary that constrains cross-stage reordering
+- a unit used for dependency and synchronization decisions
+
+Barriers enforce safety at boundaries, but cluster membership carries the stage meaning.
 
 ## Phase Shift Barrier Rendezvous
 
@@ -228,6 +278,30 @@ These match general barrier semantics across parallel models: barriers commonly 
 ### Membar interaction as a persistent performance risk
 
 The repo’s membar analysis inserts `triton::gpu::BarrierOp` in local address space (Repo: `lib/Analysis/Membar.cpp:L239-L243`) and may insert a barrier after async wait (Repo: `Membar.cpp:L266-L273`). The chained-dot schedule explicitly notes the interaction: membar moves `s_waitcnt` before `s_barrier`. (Repo: `BlockPingpong.cpp:L784-L791`.) From a warp-pipelining perspective, that’s a performance hazard because it can shift wait pressure into or across intended stage boundaries.
+
+## Backend dependency model for warp-pipelining
+
+### Why Membar alone is not sufficient
+
+Standard membar analysis answers a narrower question: where memory fences are needed to preserve legal ordering under instruction reordering.
+
+Warp-pipelining adds a different concern: different warp groups intentionally execute different stages at the same time. That means dependencies must be checked at stage granularity before backend flattening, not only as instruction-level fence placement.
+
+### Stage-level dependency reasoning
+
+Warp-pipeline dependency analysis should treat each cluster as a stage and reason over stage-level access sets:
+
+- shared-memory reads by stage
+- shared-memory writes by stage
+- allocation/lifetime intervals for those accesses
+
+The core question is not "can instruction A move past instruction B?", but "can stage S and stage T run concurrently on different warp groups safely?" If stage access sets intersect unsafely, a boundary barrier must prevent overlap.
+
+### Circular (ring) dependencies across iterations
+
+Pipeline stages form a logical ring across loop iterations, not a strict one-way chain. The first stage of iteration `i+1` may depend on the final stage of iteration `i`.
+
+Dependency analysis therefore must include wrap-around edges when deciding boundary synchronization; otherwise a schedule can look safe in one iteration but still violate cross-iteration safety.
 
 ## Practical usage, gfx1250 Gluon example, brief implementation notes, and recommendations
 
