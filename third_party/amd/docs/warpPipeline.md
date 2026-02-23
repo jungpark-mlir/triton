@@ -360,10 +360,11 @@ flowchart LR
     U1w1["Stage : S-1<br/>Warp1"]
   end
 
-  subgraph U2["Time slot T2<br/>unresolved RAW hazard on same LDS slot"]
+  subgraph U2["Time slot T2"]
     direction TB
     U2w0["Stage : S+1<br/>Warp0 LDS read"]
     U2w1["Stage : S<br/>Warp1 LDS write (still active)"]
+    U2ann["unresolved RAW hazard on same LDS slot"]
   end
 
   U0w0 --> U1w0 --> U2w0
@@ -373,10 +374,12 @@ flowchart LR
   classDef stage_m1 fill:#e8f1ff,stroke:#2f6fbf,stroke-width:2px,color:#000,font-weight:bold;
   classDef stage_s fill:#e8fbe8,stroke:#2f8a2f,stroke-width:2px,color:#000,font-weight:bold;
   classDef stage_p1 fill:#fff3e6,stroke:#b87418,stroke-width:2px,color:#000,font-weight:bold;
+  classDef hazard_text fill:transparent,stroke:transparent,color:#b00000,font-weight:bold;
   class U0w1 stage_m2;
   class U0w0,U1w1 stage_m1;
   class U1w0,U2w1 stage_s;
   class U2w0 stage_p1;
+  class U2ann hazard_text;
 ```
 
 This is why same-slot LDS dependencies are modeled with a wider window (e.g., producer completion by `S-1` and consumer at `S+1`) instead of relying on a late, adjacent-only resolve point.
