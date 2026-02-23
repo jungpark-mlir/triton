@@ -307,13 +307,13 @@ Practical rule for same-slot LDS reuse: dependency checks must look beyond adjac
 
 ```mermaid
 flowchart LR
-  subgraph W0[Warp0 (ahead)]
-    W0m1["S-1"] --> W0s["S: other work"] --> W0p["barrier before S+1"] --> W0r["S+1: LDS read"]
+  subgraph W0["Warp0 ahead"]
+    W0m1["S-1"] --> W0s["S other work"] --> W0p["barrier before S+1"] --> W0r["S+1 LDS read"]
   end
-  subgraph W1[Warp1 (one stage behind)]
-    W1m1["S-1: complete LDS write"] --> W1s["S"] --> W1p["barrier before S+1"] --> W1r["S+1"]
+  subgraph W1["Warp1 one stage behind"]
+    W1m1["S-1 complete LDS write"] --> W1s["S"] --> W1p["barrier before S+1"] --> W1r["S+1"]
   end
-  W1m1 -. "producer must complete\nbefore consumer reads" .-> W0r
+  W1m1 -. "producer completes before consumer read" .-> W0r
 ```
 
 The same reasoning extends across iteration boundaries: phase lag is not only intra-iteration (`S-1 -> S+1`), but also inter-iteration via wrap-around edges.
