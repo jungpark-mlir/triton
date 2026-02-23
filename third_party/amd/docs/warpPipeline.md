@@ -332,13 +332,15 @@ flowchart LR
   W1m2 --> W1m1 --> B1 --> W1s
   W1m1 -. "producer completes before consumer read" .-> W0r
 
+  classDef stage_m2 fill:#f0f0f0,stroke:#8a8a8a,color:#000;
   classDef stage_m1 fill:#e8f1ff,stroke:#4f83cc,color:#000;
   classDef stage_s fill:#e8fbe8,stroke:#3a9c3a,color:#000;
   classDef stage_p1 fill:#fff3e6,stroke:#d28a2f,color:#000;
   classDef barrier fill:#ffe6e6,stroke:#cc4b4b,color:#000;
-  class C0 stage_m1;
-  class C1 stage_s;
-  class C2 stage_p1;
+  class W1m2 stage_m2;
+  class W0m1,W1m1 stage_m1;
+  class W0s,W1s stage_s;
+  class W0r stage_p1;
   class B0,B1 barrier;
 ```
 
