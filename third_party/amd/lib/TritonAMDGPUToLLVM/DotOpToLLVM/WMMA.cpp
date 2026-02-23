@@ -26,7 +26,11 @@
 #include "../PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
 #include "Utility.h"
+#include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <map>
+#include <set>
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -265,21 +269,220 @@ static uint64_t packMN(uint32_t m, uint32_t n) {
   return (uint64_t(m) << 32) | uint64_t(n);
 }
 
-enum class WMMALoopOrder {
-  KOuter,
-  TileOuter,
+enum class WMMALoopAxis {
+  B,
+  M,
+  N,
+  K,
 };
 
-WMMALoopOrder getWMMALoopOrder() {
+struct WMMASubtileShape {
+  unsigned mTiles = 1;
+  unsigned nTiles = 1;
+  unsigned kTiles = 1;
+};
+
+struct WMMALoopSchedule {
+  std::array<WMMALoopAxis, 4> order = {WMMALoopAxis::K, WMMALoopAxis::B,
+                                       WMMALoopAxis::M, WMMALoopAxis::N};
+};
+
+WMMALoopSchedule getWMMALoopSchedule() {
+  WMMALoopSchedule defaultSchedule;
   const char *order = std::getenv("TRITON_AMD_WMMA_LOOP_ORDER");
   if (!order)
-    return WMMALoopOrder::KOuter;
+    return defaultSchedule;
 
   StringRef orderRef(order);
   if (orderRef.equals_insensitive("tile_k") ||
       orderRef.equals_insensitive("mnk"))
-    return WMMALoopOrder::TileOuter;
-  return WMMALoopOrder::KOuter;
+    orderRef = "bmnk";
+  else if (orderRef.equals_insensitive("k_outer"))
+    orderRef = "kbmn";
+
+  SmallString<8> normalized;
+  normalized.reserve(orderRef.size());
+  for (char c : orderRef.lower()) {
+    if (c == 'b' || c == 'm' || c == 'n' || c == 'k')
+      normalized.push_back(c);
+  }
+  if (normalized.size() != 4)
+    return defaultSchedule;
+
+  bool seenB = false, seenM = false, seenN = false, seenK = false;
+  auto parseAxis = [&](char c, WMMALoopAxis &axis) -> bool {
+    switch (c) {
+    case 'b':
+      if (seenB)
+        return false;
+      seenB = true;
+      axis = WMMALoopAxis::B;
+      return true;
+    case 'm':
+      if (seenM)
+        return false;
+      seenM = true;
+      axis = WMMALoopAxis::M;
+      return true;
+    case 'n':
+      if (seenN)
+        return false;
+      seenN = true;
+      axis = WMMALoopAxis::N;
+      return true;
+    case 'k':
+      if (seenK)
+        return false;
+      seenK = true;
+      axis = WMMALoopAxis::K;
+      return true;
+    default:
+      return false;
+    }
+  };
+
+  WMMALoopSchedule schedule;
+  for (size_t i = 0; i < 4; ++i) {
+    WMMALoopAxis axis;
+    if (!parseAxis(normalized[i], axis))
+      return defaultSchedule;
+    schedule.order[i] = axis;
+  }
+  return schedule;
+}
+
+WMMASubtileShape getWMMASubtileShape() {
+  const char *shape = std::getenv("TRITON_AMD_WMMA_SUBTILE");
+  if (!shape)
+    return {};
+
+  auto parsePositiveInt = [](StringRef s, unsigned &out) {
+    if (s.empty() || s.getAsInteger(10, out) || out == 0)
+      return false;
+    return true;
+  };
+
+  SmallVector<StringRef> parts;
+  StringRef shapeRef(shape);
+  if (shapeRef.contains('x'))
+    shapeRef.split(parts, 'x');
+  else if (shapeRef.contains(','))
+    shapeRef.split(parts, ',');
+  else
+    return {};
+
+  if (parts.size() != 3)
+    return {};
+
+  WMMASubtileShape subtile;
+  if (!parsePositiveInt(parts[0].trim(), subtile.mTiles) ||
+      !parsePositiveInt(parts[1].trim(), subtile.nTiles) ||
+      !parsePositiveInt(parts[2].trim(), subtile.kTiles))
+    return {};
+  return subtile;
+}
+
+template <typename TileT, typename EmitFn>
+void emitScheduledWMMA(const SmallVector<TileT> &tiles, size_t numRepK,
+                       WMMALoopSchedule loopSchedule, WMMASubtileShape subtile,
+                       EmitFn emitFn) {
+  if (tiles.empty() || numRepK == 0)
+    return;
+
+  std::set<int> bValuesSet;
+  std::set<int> mValuesSet;
+  std::set<int> nValuesSet;
+  for (size_t tileIdx = 0; tileIdx < tiles.size(); ++tileIdx) {
+    const auto &tile = tiles[tileIdx];
+    bValuesSet.insert(tile.b);
+    mValuesSet.insert(tile.m);
+    nValuesSet.insert(tile.n);
+  }
+
+  SmallVector<int> bValues(bValuesSet.begin(), bValuesSet.end());
+  SmallVector<int> mValues(mValuesSet.begin(), mValuesSet.end());
+  SmallVector<int> nValues(nValuesSet.begin(), nValuesSet.end());
+
+  std::map<int, size_t> bToIdx;
+  std::map<int, size_t> mToIdx;
+  std::map<int, size_t> nToIdx;
+  for (size_t i = 0; i < bValues.size(); ++i)
+    bToIdx[bValues[i]] = i;
+  for (size_t i = 0; i < mValues.size(); ++i)
+    mToIdx[mValues[i]] = i;
+  for (size_t i = 0; i < nValues.size(); ++i)
+    nToIdx[nValues[i]] = i;
+
+  struct WorkItem {
+    size_t tileIdx;
+    size_t k;
+    size_t bIdx;
+    size_t mIdx;
+    size_t nIdx;
+  };
+
+  SmallVector<WorkItem> workItems;
+  workItems.reserve(tiles.size() * numRepK);
+  for (size_t tileIdx = 0; tileIdx < tiles.size(); ++tileIdx) {
+    const auto &tile = tiles[tileIdx];
+    size_t bIdx = bToIdx[tile.b];
+    size_t mIdx = mToIdx[tile.m];
+    size_t nIdx = nToIdx[tile.n];
+    for (size_t k = 0; k < numRepK; ++k)
+      workItems.push_back({tileIdx, k, bIdx, mIdx, nIdx});
+  }
+
+  const size_t mStep = std::max<size_t>(subtile.mTiles, 1);
+  const size_t nStep = std::max<size_t>(subtile.nTiles, 1);
+  const size_t kStep = std::max<size_t>(subtile.kTiles, 1);
+  auto axisIndex = [&](const WorkItem &item, WMMALoopAxis axis) -> size_t {
+    switch (axis) {
+    case WMMALoopAxis::B:
+      return item.bIdx;
+    case WMMALoopAxis::M:
+      return item.mIdx;
+    case WMMALoopAxis::N:
+      return item.nIdx;
+    case WMMALoopAxis::K:
+      return item.k;
+    }
+    llvm_unreachable("unknown WMMA loop axis");
+  };
+  auto axisStep = [&](WMMALoopAxis axis) -> size_t {
+    switch (axis) {
+    case WMMALoopAxis::B:
+      return 1;
+    case WMMALoopAxis::M:
+      return mStep;
+    case WMMALoopAxis::N:
+      return nStep;
+    case WMMALoopAxis::K:
+      return kStep;
+    }
+    llvm_unreachable("unknown WMMA loop axis");
+  };
+
+  std::stable_sort(workItems.begin(), workItems.end(),
+                   [&](const WorkItem &lhs, const WorkItem &rhs) {
+                     for (WMMALoopAxis axis : loopSchedule.order) {
+                       size_t step = axisStep(axis);
+                       size_t lhsBlock = axisIndex(lhs, axis) / step;
+                       size_t rhsBlock = axisIndex(rhs, axis) / step;
+                       if (lhsBlock != rhsBlock)
+                         return lhsBlock < rhsBlock;
+                     }
+                     for (WMMALoopAxis axis : loopSchedule.order) {
+                       size_t step = axisStep(axis);
+                       size_t lhsIntra = axisIndex(lhs, axis) % step;
+                       size_t rhsIntra = axisIndex(rhs, axis) % step;
+                       if (lhsIntra != rhsIntra)
+                         return lhsIntra < rhsIntra;
+                     }
+                     return lhs.tileIdx < rhs.tileIdx;
+                   });
+
+  for (const WorkItem &item : workItems)
+    emitFn(tiles[item.tileIdx], item.k);
 }
 
 std::optional<int> findNextM(LinearLayout repLayout, int &reg, int elemsPerVec,
@@ -415,7 +618,8 @@ LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
 
   llvm::DenseSet<uint64_t> mnProcessed;
   SmallVector<AccTile> accTiles;
-  const WMMALoopOrder loopOrder = getWMMALoopOrder();
+  const WMMALoopSchedule loopOrder = getWMMALoopSchedule();
+  const WMMASubtileShape subtile = getWMMASubtileShape();
   for (int reg = 0; reg < repLayout.getInDimSize(kRegister);
        reg += dElemsToStorePerThread) {
     auto repIndices = repLayout.apply(
@@ -507,17 +711,7 @@ LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
     }
   };
 
-  if (loopOrder == WMMALoopOrder::KOuter) {
-    for (size_t k = 0; k < numRepK; ++k) {
-      for (const auto &accTile : accTiles)
-        emitDotForTileAndK(accTile, k);
-    }
-  } else {
-    for (const auto &accTile : accTiles) {
-      for (size_t k = 0; k < numRepK; ++k)
-        emitDotForTileAndK(accTile, k);
-    }
-  }
+  emitScheduledWMMA(accTiles, numRepK, loopOrder, subtile, emitDotForTileAndK);
 
   // replace with new packed result
   Type structTy = LLVM::LLVMStructType::getLiteral(
@@ -634,7 +828,8 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
   };
 
   SmallVector<ScaledAccTile> scaledAccTiles;
-  const WMMALoopOrder loopOrder = getWMMALoopOrder();
+  const WMMALoopSchedule loopOrder = getWMMALoopSchedule();
+  const WMMASubtileShape subtile = getWMMASubtileShape();
   for (int reg = 0; reg < repLayout.getInDimSize(kRegister);
        reg += elemsPerVec) {
     auto repIndices = repLayout.apply(
@@ -703,17 +898,8 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
     }
   };
 
-  if (loopOrder == WMMALoopOrder::KOuter) {
-    for (size_t k = 0; k < numRepK; k++) {
-      for (const auto &accTile : scaledAccTiles)
-        emitScaledDotForTileAndK(accTile, k);
-    }
-  } else {
-    for (const auto &accTile : scaledAccTiles) {
-      for (size_t k = 0; k < numRepK; k++)
-        emitScaledDotForTileAndK(accTile, k);
-    }
-  }
+  emitScheduledWMMA(scaledAccTiles, numRepK, loopOrder, subtile,
+                    emitScaledDotForTileAndK);
 
   Type structTy = LLVM::LLVMStructType::getLiteral(
       wmmaLayout.getContext(), SmallVector<Type>(fc.size(), dstElemTy));
