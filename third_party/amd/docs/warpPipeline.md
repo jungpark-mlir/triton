@@ -307,13 +307,39 @@ Practical rule for same-slot LDS reuse: dependency checks must look beyond adjac
 
 ```mermaid
 flowchart LR
-  subgraph W0["Warp0 ahead"]
-    W0m1["S-1"] --> W0s["S other work"] --> W0p["barrier before S+1"] --> W0r["S+1 LDS read"]
+  subgraph C0["Time slot T0"]
+    direction TB
+    W0m1["Warp0 S-1"]
+    W1m2["Warp1 S-2"]
   end
-  subgraph W1["Warp1 one stage behind"]
-    W1m1["S-1 complete LDS write"] --> W1s["S"] --> W1p["barrier before S+1"] --> W1r["S+1"]
+
+  subgraph C1["Time slot T1"]
+    direction TB
+    W0s["Warp0 S other work"]
+    W1m1["Warp1 S-1 complete LDS write"]
   end
+
+  B0(("local_barrier"))
+  B1(("local_barrier"))
+
+  subgraph C2["Time slot T2"]
+    direction TB
+    W0r["Warp0 S+1 LDS read"]
+    W1s["Warp1 S"]
+  end
+
+  W0m1 --> B0 --> W0s --> W0r
+  W1m2 --> W1m1 --> B1 --> W1s
   W1m1 -. "producer completes before consumer read" .-> W0r
+
+  classDef stage_m1 fill:#e8f1ff,stroke:#4f83cc,color:#000;
+  classDef stage_s fill:#e8fbe8,stroke:#3a9c3a,color:#000;
+  classDef stage_p1 fill:#fff3e6,stroke:#d28a2f,color:#000;
+  classDef barrier fill:#ffe6e6,stroke:#cc4b4b,color:#000;
+  class C0 stage_m1;
+  class C1 stage_s;
+  class C2 stage_p1;
+  class B0,B1 barrier;
 ```
 
 The same reasoning extends across iteration boundaries: phase lag is not only intra-iteration (`S-1 -> S+1`), but also inter-iteration via wrap-around edges.
