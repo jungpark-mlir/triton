@@ -360,31 +360,23 @@ flowchart LR
     U1w1["Stage : S-1<br/>Warp1"]
   end
 
-  subgraph U2["Time slot T2"]
+  subgraph U2["Time slot T2<br/>unresolved RAW hazard on same LDS slot"]
     direction TB
     U2w0["Stage : S+1<br/>Warp0 LDS read"]
     U2w1["Stage : S<br/>Warp1 LDS write (still active)"]
   end
 
-  UB0(("local_barrier"))
-  UB1(("local_barrier"))
-
-  U0w0 --> UB0 --> U1w0 --> U2w0
-  U0w1 --> U1w1 --> UB1 --> U2w1
-  U2w1 -. "unresolved RAW hazard on same LDS slot" .-> U2w0
+  U0w0 --> U1w0 --> U2w0
+  U0w1 --> U1w1 --> U2w1
 
   classDef stage_m2 fill:#f0f0f0,stroke:#6a6a6a,stroke-width:2px,color:#000,font-weight:bold;
   classDef stage_m1 fill:#e8f1ff,stroke:#2f6fbf,stroke-width:2px,color:#000,font-weight:bold;
   classDef stage_s fill:#e8fbe8,stroke:#2f8a2f,stroke-width:2px,color:#000,font-weight:bold;
   classDef stage_p1 fill:#fff3e6,stroke:#b87418,stroke-width:2px,color:#000,font-weight:bold;
-  classDef hazard fill:#ffe3e3,stroke:#c93a3a,stroke-width:2px,color:#000,font-weight:bold;
-  classDef barrier fill:#ffe6e6,stroke:#cc4b4b,color:#000;
   class U0w1 stage_m2;
   class U0w0,U1w1 stage_m1;
   class U1w0,U2w1 stage_s;
   class U2w0 stage_p1;
-  class U2w0,U2w1 hazard;
-  class UB0,UB1 barrier;
 ```
 
 This is why same-slot LDS dependencies are modeled with a wider window (e.g., producer completion by `S-1` and consumer at `S+1`) instead of relying on a late, adjacent-only resolve point.
