@@ -29,8 +29,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
-#include <map>
-#include <set>
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -287,7 +285,37 @@ struct WMMALoopSchedule {
                                        WMMALoopAxis::M, WMMALoopAxis::N};
 };
 
+static int axisOrdinal(WMMALoopAxis axis) {
+  switch (axis) {
+  case WMMALoopAxis::B:
+    return 0;
+  case WMMALoopAxis::M:
+    return 1;
+  case WMMALoopAxis::N:
+    return 2;
+  case WMMALoopAxis::K:
+    return 3;
+  }
+  llvm_unreachable("unknown WMMA loop axis");
+}
+
+static std::optional<WMMALoopAxis> parseAxisChar(char c) {
+  switch (c) {
+  case 'b':
+    return WMMALoopAxis::B;
+  case 'm':
+    return WMMALoopAxis::M;
+  case 'n':
+    return WMMALoopAxis::N;
+  case 'k':
+    return WMMALoopAxis::K;
+  default:
+    return std::nullopt;
+  }
+}
+
 WMMALoopSchedule getWMMALoopSchedule() {
+  // Runtime loop-order override. Default is previous behavior: kbmn.
   WMMALoopSchedule defaultSchedule;
   const char *order = std::getenv("TRITON_AMD_WMMA_LOOP_ORDER");
   if (!order)
@@ -309,49 +337,23 @@ WMMALoopSchedule getWMMALoopSchedule() {
   if (normalized.size() != 4)
     return defaultSchedule;
 
-  bool seenB = false, seenM = false, seenN = false, seenK = false;
-  auto parseAxis = [&](char c, WMMALoopAxis &axis) -> bool {
-    switch (c) {
-    case 'b':
-      if (seenB)
-        return false;
-      seenB = true;
-      axis = WMMALoopAxis::B;
-      return true;
-    case 'm':
-      if (seenM)
-        return false;
-      seenM = true;
-      axis = WMMALoopAxis::M;
-      return true;
-    case 'n':
-      if (seenN)
-        return false;
-      seenN = true;
-      axis = WMMALoopAxis::N;
-      return true;
-    case 'k':
-      if (seenK)
-        return false;
-      seenK = true;
-      axis = WMMALoopAxis::K;
-      return true;
-    default:
-      return false;
-    }
-  };
-
+  std::array<bool, 4> seen = {false, false, false, false};
   WMMALoopSchedule schedule;
   for (size_t i = 0; i < 4; ++i) {
-    WMMALoopAxis axis;
-    if (!parseAxis(normalized[i], axis))
+    auto axis = parseAxisChar(normalized[i]);
+    if (!axis.has_value())
       return defaultSchedule;
-    schedule.order[i] = axis;
+    int ord = axisOrdinal(axis.value());
+    if (seen[ord])
+      return defaultSchedule;
+    seen[ord] = true;
+    schedule.order[i] = axis.value();
   }
   return schedule;
 }
 
 WMMASubtileShape getWMMASubtileShape() {
+  // Subtile is in tile counts, not element counts: MxNxK.
   const char *shape = std::getenv("TRITON_AMD_WMMA_SUBTILE");
   if (!shape)
     return {};
@@ -382,6 +384,103 @@ WMMASubtileShape getWMMASubtileShape() {
   return subtile;
 }
 
+struct WMMAWorkItem {
+  size_t tileIdx;
+  size_t k;
+  size_t bIdx;
+  size_t mIdx;
+  size_t nIdx;
+};
+
+template <typename TileT, typename AxisFn>
+SmallVector<int> collectSortedUniqueAxis(const SmallVector<TileT> &tiles,
+                                         AxisFn getAxisValue) {
+  SmallVector<int> values;
+  values.reserve(tiles.size());
+  for (const auto &tile : tiles)
+    values.push_back(getAxisValue(tile));
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+  return values;
+}
+
+size_t lookupAxisIndex(const SmallVector<int> &values, int coord) {
+  auto it = std::lower_bound(values.begin(), values.end(), coord);
+  assert(it != values.end() && *it == coord && "expected coordinate exists");
+  return static_cast<size_t>(it - values.begin());
+}
+
+size_t getWMMAAxisIndex(const WMMAWorkItem &item, WMMALoopAxis axis) {
+  switch (axis) {
+  case WMMALoopAxis::B:
+    return item.bIdx;
+  case WMMALoopAxis::M:
+    return item.mIdx;
+  case WMMALoopAxis::N:
+    return item.nIdx;
+  case WMMALoopAxis::K:
+    return item.k;
+  }
+  llvm_unreachable("unknown WMMA loop axis");
+}
+
+size_t getWMMAAxisStep(WMMALoopAxis axis, WMMASubtileShape subtile) {
+  switch (axis) {
+  case WMMALoopAxis::B:
+    return 1;
+  case WMMALoopAxis::M:
+    return std::max<size_t>(subtile.mTiles, 1);
+  case WMMALoopAxis::N:
+    return std::max<size_t>(subtile.nTiles, 1);
+  case WMMALoopAxis::K:
+    return std::max<size_t>(subtile.kTiles, 1);
+  }
+  llvm_unreachable("unknown WMMA loop axis");
+}
+
+bool lessWMMAWorkItems(const WMMAWorkItem &lhs, const WMMAWorkItem &rhs,
+                       WMMALoopSchedule schedule, WMMASubtileShape subtile) {
+  // Order by subtile block id first, then intra-subtile lane.
+  for (WMMALoopAxis axis : schedule.order) {
+    size_t step = getWMMAAxisStep(axis, subtile);
+    size_t lhsBlock = getWMMAAxisIndex(lhs, axis) / step;
+    size_t rhsBlock = getWMMAAxisIndex(rhs, axis) / step;
+    if (lhsBlock != rhsBlock)
+      return lhsBlock < rhsBlock;
+  }
+  for (WMMALoopAxis axis : schedule.order) {
+    size_t step = getWMMAAxisStep(axis, subtile);
+    size_t lhsIntra = getWMMAAxisIndex(lhs, axis) % step;
+    size_t rhsIntra = getWMMAAxisIndex(rhs, axis) % step;
+    if (lhsIntra != rhsIntra)
+      return lhsIntra < rhsIntra;
+  }
+  return lhs.tileIdx < rhs.tileIdx;
+}
+
+template <typename TileT>
+SmallVector<WMMAWorkItem> buildWMMAWorkItems(const SmallVector<TileT> &tiles,
+                                             size_t numRepK) {
+  SmallVector<int> bValues =
+      collectSortedUniqueAxis(tiles, [](const auto &tile) { return tile.b; });
+  SmallVector<int> mValues =
+      collectSortedUniqueAxis(tiles, [](const auto &tile) { return tile.m; });
+  SmallVector<int> nValues =
+      collectSortedUniqueAxis(tiles, [](const auto &tile) { return tile.n; });
+
+  SmallVector<WMMAWorkItem> workItems;
+  workItems.reserve(tiles.size() * numRepK);
+  for (size_t tileIdx = 0; tileIdx < tiles.size(); ++tileIdx) {
+    const auto &tile = tiles[tileIdx];
+    const size_t bIdx = lookupAxisIndex(bValues, tile.b);
+    const size_t mIdx = lookupAxisIndex(mValues, tile.m);
+    const size_t nIdx = lookupAxisIndex(nValues, tile.n);
+    for (size_t k = 0; k < numRepK; ++k)
+      workItems.push_back({tileIdx, k, bIdx, mIdx, nIdx});
+  }
+  return workItems;
+}
+
 template <typename TileT, typename EmitFn>
 void emitScheduledWMMA(const SmallVector<TileT> &tiles, size_t numRepK,
                        WMMALoopSchedule loopSchedule, WMMASubtileShape subtile,
@@ -389,99 +488,12 @@ void emitScheduledWMMA(const SmallVector<TileT> &tiles, size_t numRepK,
   if (tiles.empty() || numRepK == 0)
     return;
 
-  std::set<int> bValuesSet;
-  std::set<int> mValuesSet;
-  std::set<int> nValuesSet;
-  for (size_t tileIdx = 0; tileIdx < tiles.size(); ++tileIdx) {
-    const auto &tile = tiles[tileIdx];
-    bValuesSet.insert(tile.b);
-    mValuesSet.insert(tile.m);
-    nValuesSet.insert(tile.n);
-  }
-
-  SmallVector<int> bValues(bValuesSet.begin(), bValuesSet.end());
-  SmallVector<int> mValues(mValuesSet.begin(), mValuesSet.end());
-  SmallVector<int> nValues(nValuesSet.begin(), nValuesSet.end());
-
-  std::map<int, size_t> bToIdx;
-  std::map<int, size_t> mToIdx;
-  std::map<int, size_t> nToIdx;
-  for (size_t i = 0; i < bValues.size(); ++i)
-    bToIdx[bValues[i]] = i;
-  for (size_t i = 0; i < mValues.size(); ++i)
-    mToIdx[mValues[i]] = i;
-  for (size_t i = 0; i < nValues.size(); ++i)
-    nToIdx[nValues[i]] = i;
-
-  struct WorkItem {
-    size_t tileIdx;
-    size_t k;
-    size_t bIdx;
-    size_t mIdx;
-    size_t nIdx;
-  };
-
-  SmallVector<WorkItem> workItems;
-  workItems.reserve(tiles.size() * numRepK);
-  for (size_t tileIdx = 0; tileIdx < tiles.size(); ++tileIdx) {
-    const auto &tile = tiles[tileIdx];
-    size_t bIdx = bToIdx[tile.b];
-    size_t mIdx = mToIdx[tile.m];
-    size_t nIdx = nToIdx[tile.n];
-    for (size_t k = 0; k < numRepK; ++k)
-      workItems.push_back({tileIdx, k, bIdx, mIdx, nIdx});
-  }
-
-  const size_t mStep = std::max<size_t>(subtile.mTiles, 1);
-  const size_t nStep = std::max<size_t>(subtile.nTiles, 1);
-  const size_t kStep = std::max<size_t>(subtile.kTiles, 1);
-  auto axisIndex = [&](const WorkItem &item, WMMALoopAxis axis) -> size_t {
-    switch (axis) {
-    case WMMALoopAxis::B:
-      return item.bIdx;
-    case WMMALoopAxis::M:
-      return item.mIdx;
-    case WMMALoopAxis::N:
-      return item.nIdx;
-    case WMMALoopAxis::K:
-      return item.k;
-    }
-    llvm_unreachable("unknown WMMA loop axis");
-  };
-  auto axisStep = [&](WMMALoopAxis axis) -> size_t {
-    switch (axis) {
-    case WMMALoopAxis::B:
-      return 1;
-    case WMMALoopAxis::M:
-      return mStep;
-    case WMMALoopAxis::N:
-      return nStep;
-    case WMMALoopAxis::K:
-      return kStep;
-    }
-    llvm_unreachable("unknown WMMA loop axis");
-  };
-
+  SmallVector<WMMAWorkItem> workItems = buildWMMAWorkItems(tiles, numRepK);
   std::stable_sort(workItems.begin(), workItems.end(),
-                   [&](const WorkItem &lhs, const WorkItem &rhs) {
-                     for (WMMALoopAxis axis : loopSchedule.order) {
-                       size_t step = axisStep(axis);
-                       size_t lhsBlock = axisIndex(lhs, axis) / step;
-                       size_t rhsBlock = axisIndex(rhs, axis) / step;
-                       if (lhsBlock != rhsBlock)
-                         return lhsBlock < rhsBlock;
-                     }
-                     for (WMMALoopAxis axis : loopSchedule.order) {
-                       size_t step = axisStep(axis);
-                       size_t lhsIntra = axisIndex(lhs, axis) % step;
-                       size_t rhsIntra = axisIndex(rhs, axis) % step;
-                       if (lhsIntra != rhsIntra)
-                         return lhsIntra < rhsIntra;
-                     }
-                     return lhs.tileIdx < rhs.tileIdx;
+                   [&](const WMMAWorkItem &lhs, const WMMAWorkItem &rhs) {
+                     return lessWMMAWorkItems(lhs, rhs, loopSchedule, subtile);
                    });
-
-  for (const WorkItem &item : workItems)
+  for (const WMMAWorkItem &item : workItems)
     emitFn(tiles[item.tileIdx], item.k);
 }
 
