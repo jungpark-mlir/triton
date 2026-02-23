@@ -26,6 +26,7 @@
 #include "../PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
 #include "Utility.h"
+#include <cstdlib>
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -264,6 +265,23 @@ static uint64_t packMN(uint32_t m, uint32_t n) {
   return (uint64_t(m) << 32) | uint64_t(n);
 }
 
+enum class WMMALoopOrder {
+  KOuter,
+  TileOuter,
+};
+
+WMMALoopOrder getWMMALoopOrder() {
+  const char *order = std::getenv("TRITON_AMD_WMMA_LOOP_ORDER");
+  if (!order)
+    return WMMALoopOrder::KOuter;
+
+  StringRef orderRef(order);
+  if (orderRef.equals_insensitive("tile_k") ||
+      orderRef.equals_insensitive("mnk"))
+    return WMMALoopOrder::TileOuter;
+  return WMMALoopOrder::KOuter;
+}
+
 std::optional<int> findNextM(LinearLayout repLayout, int &reg, int elemsPerVec,
                              int m, int rank) {
   auto ctx = repLayout.getOutDimNames().begin()->getContext();
@@ -397,6 +415,7 @@ LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
 
   llvm::DenseSet<uint64_t> mnProcessed;
   SmallVector<AccTile> accTiles;
+  const WMMALoopOrder loopOrder = getWMMALoopOrder();
   for (int reg = 0; reg < repLayout.getInDimSize(kRegister);
        reg += dElemsToStorePerThread) {
     auto repIndices = repLayout.apply(
@@ -426,69 +445,77 @@ LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
         {reg, nextMReg, b, m, n, tiedGroup, nextM, tiedIntrinsicName});
   }
 
-  for (size_t k = 0; k < numRepK; ++k) {
-    for (const auto &accTile : accTiles) {
-      Value acc = tb.undef(vecTy);
-      auto selectRegValue = [&](int subTied) {
-        return (subTied == 0) ? accTile.reg : accTile.nextMReg;
-      };
+  auto emitDotForTileAndK = [&](const AccTile &accTile, size_t k) {
+    Value acc = tb.undef(vecTy);
+    auto selectRegValue = [&](int subTied) {
+      return (subTied == 0) ? accTile.reg : accTile.nextMReg;
+    };
 
-      for (unsigned v = 0; v < dElemsToStorePerThread; ++v) {
-        for (int subTied = 0; subTied < accTile.tiedGroup; ++subTied) {
-          acc = tb.insert_element(vecTy, acc, fc[selectRegValue(subTied) + v],
-                                  tb.i32_val(v * paddedOutputElemSize +
-                                             subTied));
-        }
-      }
-
-      auto ha = getOperandVals(rewriter, typeConverter, aLayout, loadedA,
-                               /*opIdx*/ 0, rank, accTile.b, accTile.m, k, kDim,
-                               kBase, kPadding,
-                               /*opScale*/ nullptr,
-                               aTensorTy.getElementType(), loc);
-      ha = prepareOperands(rewriter, ha, aTensorTy.getElementType(), wmmaVer,
-                           kBase, loc);
-
-      auto hb = getOperandVals(rewriter, typeConverter, bLayout, loadedB,
-                               /*opIdx*/ 1, rank, accTile.b, accTile.n, k, kDim,
-                               kBase, kPadding,
-                               /*opScale*/ nullptr,
-                               bTensorTy.getElementType(), loc);
-      hb = prepareOperands(rewriter, hb, bTensorTy.getElementType(), wmmaVer,
-                           kBase, loc);
-
-      Value haNext;
-      if (accTile.tiedGroup == 2) {
-        haNext = getOperandVals(rewriter, typeConverter, aLayout, loadedA,
-                                /*opIdx*/ 0, rank, accTile.b,
-                                accTile.nextM.value(), k, kDim, kBase, kPadding,
-                                nullptr, aTensorTy.getElementType(), loc);
-        haNext = prepareOperands(rewriter, haNext, aTensorTy.getElementType(),
-                                 wmmaVer, kBase, loc);
-      }
-
+    for (unsigned v = 0; v < dElemsToStorePerThread; ++v) {
       for (int subTied = 0; subTied < accTile.tiedGroup; ++subTied) {
-        auto optTied = accTile.tiedGroup == 2
-                           ? std::optional<bool>(subTied != 0)
-                           : std::nullopt;
-        auto aValue = subTied == 0 ? ha : haNext;
-        acc = wmmaLayout.getIsTransposed()
-                  ? generateWMMAOp(rewriter, loc, wmmaVer, hb, aValue, acc,
-                                   bTensorTy.getElementType(),
-                                   aTensorTy.getElementType(), dstElemTy,
-                                   accTile.intrinsicName, optTied)
-                  : generateWMMAOp(rewriter, loc, wmmaVer, aValue, hb, acc,
-                                   aTensorTy.getElementType(),
-                                   bTensorTy.getElementType(), dstElemTy,
-                                   accTile.intrinsicName, optTied);
+        acc = tb.insert_element(vecTy, acc, fc[selectRegValue(subTied) + v],
+                                tb.i32_val(v * paddedOutputElemSize + subTied));
       }
+    }
 
-      for (unsigned v = 0; v < dElemsToStorePerThread; ++v) {
-        for (int subTied = 0; subTied < accTile.tiedGroup; ++subTied) {
-          fc[selectRegValue(subTied) + v] = tb.extract_element(
-              dstElemTy, acc, tb.i32_val(v * paddedOutputElemSize + subTied));
-        }
+    auto ha = getOperandVals(rewriter, typeConverter, aLayout, loadedA,
+                             /*opIdx*/ 0, rank, accTile.b, accTile.m, k, kDim,
+                             kBase, kPadding,
+                             /*opScale*/ nullptr, aTensorTy.getElementType(),
+                             loc);
+    ha = prepareOperands(rewriter, ha, aTensorTy.getElementType(), wmmaVer,
+                         kBase, loc);
+
+    auto hb = getOperandVals(rewriter, typeConverter, bLayout, loadedB,
+                             /*opIdx*/ 1, rank, accTile.b, accTile.n, k, kDim,
+                             kBase, kPadding,
+                             /*opScale*/ nullptr, bTensorTy.getElementType(),
+                             loc);
+    hb = prepareOperands(rewriter, hb, bTensorTy.getElementType(), wmmaVer,
+                         kBase, loc);
+
+    Value haNext;
+    if (accTile.tiedGroup == 2) {
+      haNext = getOperandVals(rewriter, typeConverter, aLayout, loadedA,
+                              /*opIdx*/ 0, rank, accTile.b,
+                              accTile.nextM.value(), k, kDim, kBase, kPadding,
+                              nullptr, aTensorTy.getElementType(), loc);
+      haNext = prepareOperands(rewriter, haNext, aTensorTy.getElementType(),
+                               wmmaVer, kBase, loc);
+    }
+
+    for (int subTied = 0; subTied < accTile.tiedGroup; ++subTied) {
+      auto optTied = accTile.tiedGroup == 2 ? std::optional<bool>(subTied != 0)
+                                            : std::nullopt;
+      auto aValue = subTied == 0 ? ha : haNext;
+      acc = wmmaLayout.getIsTransposed()
+                ? generateWMMAOp(rewriter, loc, wmmaVer, hb, aValue, acc,
+                                 bTensorTy.getElementType(),
+                                 aTensorTy.getElementType(), dstElemTy,
+                                 accTile.intrinsicName, optTied)
+                : generateWMMAOp(rewriter, loc, wmmaVer, aValue, hb, acc,
+                                 aTensorTy.getElementType(),
+                                 bTensorTy.getElementType(), dstElemTy,
+                                 accTile.intrinsicName, optTied);
+    }
+
+    for (unsigned v = 0; v < dElemsToStorePerThread; ++v) {
+      for (int subTied = 0; subTied < accTile.tiedGroup; ++subTied) {
+        fc[selectRegValue(subTied) + v] = tb.extract_element(
+            dstElemTy, acc, tb.i32_val(v * paddedOutputElemSize + subTied));
       }
+    }
+  };
+
+  if (loopOrder == WMMALoopOrder::KOuter) {
+    for (size_t k = 0; k < numRepK; ++k) {
+      for (const auto &accTile : accTiles)
+        emitDotForTileAndK(accTile, k);
+    }
+  } else {
+    for (const auto &accTile : accTiles) {
+      for (size_t k = 0; k < numRepK; ++k)
+        emitDotForTileAndK(accTile, k);
     }
   }
 
@@ -607,6 +634,7 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
   };
 
   SmallVector<ScaledAccTile> scaledAccTiles;
+  const WMMALoopOrder loopOrder = getWMMALoopOrder();
   for (int reg = 0; reg < repLayout.getInDimSize(kRegister);
        reg += elemsPerVec) {
     auto repIndices = repLayout.apply(
@@ -617,63 +645,73 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
     scaledAccTiles.push_back({reg, b, m, n});
   }
 
-  for (size_t k = 0; k < numRepK; k++) {
+  auto emitScaledDotForTileAndK = [&](const ScaledAccTile &accTile, size_t k) {
+    Value acc = tb.undef(vecTy);
+    for (unsigned v = 0; v < dElemsToStorePerThread; ++v) {
+      acc = tb.insert_element(vecTy, acc, fc[accTile.reg + v], tb.i32_val(v));
+    }
+
+    int scaleOpSelA = 0;
+    int scaleOpSelB = 0;
+
+    auto ha = getOperandVals(rewriter, typeConverter, aLayout, loadedA,
+                             /*opIdx*/ 0, rank, accTile.b, accTile.m, k, kDimA,
+                             kBaseA, kPaddingA,
+                             /*opSel*/ nullptr, aTensorTy.getElementType(),
+                             loc);
+    ha = prepareOperands(rewriter, ha, aTensorTy.getElementType(), wmmaVer,
+                         kBaseA, loc);
+
+    auto hb = getOperandVals(rewriter, typeConverter, bLayout, loadedB,
+                             /*opIdx*/ 1, rank, accTile.b, accTile.n, k, kDimB,
+                             kBaseB, kPaddingB,
+                             /*opSel*/ nullptr, bTensorTy.getElementType(),
+                             loc);
+    hb = prepareOperands(rewriter, hb, bTensorTy.getElementType(), wmmaVer,
+                         kBaseB, loc);
+
+    auto sa = getOperandVals(
+        rewriter, typeConverter, aScaleLayout, loadedAScale,
+        /*opIdx*/ 0, rank, accTile.b, accTile.m, k, kDimA / scaleFactorA,
+        KBaseScale,
+        /*padding*/ 0, &scaleOpSelA, aScaleTensorTy.getElementType(), loc,
+        /*isScale*/ true);
+    sa = prepareOperands(rewriter, sa, aScaleTensorTy.getElementType(), wmmaVer,
+                         KBaseScale, loc);
+
+    auto sb = getOperandVals(
+        rewriter, typeConverter, bScaleLayout, loadedBScale,
+        /*opIdx*/ 0, rank, accTile.b, accTile.n, k, kDimB / scaleFactorB,
+        KBaseScale,
+        /*padding*/ 0, &scaleOpSelB, bScaleTensorTy.getElementType(), loc,
+        /*isScale*/ true);
+    sb = prepareOperands(rewriter, sb, bScaleTensorTy.getElementType(), wmmaVer,
+                         KBaseScale, loc);
+
+    acc = wmmaLayout.getIsTransposed()
+              ? generateScaledWMMAIntrinsic(
+                    rewriter, loc, hb, sb, ha, sa, acc, scaledBElemType,
+                    scaledAElemType, dstElemTy, KBaseScale, scaleOpSelB,
+                    scaleOpSelA)
+              : generateScaledWMMAIntrinsic(
+                    rewriter, loc, ha, sa, hb, sb, acc, scaledAElemType,
+                    scaledBElemType, dstElemTy, KBaseScale, scaleOpSelA,
+                    scaleOpSelB);
+
+    for (unsigned v = 0; v < dElemsToStorePerThread; ++v) {
+      fc[accTile.reg + v] = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
+    }
+  };
+
+  if (loopOrder == WMMALoopOrder::KOuter) {
+    for (size_t k = 0; k < numRepK; k++) {
+      for (const auto &accTile : scaledAccTiles)
+        emitScaledDotForTileAndK(accTile, k);
+    }
+  } else {
     for (const auto &accTile : scaledAccTiles) {
-      Value acc = tb.undef(vecTy);
-      for (unsigned v = 0; v < dElemsToStorePerThread; ++v) {
-        acc = tb.insert_element(vecTy, acc, fc[accTile.reg + v], tb.i32_val(v));
-      }
-
-      int scaleOpSelA = 0;
-      int scaleOpSelB = 0;
-
-      auto ha = getOperandVals(rewriter, typeConverter, aLayout, loadedA,
-                               /*opIdx*/ 0, rank, accTile.b, accTile.m, k,
-                               kDimA, kBaseA, kPaddingA,
-                               /*opSel*/ nullptr,
-                               aTensorTy.getElementType(), loc);
-      ha = prepareOperands(rewriter, ha, aTensorTy.getElementType(), wmmaVer,
-                           kBaseA, loc);
-
-      auto hb = getOperandVals(rewriter, typeConverter, bLayout, loadedB,
-                               /*opIdx*/ 1, rank, accTile.b, accTile.n, k,
-                               kDimB, kBaseB, kPaddingB,
-                               /*opSel*/ nullptr,
-                               bTensorTy.getElementType(), loc);
-      hb = prepareOperands(rewriter, hb, bTensorTy.getElementType(), wmmaVer,
-                           kBaseB, loc);
-
-      auto sa = getOperandVals(
-          rewriter, typeConverter, aScaleLayout, loadedAScale,
-          /*opIdx*/ 0, rank, accTile.b, accTile.m, k, kDimA / scaleFactorA,
-          KBaseScale,
-          /*padding*/ 0, &scaleOpSelA, aScaleTensorTy.getElementType(), loc,
-          /*isScale*/ true);
-      sa = prepareOperands(rewriter, sa, aScaleTensorTy.getElementType(),
-                           wmmaVer, KBaseScale, loc);
-
-      auto sb = getOperandVals(
-          rewriter, typeConverter, bScaleLayout, loadedBScale,
-          /*opIdx*/ 0, rank, accTile.b, accTile.n, k, kDimB / scaleFactorB,
-          KBaseScale,
-          /*padding*/ 0, &scaleOpSelB, bScaleTensorTy.getElementType(), loc,
-          /*isScale*/ true);
-      sb = prepareOperands(rewriter, sb, bScaleTensorTy.getElementType(),
-                           wmmaVer, KBaseScale, loc);
-
-      acc = wmmaLayout.getIsTransposed()
-                ? generateScaledWMMAIntrinsic(
-                      rewriter, loc, hb, sb, ha, sa, acc, scaledBElemType,
-                      scaledAElemType, dstElemTy, KBaseScale, scaleOpSelB,
-                      scaleOpSelA)
-                : generateScaledWMMAIntrinsic(
-                      rewriter, loc, ha, sa, hb, sb, acc, scaledAElemType,
-                      scaledBElemType, dstElemTy, KBaseScale, scaleOpSelA,
-                      scaleOpSelB);
-
-      for (unsigned v = 0; v < dElemsToStorePerThread; ++v) {
-        fc[accTile.reg + v] = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
-      }
+      for (size_t k = 0; k < numRepK; k++)
+        emitScaledDotForTileAndK(accTile, k);
     }
   }
 
