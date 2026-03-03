@@ -714,7 +714,7 @@ class InterpreterBuilder:
     def create_assume(self, condition):
         assert condition, "Assume failed"
 
-    def create_barrier(self):
+    def create_barrier(self, cta=False, addrspace=0b11111):
         # Triton's barrier applies to each program in a grid, so it's a no-op in the interpreter
         pass
 

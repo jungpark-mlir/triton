@@ -41,6 +41,14 @@ static LogicalResult lowerBarrier(Operation *op, unsigned numWarps,
   return success();
 }
 
+static bool isCTABarrier(Operation *op) {
+  if (auto cta = op->getAttrOfType<BoolAttr>("ttg.cta"))
+    return cta.getValue();
+  if (auto cta = op->getAttrOfType<BoolAttr>("cta"))
+    return cta.getValue();
+  return false;
+}
+
 static LogicalResult lowerCallOp(LLVM::CallOp callOp, unsigned numWarps,
                                  std::optional<unsigned> partitionIdx,
                                  WarpSpecializeBarrierHelper &barrierHelper) {
@@ -72,6 +80,8 @@ lowerKernelBarriers(LLVM::LLVMFuncOp func,
       return WalkResult::skip();
     }
     if (barrierHelper.isBarrierOp(op)) {
+      if (isCTABarrier(op))
+        return WalkResult::advance();
       auto barRes =
           lowerBarrier(op, defaultNumWarps, /*partitionIdx=*/{}, barrierHelper);
       // Since this is a PreOrder walk, we have to return skip() on success so
@@ -96,6 +106,8 @@ lowerKernelBarriers(LLVM::LLVMFuncOp func,
       unsigned numWarps = op.getPartitionNumWarps()[idx];
       WalkResult result = partition->walk([&, idx = idx](Operation *op) {
         if (barrierHelper.isBarrierOp(op)) {
+          if (isCTABarrier(op))
+            return WalkResult::advance();
           return WalkResult(lowerBarrier(op, numWarps, idx, barrierHelper));
         }
         if (auto callOp = dyn_cast<LLVM::CallOp>(op)) {
@@ -143,6 +155,8 @@ lowerInnerFunctionBarriers(LLVM::LLVMFuncOp func,
 
   func.walk([&](Operation *op) {
     if (barrierHelper.isBarrierOp(op)) {
+      if (isCTABarrier(op))
+        return;
       TritonLLVMIRRewriter b(op->getLoc(), op);
       barrierHelper.createBarrier(b, numWarps, handle);
       op->erase();

@@ -333,7 +333,9 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<mlir::gpu::BarrierOp>(op);
+    auto newOp = rewriter.replaceOpWithNewOp<mlir::gpu::BarrierOp>(op);
+    if (op.getCta())
+      newOp->setAttr("ttg.cta", rewriter.getBoolAttr(true));
     return success();
   }
 };

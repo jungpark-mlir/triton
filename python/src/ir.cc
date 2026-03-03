@@ -1829,10 +1829,28 @@ void init_triton_ir(py::module &&m) {
       .def("create_gather",
            [](TritonOpBuilder &self, Value src, Value indices, int axis)
                -> Value { return self.create<GatherOp>(src, indices, axis); })
-      // Force GPU barrier
+      // Create TTG barrier (optional CTA intent and addrspace mask)
       .def("create_barrier",
-           [](TritonOpBuilder &self) {
-             self.create<triton::gpu::BarrierOp>(triton::gpu::AddrSpace::All);
+           [](TritonOpBuilder &self, bool cta, int addrspace) {
+             self.create<triton::gpu::BarrierOp>(
+                 static_cast<triton::gpu::AddrSpace>(addrspace), cta);
+           },
+           py::arg("cta") = false,
+           py::arg("addrspace") = static_cast<int>(triton::gpu::AddrSpace::All))
+      // Make a block pointer (tensor pointer in Triton IR)
+      .def("create_make_block_ptr",
+           [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
+              std::vector<Value> &strides, std::vector<Value> &offsets,
+              std::vector<int32_t> &tensorShape,
+              std::vector<int32_t> &order) -> Value {
+             return self.create<MakeTensorPtrOp>(base, shape, strides, offsets,
+                                                 tensorShape, order);
+           })
+      // Advance a block pointer
+      .def("create_advance",
+           [](TritonOpBuilder &self, Value &ptr,
+              std::vector<Value> &offsets) -> Value {
+             return self.create<AdvanceOp>(ptr.getType(), ptr, offsets);
            })
       // Make a tensor descriptor
       .def("create_make_tensor_descriptor",

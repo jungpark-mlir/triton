@@ -1397,9 +1397,12 @@ void BarrierOp::print(OpAsmPrinter &p) {
   } else {
     p << ' ' << stringifyAddrSpace(getAddrSpace());
   }
+  if (getCta())
+    p << " cta";
 }
 
 ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
+  MLIRContext *ctx = parser.getContext();
   auto parseAddrSpace = [&]() -> FailureOr<AddrSpace> {
     std::string keyword;
     if (parser.parseKeywordOrString(&keyword))
@@ -1427,8 +1430,9 @@ ParseResult BarrierOp::parse(OpAsmParser &parser, OperationState &result) {
     addrSpaceRet = bitEnumSet(addrSpaceRet, *addrSpace);
   }
 
-  result.addAttribute("addrSpace",
-                      AddrSpaceAttr::get(parser.getContext(), addrSpaceRet));
+  result.addAttribute("addrSpace", AddrSpaceAttr::get(ctx, addrSpaceRet));
+  bool cta = succeeded(parser.parseOptionalKeyword("cta"));
+  result.addAttribute("cta", BoolAttr::get(ctx, cta));
 
   return success();
 }
