@@ -577,17 +577,36 @@ def num_ctas(_semantic=None):
 
 
 @builtin
-def barrier(*, cluster: bool = False, _semantic=None):
+def barrier(*, cluster: bool = False, cta: bool = False, addrspace=None, _semantic=None):
     """
     Insert a barrier to synchronize threads within a CTA, or across a cluster.
+    For non-cluster usage, this emits a TTG barrier directly.
 
     Args:
         cluster (bool): Whether to synchronize across the CTA cluster.
+        cta (bool): Preserve CTA-scope barrier semantics in warp-specialized
+            lowering.
+        addrspace: Optional TTG barrier address-space mask. If not provided,
+            defaults to `all`.
+            Valid only for non-cluster barriers.
     """
     cluster = _unwrap_if_constexpr(cluster)
+    cta = _unwrap_if_constexpr(cta)
+    addrspace = _unwrap_if_constexpr(addrspace)
+    if cluster and cta:
+        raise ValueError("cta flag is only valid for non-cluster barriers")
+    if cluster and addrspace is not None:
+        raise ValueError("addrspace is only valid for non-cluster barriers")
     num_ctas = _unwrap_if_constexpr(_semantic.num_ctas())
     if num_ctas == 1 or not cluster:
-        return _semantic.debug_barrier()
+        if addrspace is None:
+            addrspace = 0b11111
+        elif hasattr(addrspace, "value"):
+            addrspace = int(addrspace.value)
+        else:
+            addrspace = int(addrspace)
+        _semantic.builder.create_barrier(cta=cta, addrspace=addrspace)
+        return
     _semantic.builder.create_cluster_barrier()
 
 

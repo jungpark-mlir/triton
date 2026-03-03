@@ -487,7 +487,9 @@ public:
           /* store= */ op.hasGlobalWrite() ? zero : nullptr,
           /* ds= */ localBarrier ? zero : nullptr);
     }
-    rewriter.replaceOpWithNewOp<ROCDL::SBarrierOp>(op);
+    auto newOp = rewriter.replaceOpWithNewOp<ROCDL::SBarrierOp>(op);
+    if (op.getCta())
+      newOp->setAttr("ttg.cta", rewriter.getBoolAttr(true));
 
     return success();
   }

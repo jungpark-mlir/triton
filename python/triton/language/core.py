@@ -3006,6 +3006,7 @@ def map_elementwise(
 def debug_barrier(_semantic=None):
     '''
     Insert a barrier to synchronize all threads in a block.
+    Uses the default full TTG barrier scope (all address spaces).
     '''
     return _semantic.debug_barrier()
 
