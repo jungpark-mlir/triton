@@ -44,6 +44,12 @@ class MemWaitOpTrait
   // Optional: Add methods or verification logic here
 };
 
+template <typename ConcreteType>
+class MemAsyncLocalStoreOpTrait
+    : public mlir::OpTrait::TraitBase<ConcreteType,
+                                      MemAsyncLocalStoreOpTrait> {
+};
+
 } // namespace OpTrait
 } // namespace mlir
 
