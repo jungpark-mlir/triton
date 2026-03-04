@@ -3,7 +3,8 @@ from ..._semantic import _check
 from triton.experimental.gluon.language._layouts import DistributedLayout
 from ..cdna4.async_copy import commit_group, wait_group
 
-__all__ = ["global_to_shared", "shared_to_global", "commit_group", "wait_group", "mbarrier_arrive"]
+__all__ = ["global_to_shared", "shared_to_global", "commit_group", "wait_group", "mbarrier_arrive",
+           "load_shared_relaxed"]
 
 
 @builtin
@@ -76,3 +77,25 @@ def mbarrier_arrive(mbarrier, _semantic=None):
         mbarrier (shared_memory_descriptor): Barrier object to arrive on.
     """
     _semantic.builder.create_async_copy_lds_barrier_arrive(mbarrier.handle)
+
+
+@builtin
+def load_shared_relaxed(smem, layout, _semantic=None):
+    """
+    Load a tensor from shared memory with extra hints for the underlying
+    compiler to avoid emitting unnecessary waits before loading from the target
+    shared memory.
+
+    Args:
+        smem (shared_memory_descriptor): Shared memory descriptor to load from.
+        layout (DistributedLayout): The destination layout of the tensor.
+
+    Returns:
+        tensor: A Gluon tensor containing the loaded data.
+    """
+    SYNCED_VIA_WAIT_ATTR_NAME = "ttg.amdg.syncedViaAsyncWait"
+
+    layout = _unwrap_if_constexpr(layout)
+    ret = _semantic.shared_load(smem, layout)
+    ret.handle.set_attr(SYNCED_VIA_WAIT_ATTR_NAME, _semantic.builder.get_bool_attr(True))
+    return ret

@@ -689,11 +689,17 @@ class MXFPGEMMWSMSplitProgram:
         a_buffer = self.a_buffer0 if first_half else self.a_buffer1
         if cfg.WITH_A_SCALE:
             a_scale_buffer = self.a_scale_buffer0 if first_half else self.a_scale_buffer1
-        a = a_buffer.index(wmma_idx % cfg.NUM_BUFFERS).load(layout=cfg.dot_layout_a)
+        a = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+            a_buffer.index(wmma_idx % cfg.NUM_BUFFERS), cfg.dot_layout_a
+        )
         if cfg.TRANSPOSE_B:
-            b = self.b_buffer.index(wmma_idx % cfg.NUM_BUFFERS).permute([1, 0]).load(layout=cfg.dot_layout_b)
+            b = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+                self.b_buffer.index(wmma_idx % cfg.NUM_BUFFERS).permute([1, 0]), cfg.dot_layout_b
+            )
         else:
-            b = self.b_buffer.index(wmma_idx % cfg.NUM_BUFFERS).load(layout=cfg.dot_layout_b)
+            b = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+                self.b_buffer.index(wmma_idx % cfg.NUM_BUFFERS), cfg.dot_layout_b
+            )
         if cfg.WITH_A_SCALE:
             a_scale_buffer_slice = a_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
         b_scale_buffer_slice = self.b_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
@@ -712,10 +718,14 @@ class MXFPGEMMWSMSplitProgram:
                 4,
                 cfg.SCALE_KWIDTH)).permute((0, 3, 2, 1, 4)).reshape((cfg.BLOCK_N, BLOCK_K_SCALE))
         if cfg.WITH_A_SCALE:
-            scale_a = a_scale_buffer_slice.load(layout=cfg.layout_a_scale)
+            scale_a = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+                a_scale_buffer_slice, cfg.layout_a_scale
+            )
         else:
             scale_a = gl.constexpr(0)
-        scale_b = b_scale_buffer_slice.load(layout=cfg.layout_b_scale)
+        scale_b = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+            b_scale_buffer_slice, cfg.layout_b_scale
+        )
         return a, b, scale_a, scale_b
 
     @gluon.jit
@@ -747,19 +757,31 @@ class MXFPGEMMWSMSplitProgram:
             load_idx = self.issue_loads(load_idx)
 
         gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+        gl.sched_barrier(0)
         gl.barrier(cta=False, addrspace=0b00001)
+        gl.sched_barrier(0)
         gl.assume(loop_ub >= 0)
         for _ in range(0, loop_ub):
-            load_idx = self.issue_loads(load_idx)
+            
             a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, True)
+            gl.sched_barrier(0)
             wmma_idx += 1
+            load_idx = self.issue_loads(load_idx)
+
+            gl.sched_barrier(0)
             gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
             c0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c0)
-            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 3) * NUM_LOADS_IN_BATCH_WS)
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
             gl.barrier(cta=True, addrspace=0b00001)
+            gl.sched_barrier(0)
 
         gl.barrier(cta=True, addrspace=0b00000)
+        gl.sched_barrier(0)
         for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
             gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 1 - i) * NUM_LOADS_IN_BATCH_WS)
             gl.barrier(cta=True, addrspace=0b00001)
             a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, True)
@@ -779,13 +801,18 @@ class MXFPGEMMWSMSplitProgram:
         for _ in range(0, loop_ub):
             a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, False)
             wmma_idx += 1
+            gl.sched_barrier(0)
             gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
             c1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c1)
+            gl.sched_barrier(0)
             gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
 
-        gl.barrier(cta=True, addrspace=0b00000)
         for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
             gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
             a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, False)
             wmma_idx += 1
             c1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c1)
