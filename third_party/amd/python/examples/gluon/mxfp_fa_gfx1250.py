@@ -3222,12 +3222,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args = vars(args)
 
-    kernel = run_attention(
-        args["q_type"], args["kv_type"], args["batch"], args["seqlen_q"], args["seqlen_k"],
-        args["num_q_heads"], args["num_k_heads"], args["head_sz"], args["scale_type"],
-        args["disable_p_scaling"], args["block_m"], args["block_n"], args["split_k"],
-        args["pipelined"], args["num_warps"])
-    static_profile(kernel)
     if args["verif"]:
         if args["scale_type"] == "global":
             test_global_scaled_attn_fwd(
@@ -3239,3 +3233,10 @@ if __name__ == "__main__":
                 args["q_type"], args["kv_type"], args["batch"], args["seqlen_q"], args["seqlen_k"],
                 args["num_q_heads"], args["num_k_heads"], args["head_sz"], args["block_m"], args["block_n"],
                 args["split_k"], args["pipelined"], args["num_warps"], args["disable_p_scaling"])
+    else:
+        kernel = run_attention(
+            args["q_type"], args["kv_type"], args["batch"], args["seqlen_q"], args["seqlen_k"],
+            args["num_q_heads"], args["num_k_heads"], args["head_sz"], args["scale_type"],
+            args["disable_p_scaling"], args["block_m"], args["block_n"], args["split_k"],
+            args["pipelined"], args["num_warps"])
+        static_profile(kernel)
