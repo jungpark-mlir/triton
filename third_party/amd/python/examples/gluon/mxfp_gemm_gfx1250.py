@@ -683,6 +683,25 @@ class MXFPGEMMWSMSplitProgram:
         return load_idx + 1
 
     @gluon.jit
+    def issue_loads_noscale(self, load_idx, pred=1):
+        cfg = self.cfg
+        BLOCK_K_PACKED_A: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_A
+        BLOCK_K_PACKED_B: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_B
+        HALF_M: gl.constexpr = cfg.BLOCK_M // cfg.NUM_SUBTILES[0]
+
+        gl.amd.gfx1250.tdm.async_load(self.a_desc0, [0, load_idx * BLOCK_K_PACKED_A],
+                                      self.a_buffer0.index(load_idx % cfg.NUM_BUFFERS), pred=pred)
+        gl.amd.gfx1250.tdm.async_load(self.a_desc1, [HALF_M, load_idx * BLOCK_K_PACKED_A],
+                                      self.a_buffer1.index(load_idx % cfg.NUM_BUFFERS), pred=pred)
+        if cfg.TRANSPOSE_B:
+            gl.amd.gfx1250.tdm.async_load(self.b_desc, [0, load_idx * BLOCK_K_PACKED_B],
+                                          self.b_buffer.index(load_idx % cfg.NUM_BUFFERS), pred=pred)
+        else:
+            gl.amd.gfx1250.tdm.async_load(self.b_desc, [load_idx * BLOCK_K_PACKED_B, 0],
+                                          self.b_buffer.index(load_idx % cfg.NUM_BUFFERS), pred=pred)
+        return load_idx + 1
+
+    @gluon.jit
     def issue_local_loads(self, wmma_idx, first_half: gl.constexpr):
         cfg = self.cfg
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
@@ -730,6 +749,29 @@ class MXFPGEMMWSMSplitProgram:
         return a, b, scale_a, scale_b
 
     @gluon.jit
+    def issue_local_loads_noscale(self, wmma_idx, first_half: gl.constexpr):
+        cfg = self.cfg
+        HALF_M: gl.constexpr = cfg.BLOCK_M // cfg.NUM_SUBTILES[0]
+        BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
+        # Partition-local A, shared B.
+        a_buffer = self.a_buffer0 if first_half else self.a_buffer1
+        a = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+            a_buffer.index(wmma_idx % cfg.NUM_BUFFERS), cfg.dot_layout_a
+        )
+        if cfg.TRANSPOSE_B:
+            b = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+                self.b_buffer.index(wmma_idx % cfg.NUM_BUFFERS).permute([1, 0]), cfg.dot_layout_b
+            )
+        else:
+            b = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+                self.b_buffer.index(wmma_idx % cfg.NUM_BUFFERS), cfg.dot_layout_b
+            )
+        # MX scale uses packed uint8 encoding; 0x7F represents 1.0.
+        scale_a = gl.full([HALF_M, BLOCK_K_SCALE], 0x7F, gl.uint8, cfg.layout_a_scale)
+        scale_b = gl.full([cfg.BLOCK_N, BLOCK_K_SCALE], 0x7F, gl.uint8, cfg.layout_b_scale)
+        return a, b, scale_a, scale_b
+
+    @gluon.jit
     def warp_pipeline_ws(self, K):
         cfg = self.cfg
         gl.static_assert(cfg.NUM_WARPS == 4)
@@ -745,6 +787,54 @@ class MXFPGEMMWSMSplitProgram:
             ],
             # In this Gluon path, worker_num_warps is a single total worker value,
             # not a per-partition list.
+            [cfg.NUM_WARPS],
+        )
+
+    @gluon.jit
+    def warp_pipeline_ws_noscale(self, K):
+        cfg = self.cfg
+        gl.static_assert(cfg.NUM_WARPS == 4)
+        HALF_M: gl.constexpr = cfg.BLOCK_M // 2
+        load_idx = 0
+        wmma_idx = 0
+        loop_ub = gl.cdiv(K, cfg.BLOCK_K) - (cfg.NUM_BUFFERS - 1)
+        gl.warp_specialize(
+            [
+                (MXFPGEMMWSMSplitProgram.ws_pipe0_noscale, (self, load_idx, wmma_idx, loop_ub, HALF_M)),
+                (MXFPGEMMWSMSplitProgram.ws_pipe1_noscale, (self, wmma_idx, loop_ub, HALF_M)),
+            ],
+            [cfg.NUM_WARPS],
+        )
+
+    @gluon.jit
+    def warp_pipeline_ws_local_pref(self, K):
+        cfg = self.cfg
+        gl.static_assert(cfg.NUM_WARPS == 4)
+        HALF_M: gl.constexpr = cfg.BLOCK_M // 2
+        load_idx = 0
+        wmma_idx = 0
+        loop_ub = gl.cdiv(K, cfg.BLOCK_K) - (cfg.NUM_BUFFERS - 1)
+        gl.warp_specialize(
+            [
+                (MXFPGEMMWSMSplitProgram.ws_pipe0_local_pref, (self, load_idx, wmma_idx, loop_ub, HALF_M)),
+                (MXFPGEMMWSMSplitProgram.ws_pipe1_local_pref, (self, wmma_idx, loop_ub, HALF_M)),
+            ],
+            [cfg.NUM_WARPS],
+        )
+
+    @gluon.jit
+    def warp_pipeline_ws_local_pref2(self, K):
+        cfg = self.cfg
+        gl.static_assert(cfg.NUM_WARPS == 4)
+        HALF_M: gl.constexpr = cfg.BLOCK_M // 2
+        load_idx = 0
+        wmma_idx = 0
+        loop_ub = gl.cdiv(K, cfg.BLOCK_K) - (cfg.NUM_BUFFERS - 1)
+        gl.warp_specialize(
+            [
+                (MXFPGEMMWSMSplitProgram.ws_pipe0_local_pref2, (self, load_idx, wmma_idx, loop_ub, HALF_M)),
+                (MXFPGEMMWSMSplitProgram.ws_pipe1_local_pref2, (self, wmma_idx, loop_ub, HALF_M)),
+            ],
             [cfg.NUM_WARPS],
         )
 
@@ -776,7 +866,7 @@ class MXFPGEMMWSMSplitProgram:
             c0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c0)
             gl.sched_barrier(0)
             gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
-            gl.barrier(cta=True, addrspace=0b00001)
+            gl.barrier(cta=True, addrspace=0b00000)
             gl.sched_barrier(0)
 
         gl.barrier(cta=True, addrspace=0b00000)
@@ -815,6 +905,285 @@ class MXFPGEMMWSMSplitProgram:
             gl.barrier(cta=True, addrspace=0b00000)
             gl.sched_barrier(0)
             a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, False)
+            wmma_idx += 1
+            c1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c1)
+        c_offs, c_mask = self.get_store_offsets_and_mask_m_range(HALF_M, HALF_M)
+        gl.amd.gfx1250.buffer_store(c1, self.c_ptr, c_offs, mask=c_mask)
+
+    @gluon.jit
+    def ws_pipe0_local_pref(self, load_idx, wmma_idx, loop_ub, HALF_M):
+        cfg = self.cfg
+        NUM_LOADS_IN_BATCH_WS: gl.constexpr = cfg.NUM_LOADS_IN_BATCH + (2 if cfg.WITH_A_SCALE else 1)
+        c0 = gl.zeros((HALF_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_loads(load_idx)
+
+        gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+        gl.sched_barrier(0)
+        gl.barrier(cta=False, addrspace=0b00001)
+        gl.sched_barrier(0)
+        gl.assume(loop_ub >= 0)
+
+        # Prefetch one local tile ahead and consume it in the next stage.
+        a_cur, b_cur, scale_a_cur, scale_b_cur = self.issue_local_loads(wmma_idx, True)
+        wmma_idx += 1
+        for _ in range(0, loop_ub - 1):
+            a_next, b_next, scale_a_next, scale_b_next = self.issue_local_loads(wmma_idx, True)
+            wmma_idx += 1
+
+            gl.sched_barrier(0)
+            load_idx = self.issue_loads(load_idx)
+
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            c0 = gl.amd.gfx1250.wmma_scaled(a_cur, scale_a_cur, cfg.DTYPE_A, b_cur, scale_b_cur, cfg.DTYPE_B, c0)
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+            a_cur, b_cur, scale_a_cur, scale_b_cur = a_next, b_next, scale_a_next, scale_b_next
+
+        if loop_ub > 0:
+            gl.sched_barrier(0)
+            load_idx = self.issue_loads(load_idx)
+
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            c0 = gl.amd.gfx1250.wmma_scaled(a_cur, scale_a_cur, cfg.DTYPE_A, b_cur, scale_b_cur, cfg.DTYPE_B, c0)
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00001)
+            gl.sched_barrier(0)
+
+        gl.barrier(cta=True, addrspace=0b00000)
+        gl.sched_barrier(0)
+        for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 1 - i) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00001)
+            a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, True)
+            wmma_idx += 1
+            c0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c0)
+        c_offs, c_mask = self.get_store_offsets_and_mask_m_range(0, HALF_M)
+        gl.amd.gfx1250.buffer_store(c0, self.c_ptr, c_offs, mask=c_mask)
+
+    @gluon.jit
+    def ws_pipe1_local_pref(self, wmma_idx, loop_ub, HALF_M):
+        cfg = self.cfg
+        c1 = gl.zeros((HALF_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+        gl.barrier(cta=True, addrspace=0b00000)
+        gl.assume(loop_ub >= 0)
+
+        # Prefetch one local tile ahead and consume it in the next stage.
+        a_cur, b_cur, scale_a_cur, scale_b_cur = self.issue_local_loads(wmma_idx, False)
+        wmma_idx += 1
+        for _ in range(0, loop_ub - 1):
+            a_next, b_next, scale_a_next, scale_b_next = self.issue_local_loads(wmma_idx, False)
+            wmma_idx += 1
+
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            c1 = gl.amd.gfx1250.wmma_scaled(a_cur, scale_a_cur, cfg.DTYPE_A, b_cur, scale_b_cur, cfg.DTYPE_B, c1)
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+            a_cur, b_cur, scale_a_cur, scale_b_cur = a_next, b_next, scale_a_next, scale_b_next
+
+        if loop_ub > 0:
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            c1 = gl.amd.gfx1250.wmma_scaled(a_cur, scale_a_cur, cfg.DTYPE_A, b_cur, scale_b_cur, cfg.DTYPE_B, c1)
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+            a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, False)
+            wmma_idx += 1
+            c1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c1)
+        c_offs, c_mask = self.get_store_offsets_and_mask_m_range(HALF_M, HALF_M)
+        gl.amd.gfx1250.buffer_store(c1, self.c_ptr, c_offs, mask=c_mask)
+
+    @gluon.jit
+    def ws_pipe0_local_pref2(self, load_idx, wmma_idx, loop_ub, HALF_M):
+        cfg = self.cfg
+        NUM_LOADS_IN_BATCH_WS: gl.constexpr = cfg.NUM_LOADS_IN_BATCH + (2 if cfg.WITH_A_SCALE else 1)
+        c0 = gl.zeros((HALF_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_loads(load_idx)
+
+        gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+        gl.sched_barrier(0)
+        gl.barrier(cta=False, addrspace=0b00001)
+        gl.sched_barrier(0)
+        gl.assume(loop_ub >= 0)
+
+        # Prologue local prefetch for W(0).
+        a_cur, b_cur, scale_a_cur, scale_b_cur = self.issue_local_loads(wmma_idx, True)
+        wmma_idx += 1
+        for _ in range(0, loop_ub - 1):
+            gl.sched_barrier(0)
+            load_idx = self.issue_loads(load_idx)
+
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00000)
+            
+            gl.sched_barrier(0)
+
+            # Keep local prefetch adjacent to compute (W(i), then prefetch L(i+1)).
+            c0 = gl.amd.gfx1250.wmma_scaled(a_cur, scale_a_cur, cfg.DTYPE_A, b_cur, scale_b_cur, cfg.DTYPE_B, c0)
+            a_cur, b_cur, scale_a_cur, scale_b_cur = self.issue_local_loads(wmma_idx, True)
+            wmma_idx += 1
+
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+        if loop_ub > 0:
+            gl.sched_barrier(0)
+            load_idx = self.issue_loads(load_idx)
+
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            c0 = gl.amd.gfx1250.wmma_scaled(a_cur, scale_a_cur, cfg.DTYPE_A, b_cur, scale_b_cur, cfg.DTYPE_B, c0)
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00001)
+            gl.sched_barrier(0)
+
+        gl.barrier(cta=True, addrspace=0b00000)
+        gl.sched_barrier(0)
+        for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 1 - i) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00001)
+            a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, True)
+            wmma_idx += 1
+            c0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c0)
+        c_offs, c_mask = self.get_store_offsets_and_mask_m_range(0, HALF_M)
+        gl.amd.gfx1250.buffer_store(c0, self.c_ptr, c_offs, mask=c_mask)
+
+    @gluon.jit
+    def ws_pipe1_local_pref2(self, wmma_idx, loop_ub, HALF_M):
+        cfg = self.cfg
+        c1 = gl.zeros((HALF_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+        gl.barrier(cta=True, addrspace=0b00000)
+        gl.assume(loop_ub >= 0)
+
+        # Prologue local prefetch for W(0).
+        a_cur, b_cur, scale_a_cur, scale_b_cur = self.issue_local_loads(wmma_idx, False)
+        wmma_idx += 1
+        for _ in range(0, loop_ub - 1):
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            # Keep local prefetch adjacent to compute (W(i), then prefetch L(i+1)).
+            c1 = gl.amd.gfx1250.wmma_scaled(a_cur, scale_a_cur, cfg.DTYPE_A, b_cur, scale_b_cur, cfg.DTYPE_B, c1)
+            a_cur, b_cur, scale_a_cur, scale_b_cur = self.issue_local_loads(wmma_idx, False)
+            wmma_idx += 1
+
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+        if loop_ub > 0:
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            c1 = gl.amd.gfx1250.wmma_scaled(a_cur, scale_a_cur, cfg.DTYPE_A, b_cur, scale_b_cur, cfg.DTYPE_B, c1)
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+            a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, False)
+            wmma_idx += 1
+            c1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c1)
+        c_offs, c_mask = self.get_store_offsets_and_mask_m_range(HALF_M, HALF_M)
+        gl.amd.gfx1250.buffer_store(c1, self.c_ptr, c_offs, mask=c_mask)
+
+    @gluon.jit
+    def ws_pipe0_noscale(self, load_idx, wmma_idx, loop_ub, HALF_M):
+        cfg = self.cfg
+        NUM_LOADS_IN_BATCH_WS: gl.constexpr = 2
+        c0 = gl.zeros((HALF_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_loads_noscale(load_idx)
+
+        gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+        gl.sched_barrier(0)
+        gl.barrier(cta=False, addrspace=0b00001)
+        gl.sched_barrier(0)
+        gl.assume(loop_ub >= 0)
+        for _ in range(0, loop_ub):
+            a, b, scale_a, scale_b = self.issue_local_loads_noscale(wmma_idx, True)
+            gl.sched_barrier(0)
+            wmma_idx += 1
+            load_idx = self.issue_loads_noscale(load_idx)
+
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            c0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c0)
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00001)
+            gl.sched_barrier(0)
+
+        gl.barrier(cta=True, addrspace=0b00000)
+        gl.sched_barrier(0)
+        for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 1 - i) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00001)
+            a, b, scale_a, scale_b = self.issue_local_loads_noscale(wmma_idx, True)
+            wmma_idx += 1
+            c0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c0)
+        c_offs, c_mask = self.get_store_offsets_and_mask_m_range(0, HALF_M)
+        gl.amd.gfx1250.buffer_store(c0, self.c_ptr, c_offs, mask=c_mask)
+
+    @gluon.jit
+    def ws_pipe1_noscale(self, wmma_idx, loop_ub, HALF_M):
+        cfg = self.cfg
+        c1 = gl.zeros((HALF_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout)
+        gl.barrier(cta=True, addrspace=0b00000)
+        gl.assume(loop_ub >= 0)
+        for _ in range(0, loop_ub):
+            a, b, scale_a, scale_b = self.issue_local_loads_noscale(wmma_idx, False)
+            wmma_idx += 1
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+            c1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c1)
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+            a, b, scale_a, scale_b = self.issue_local_loads_noscale(wmma_idx, False)
             wmma_idx += 1
             c1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c1)
         c_offs, c_mask = self.get_store_offsets_and_mask_m_range(HALF_M, HALF_M)
@@ -1494,10 +1863,17 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
                                 BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr,
                                 TRANSPOSE_B: gl.constexpr, NUM_BUFFERS: gl.constexpr, SCALE_PRESHUFFLE: gl.constexpr,
                                 ASYNC_COPY_SCALE: gl.constexpr, WITH_A_SCALE: gl.constexpr, SCHEDULE: gl.constexpr,
-                                NUM_WARPS: gl.constexpr, PINGPONG: gl.constexpr, WS: gl.constexpr):
+                                NUM_WARPS: gl.constexpr, PINGPONG: gl.constexpr, WS: gl.constexpr,
+                                WS_NOSCALE: gl.constexpr, LPREF: gl.constexpr, LPREF2: gl.constexpr):
 
     if WS:
         gl.static_assert(SCHEDULE == 'baseline')
+    if WS_NOSCALE:
+        gl.static_assert(WS)
+    if LPREF:
+        gl.static_assert(WS)
+    if LPREF2:
+        gl.static_assert(WS)
 
     if PINGPONG:
         if WS:
@@ -1563,7 +1939,14 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
 
     if PINGPONG:
         if WS:
-            pgm.warp_pipeline_ws(K)
+            if WS_NOSCALE:
+                pgm.warp_pipeline_ws_noscale(K)
+            elif LPREF2:
+                pgm.warp_pipeline_ws_local_pref2(K)
+            elif LPREF:
+                pgm.warp_pipeline_ws_local_pref(K)
+            else:
+                pgm.warp_pipeline_ws(K)
         else:
             pgm.warp_pipeline(K)
     else:
@@ -1677,7 +2060,9 @@ def get_ws_launch_params(num_warps, schedule, ws=False):
 @pytest.mark.parametrize("PINGPONG", [True, False])
 def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B,
                                             NUM_BUFFERS, SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE,
-                                            GROUP_SIZE_M, PINGPONG, WS=False, DEBUG_DETERMINISTIC=False,
+                                            GROUP_SIZE_M, PINGPONG, WS=False, WS_NOSCALE=False, LPREF=False,
+                                            LPREF2=False,
+                                            DEBUG_DETERMINISTIC=False,
                                             DUMP_BOTTOM=False):
     SCALE_BLOCK = 32
     numWarps = 8
@@ -1720,7 +2105,11 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
         a_scale = None
     b_scale = MXScaleTensor(size=b_scale_size).random(low=1.0, high=32.0)
 
-    c_ref = torch_gemm_mxfp(a, b, a_scale, b_scale, SCALE_BLOCK, M, N, K)
+    if WS_NOSCALE:
+        b_scale_ref = torch.full(b_scale_size, 1.0, dtype=torch.float32)
+        c_ref = torch_gemm_mxfp(a, b, None, b_scale_ref, SCALE_BLOCK, M, N, K)
+    else:
+        c_ref = torch_gemm_mxfp(a, b, a_scale, b_scale, SCALE_BLOCK, M, N, K)
 
     if WITH_A_SCALE:
         a_scale = a_scale.data
@@ -1767,7 +2156,8 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
                                           stride_bn, stride_cm, stride_cn, stride_scale, dtype_converter[DTYPE_A],
                                           dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
                                           GROUP_SIZE_M, TRANSPOSE_B, NUM_BUFFERS, SCALE_PRESHUFFLE, ASYNC_COPY_SCALE,
-                                          WITH_A_SCALE, SCHEDULE, kernel_num_warps, PINGPONG, WS,
+                                          WITH_A_SCALE, SCHEDULE, kernel_num_warps, PINGPONG, WS, WS_NOSCALE, LPREF,
+                                          LPREF2,
                                           num_warps=kernel_num_warps,
                                           num_ctas=numCtas,
                                           waves_per_eu=waves_per_eu)
@@ -1814,7 +2204,8 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
 @pytest.mark.parametrize("GROUP_SIZE_M", [8])
 def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B, NUM_BUFFERS,
                                       SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE, GROUP_SIZE_M,
-                                      WS=False, DEBUG_DETERMINISTIC=False):
+                                      WS=False, WS_NOSCALE=False, LPREF=False, LPREF2=False,
+                                      DEBUG_DETERMINISTIC=False):
     SCALE_BLOCK = 32
     numWarps = 4
     numCtas = 1
@@ -1862,7 +2253,11 @@ def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_
         a_scale = None
     b_scale = MXScaleTensor(size=b_scale_size).random(low=1.0, high=32.0)
 
-    c_ref = torch_gemm_mxfp(a, b, a_scale, b_scale, SCALE_BLOCK, M, N, K)
+    if WS_NOSCALE:
+        b_scale_ref = torch.full(b_scale_size, 1.0, dtype=torch.float32)
+        c_ref = torch_gemm_mxfp(a, b, None, b_scale_ref, SCALE_BLOCK, M, N, K)
+    else:
+        c_ref = torch_gemm_mxfp(a, b, a_scale, b_scale, SCALE_BLOCK, M, N, K)
 
     if WITH_A_SCALE:
         a_scale = a_scale.data
@@ -1910,6 +2305,7 @@ def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_
                                           dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
                                           GROUP_SIZE_M, TRANSPOSE_B, NUM_BUFFERS, SCALE_PRESHUFFLE, ASYNC_COPY_SCALE,
                                           WITH_A_SCALE, SCHEDULE, NUM_WARPS=kernel_num_warps, PINGPONG=False, WS=WS,
+                                          WS_NOSCALE=WS_NOSCALE, LPREF=LPREF, LPREF2=LPREF2,
                                           num_warps=kernel_num_warps, num_ctas=numCtas,
                                           waves_per_eu=waves_per_eu)
     static_profile(k)
@@ -1951,6 +2347,9 @@ if __name__ == '__main__':
     parser.add_argument('--dtype_b', type=str, default='float8_e4m3', choices=supported_dtypes)
     parser.add_argument('--pingpong', action='store_true')
     parser.add_argument('--ws', action='store_true')
+    parser.add_argument('--ws_noscale', action='store_true')
+    parser.add_argument('--lpref', action='store_true')
+    parser.add_argument('--lpref2', action='store_true')
     parser.add_argument('--debug_deterministic', action='store_true')
     parser.add_argument('--dump_bottom', action='store_true')
 
@@ -1958,6 +2357,24 @@ if __name__ == '__main__':
 
     if args.ws and args.schedule != 'baseline':
         raise ValueError("--ws only supports --schedule baseline")
+    if args.ws_noscale and not args.ws:
+        raise ValueError("--ws_noscale requires --ws")
+    if args.ws_noscale and not args.pingpong:
+        raise ValueError("--ws_noscale requires --pingpong")
+    if args.lpref and not args.ws:
+        raise ValueError("--lpref requires --ws")
+    if args.lpref and not args.pingpong:
+        raise ValueError("--lpref requires --pingpong")
+    if args.lpref and args.ws_noscale:
+        raise ValueError("--lpref and --ws_noscale cannot be enabled together")
+    if args.lpref2 and not args.ws:
+        raise ValueError("--lpref2 requires --ws")
+    if args.lpref2 and not args.pingpong:
+        raise ValueError("--lpref2 requires --pingpong")
+    if args.lpref2 and args.ws_noscale:
+        raise ValueError("--lpref2 and --ws_noscale cannot be enabled together")
+    if args.lpref and args.lpref2:
+        raise ValueError("--lpref and --lpref2 cannot be enabled together")
 
     if args.pingpong:
         assert (args.num_warps == 8 and (args.schedule == 'baseline' or args.schedule == 'sliceK'))
@@ -1976,6 +2393,9 @@ if __name__ == '__main__':
                                                 GROUP_SIZE_M=args.group_size_m,  #
                                                 PINGPONG=args.pingpong,  #
                                                 WS=args.ws,  #
+                                                WS_NOSCALE=args.ws_noscale,  #
+                                                LPREF=args.lpref,  #
+                                                LPREF2=args.lpref2,  #
                                                 DEBUG_DETERMINISTIC=args.debug_deterministic,  #
                                                 DUMP_BOTTOM=args.dump_bottom)
     else:
@@ -1991,4 +2411,7 @@ if __name__ == '__main__':
                                           ASYNC_COPY_SCALE=args.async_copy_scale,  #
                                           GROUP_SIZE_M=args.group_size_m,  #
                                           WS=args.ws,  #
+                                          WS_NOSCALE=args.ws_noscale,  #
+                                          LPREF=args.lpref,  #
+                                          LPREF2=args.lpref2,  #
                                           DEBUG_DETERMINISTIC=args.debug_deterministic)
