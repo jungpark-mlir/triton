@@ -1837,21 +1837,6 @@ void init_triton_ir(py::module &&m) {
            },
            py::arg("cta") = false,
            py::arg("addrspace") = static_cast<int>(triton::gpu::AddrSpace::All))
-      // Make a block pointer (tensor pointer in Triton IR)
-      .def("create_make_block_ptr",
-           [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
-              std::vector<Value> &strides, std::vector<Value> &offsets,
-              std::vector<int32_t> &tensorShape,
-              std::vector<int32_t> &order) -> Value {
-             return self.create<MakeTensorPtrOp>(base, shape, strides, offsets,
-                                                 tensorShape, order);
-           })
-      // Advance a block pointer
-      .def("create_advance",
-           [](TritonOpBuilder &self, Value &ptr,
-              std::vector<Value> &offsets) -> Value {
-             return self.create<AdvanceOp>(ptr.getType(), ptr, offsets);
-           })
       // Make a tensor descriptor
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
