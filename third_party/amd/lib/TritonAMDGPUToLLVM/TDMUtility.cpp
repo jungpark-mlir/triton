@@ -3,7 +3,6 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
-#include "llvm/Config/llvm-config.h"
 #include <optional>
 
 // Include shared C-compatible TDM utilities
@@ -11,16 +10,6 @@
 
 namespace mlir::LLVM::AMD {
 namespace {
-
-static void emitTensorLDSIntrinsicCall(RewriterBase &rewriter, Location loc,
-                                       const char *intrinsicName, Value group0,
-                                       Value group1, Value group2, Value group3,
-                                       Value cachePolicy) {
-  // Hard-code 5-operand ABI for custom LLVM toolchains.
-  LLVM::createLLVMIntrinsicCallOp(
-      rewriter, loc, intrinsicName, {},
-      {group0, group1, group2, group3, cachePolicy});
-}
 
 // Helper to decode a value spanning two 32-bit words
 static Value decode48BitValue(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
@@ -765,6 +754,9 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 
   assert(shapePerCTA.size() <= 5);
 
+  auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
+  Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
+
   if (shapePerCTA.size() > 2) {
     auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
     auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.begin() + 12);
@@ -784,8 +776,9 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 
     const char *intrinsicName = isLoad ? "llvm.amdgcn.tensor.load.to.lds"
                                        : "llvm.amdgcn.tensor.store.from.lds";
-    emitTensorLDSIntrinsicCall(rewriter, loc, intrinsicName, group0, group1,
-                               group2, group3, b.i32_val(0));
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, intrinsicName, {},
+        {group0, group1, group2, group3, group4Zero, b.i32_val(0)});
   } else {
     auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
     auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.end());
@@ -804,8 +797,9 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 
     const char *intrinsicName = isLoad ? "llvm.amdgcn.tensor.load.to.lds"
                                        : "llvm.amdgcn.tensor.store.from.lds";
-    emitTensorLDSIntrinsicCall(rewriter, loc, intrinsicName, group0, group1,
-                               group2Zero, group3Zero, b.i32_val(0));
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, intrinsicName, {},
+        {group0, group1, group2Zero, group3Zero, group4Zero, b.i32_val(0)});
   }
 }
 
@@ -880,10 +874,14 @@ void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
     auto group2 = packLLVector(loc, g2, rewriter);
     auto group3 = packLLVector(loc, g3, rewriter);
 
+    auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
+    Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
+
     const char *intrinsicName = isGather ? "llvm.amdgcn.tensor.load.to.lds"
                                          : "llvm.amdgcn.tensor.store.from.lds";
-    emitTensorLDSIntrinsicCall(rewriter, loc, intrinsicName, group0, group1,
-                               group2, group3, b.i32_val(0));
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, intrinsicName, {},
+        {group0, group1, group2, group3, group4Zero, b.i32_val(0)});
   }
 }
 
