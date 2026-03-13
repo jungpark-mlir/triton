@@ -11,6 +11,7 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from triton.experimental.gluon.language.amd.gfx1250 import tdm
 from triton.experimental.gluon.language.amd.gfx1250 import async_copy as cp
+from triton.experimental.gluon.language.amd.gfx1250 import PartitionedSharedLayout
 from triton.language.core import _aggregate as aggregate
 from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 
@@ -27,7 +28,7 @@ def get_scale_blocked_layout(num_warps: gl.constexpr):
 
 
 @gluon.constexpr_function
-def get_wmma_layout(num_warps, packed, scale_preshuffle):
+def get_wmma_layout(num_warps, packed, scale_preshuffle, ws_swizzle=False):
     assert (num_warps in (4, 8))
     if scale_preshuffle:
         reg_bases = [[0, 1], [1, 0]]
@@ -36,9 +37,15 @@ def get_wmma_layout(num_warps, packed, scale_preshuffle):
         reg_bases = []
         tiles_per_warp = 1
 
-    # [NUM_WARPS // 2, 2]
+    # Keep WMMA linear layout stable for MXFP (k_width=16, K=128). In this
+    # kernel, ws_swizzle is applied via shared-memory layout selection only.
     if num_warps == 4:
-        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
+        if ws_swizzle:
+            # Make warp-id parity (LSB) move along M so even/odd warps map to
+            # disjoint bands on the A partitioned-M axis.
+            warp_bases = [[tiles_per_warp, 0], [0, tiles_per_warp]]
+        else:
+            warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
     else:
         warp_bases = [[0, tiles_per_warp], [0, tiles_per_warp * 2], [tiles_per_warp, 0]]
 
@@ -90,7 +97,7 @@ class MXFPGEMMConfig:
 
     @gluon.constexpr_function
     def __init__(self, BLOCK_M, BLOCK_N, BLOCK_K, DTYPE_A, DTYPE_B, SCALE_BLOCK, NUM_BUFFERS, TRANSPOSE_B, WITH_A_SCALE,
-                 SCALE_PRESHUFFLE, NUM_WARPS, ASYNC_COPY_SCALE=False, NUM_SUBTILES=(1, 1, 1)):
+                 SCALE_PRESHUFFLE, NUM_WARPS, ASYNC_COPY_SCALE=False, NUM_SUBTILES=(1, 1, 1), WS_SWIZZLE=False):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -120,8 +127,8 @@ class MXFPGEMMConfig:
         self.BLOCK_N_PRESHUFFLED = gl.constexpr(BLOCK_N // self.PRESHUFFLE_FACTOR)
         self.BLOCK_K_SCALE_PRESHUFFLED = gl.constexpr(BLOCK_K_SCALE * self.PRESHUFFLE_FACTOR)
 
-        WMMA_LAYOUT: gl.constexpr = get_wmma_layout(NUM_WARPS, False, SCALE_PRESHUFFLE)
-        WMMA_LAYOUT_PACKED: gl.constexpr = get_wmma_layout(NUM_WARPS, True, SCALE_PRESHUFFLE)
+        WMMA_LAYOUT: gl.constexpr = get_wmma_layout(NUM_WARPS, False, SCALE_PRESHUFFLE, WS_SWIZZLE)
+        WMMA_LAYOUT_PACKED: gl.constexpr = get_wmma_layout(NUM_WARPS, True, SCALE_PRESHUFFLE, WS_SWIZZLE)
 
         self.dot_layout_a = gl.constexpr(
             gl.DotOperandLayout(operand_index=0, parent=WMMA_LAYOUT_PACKED if DTYPE_A == "e2m1" else WMMA_LAYOUT,
@@ -139,17 +146,46 @@ class MXFPGEMMConfig:
 
         BLOCK_K_PACKED_A = BLOCK_K // self.DIV_FACTOR_A // NUM_SUBTILES_K
         BLOCK_K_PACKED_B = BLOCK_K // self.DIV_FACTOR_B // NUM_SUBTILES_K
-        self.shared_layout_a = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for([[BLOCK_K_PACKED_A, 16]],
-                                                    [BLOCK_M // NUM_SUBTILES_M, BLOCK_K_PACKED_A], [1, 0]))
-        if TRANSPOSE_B:
-            self.shared_layout_b = gl.constexpr(
-                gl.PaddedSharedLayout.with_identity_for([[BLOCK_K_PACKED_B, 16]],
-                                                        [BLOCK_N // NUM_SUBTILES_N, BLOCK_K_PACKED_B], [1, 0]))
+        if WS_SWIZZLE:
+            # Experimental variant:
+            # - A uses PartitionedSharedLayout(PaddedSharedLayout) where inner
+            #   padded tile shape follows:
+            #   (M_subtile // num_groups // num_partitions, K_packed).
+            # - B remains on the original padded shared layout.
+            num_groups_a: gl.constexpr = (BLOCK_M // NUM_SUBTILES_M) // 64
+            num_partitions_a: gl.constexpr = 2
+            inner_shape_m_a: gl.constexpr = (BLOCK_M // NUM_SUBTILES_M) // num_groups_a // num_partitions_a
+            inner_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+                [[BLOCK_K_PACKED_A, 16]],
+                [inner_shape_m_a, BLOCK_K_PACKED_A],
+                [1, 0],
+            )
+            self.shared_layout_a = gl.constexpr(
+                PartitionedSharedLayout(num_partitions=num_partitions_a, num_groups=num_groups_a, partition_dim=0,
+                                        partition_layout=inner_a)
+            )
+            if TRANSPOSE_B:
+                self.shared_layout_b = gl.constexpr(
+                    gl.PaddedSharedLayout.with_identity_for([[BLOCK_K_PACKED_B, 16]],
+                                                            [BLOCK_N // NUM_SUBTILES_N, BLOCK_K_PACKED_B], [1, 0])
+                )
+            else:
+                self.shared_layout_b = gl.constexpr(
+                    gl.PaddedSharedLayout.with_identity_for([[BLOCK_N // NUM_SUBTILES_N, 16]],
+                                                            [BLOCK_K_PACKED_B, BLOCK_N // NUM_SUBTILES_N], [1, 0])
+                )
         else:
-            self.shared_layout_b = gl.constexpr(
-                gl.PaddedSharedLayout.with_identity_for([[BLOCK_N // NUM_SUBTILES_N, 16]],
-                                                        [BLOCK_K_PACKED_B, BLOCK_N // NUM_SUBTILES_N], [1, 0]))
+            self.shared_layout_a = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for([[BLOCK_K_PACKED_A, 16]],
+                                                        [BLOCK_M // NUM_SUBTILES_M, BLOCK_K_PACKED_A], [1, 0]))
+            if TRANSPOSE_B:
+                self.shared_layout_b = gl.constexpr(
+                    gl.PaddedSharedLayout.with_identity_for([[BLOCK_K_PACKED_B, 16]],
+                                                            [BLOCK_N // NUM_SUBTILES_N, BLOCK_K_PACKED_B], [1, 0]))
+            else:
+                self.shared_layout_b = gl.constexpr(
+                    gl.PaddedSharedLayout.with_identity_for([[BLOCK_N // NUM_SUBTILES_N, 16]],
+                                                            [BLOCK_K_PACKED_B, BLOCK_N // NUM_SUBTILES_N], [1, 0]))
 
         self.shared_layout_a_scale = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
@@ -1864,7 +1900,8 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
                                 TRANSPOSE_B: gl.constexpr, NUM_BUFFERS: gl.constexpr, SCALE_PRESHUFFLE: gl.constexpr,
                                 ASYNC_COPY_SCALE: gl.constexpr, WITH_A_SCALE: gl.constexpr, SCHEDULE: gl.constexpr,
                                 NUM_WARPS: gl.constexpr, PINGPONG: gl.constexpr, WS: gl.constexpr,
-                                WS_NOSCALE: gl.constexpr, LPREF: gl.constexpr, LPREF2: gl.constexpr):
+                                WS_NOSCALE: gl.constexpr, LPREF: gl.constexpr, LPREF2: gl.constexpr,
+                                WS_SWIZZLE: gl.constexpr):
 
     if WS:
         gl.static_assert(SCHEDULE == 'baseline')
@@ -1874,6 +1911,9 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
         gl.static_assert(WS)
     if LPREF2:
         gl.static_assert(WS)
+    if WS_SWIZZLE:
+        gl.static_assert(WS)
+        gl.static_assert(NUM_WARPS == 4)
 
     if PINGPONG:
         if WS:
@@ -1890,7 +1930,7 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
         NUM_SUBTILES: gl.constexpr = (2, 1, 1) if WS else (1, 1, 1)
 
     cfg = MXFPGEMMConfig(BLOCK_M, BLOCK_N, BLOCK_K, DTYPE_A, DTYPE_B, SCALE_BLOCK, NUM_BUFFERS, TRANSPOSE_B,
-                         WITH_A_SCALE, SCALE_PRESHUFFLE, NUM_WARPS, ASYNC_COPY_SCALE, NUM_SUBTILES)
+                         WITH_A_SCALE, SCALE_PRESHUFFLE, NUM_WARPS, ASYNC_COPY_SCALE, NUM_SUBTILES, WS_SWIZZLE)
 
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
@@ -2061,7 +2101,7 @@ def get_ws_launch_params(num_warps, schedule, ws=False):
 def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B,
                                             NUM_BUFFERS, SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE,
                                             GROUP_SIZE_M, PINGPONG, WS=False, WS_NOSCALE=False, LPREF=False,
-                                            LPREF2=False,
+                                            LPREF2=False, WS_SWIZZLE=False,
                                             DEBUG_DETERMINISTIC=False,
                                             DUMP_BOTTOM=False):
     SCALE_BLOCK = 32
@@ -2157,7 +2197,7 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
                                           dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
                                           GROUP_SIZE_M, TRANSPOSE_B, NUM_BUFFERS, SCALE_PRESHUFFLE, ASYNC_COPY_SCALE,
                                           WITH_A_SCALE, SCHEDULE, kernel_num_warps, PINGPONG, WS, WS_NOSCALE, LPREF,
-                                          LPREF2,
+                                          LPREF2, WS_SWIZZLE,
                                           num_warps=kernel_num_warps,
                                           num_ctas=numCtas,
                                           waves_per_eu=waves_per_eu)
@@ -2204,7 +2244,7 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
 @pytest.mark.parametrize("GROUP_SIZE_M", [8])
 def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B, NUM_BUFFERS,
                                       SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE, GROUP_SIZE_M,
-                                      WS=False, WS_NOSCALE=False, LPREF=False, LPREF2=False,
+                                      WS=False, WS_NOSCALE=False, LPREF=False, LPREF2=False, WS_SWIZZLE=False,
                                       DEBUG_DETERMINISTIC=False):
     SCALE_BLOCK = 32
     numWarps = 4
@@ -2305,7 +2345,7 @@ def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_
                                           dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
                                           GROUP_SIZE_M, TRANSPOSE_B, NUM_BUFFERS, SCALE_PRESHUFFLE, ASYNC_COPY_SCALE,
                                           WITH_A_SCALE, SCHEDULE, NUM_WARPS=kernel_num_warps, PINGPONG=False, WS=WS,
-                                          WS_NOSCALE=WS_NOSCALE, LPREF=LPREF, LPREF2=LPREF2,
+                                          WS_NOSCALE=WS_NOSCALE, LPREF=LPREF, LPREF2=LPREF2, WS_SWIZZLE=WS_SWIZZLE,
                                           num_warps=kernel_num_warps, num_ctas=numCtas,
                                           waves_per_eu=waves_per_eu)
     static_profile(k)
@@ -2350,6 +2390,7 @@ if __name__ == '__main__':
     parser.add_argument('--ws_noscale', action='store_true')
     parser.add_argument('--lpref', action='store_true')
     parser.add_argument('--lpref2', action='store_true')
+    parser.add_argument('--ws_swizzle', action='store_true')
     parser.add_argument('--debug_deterministic', action='store_true')
     parser.add_argument('--dump_bottom', action='store_true')
 
@@ -2375,6 +2416,10 @@ if __name__ == '__main__':
         raise ValueError("--lpref2 and --ws_noscale cannot be enabled together")
     if args.lpref and args.lpref2:
         raise ValueError("--lpref and --lpref2 cannot be enabled together")
+    if args.ws_swizzle and not args.ws:
+        raise ValueError("--ws_swizzle requires --ws")
+    if args.ws_swizzle and not args.pingpong:
+        raise ValueError("--ws_swizzle requires --pingpong")
 
     if args.pingpong:
         assert (args.num_warps == 8 and (args.schedule == 'baseline' or args.schedule == 'sliceK'))
@@ -2396,6 +2441,7 @@ if __name__ == '__main__':
                                                 WS_NOSCALE=args.ws_noscale,  #
                                                 LPREF=args.lpref,  #
                                                 LPREF2=args.lpref2,  #
+                                                WS_SWIZZLE=args.ws_swizzle,  #
                                                 DEBUG_DETERMINISTIC=args.debug_deterministic,  #
                                                 DUMP_BOTTOM=args.dump_bottom)
     else:
@@ -2414,4 +2460,5 @@ if __name__ == '__main__':
                                           WS_NOSCALE=args.ws_noscale,  #
                                           LPREF=args.lpref,  #
                                           LPREF2=args.lpref2,  #
+                                          WS_SWIZZLE=args.ws_swizzle,  #
                                           DEBUG_DETERMINISTIC=args.debug_deterministic)
