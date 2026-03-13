@@ -1,6 +1,7 @@
 #include "triton/Analysis/Allocation.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 
@@ -494,10 +495,79 @@ private:
     // eventually reach a fixed point.
     GraphT interference;
     buildInterferenceGraph(buffers, interference);
-    do {
+    const char *traceEnv = std::getenv("TRITON_ALLOCATION_ANALYSIS_TRACE");
+    bool traceAllocationAnalysis =
+        traceEnv && std::string(traceEnv) != "0" &&
+        std::string(traceEnv) != "false" && std::string(traceEnv) != "False";
+    auto countInterferenceEdges = [&](const GraphT &graph) -> size_t {
+      size_t edgeCount = 0;
+      for (const auto &entry : graph)
+        edgeCount += entry.second.size();
+      return edgeCount;
+    };
+    if (traceAllocationAnalysis) {
+      llvm::dbgs() << "[allocation-shared-memory] computeOffsets: buffers="
+                   << buffers.size()
+                   << ", initial_edges=" << countInterferenceEdges(interference)
+                   << "\n";
+    }
+    size_t iter = 0;
+    constexpr size_t kMaxFixedPointIters = 100000;
+    bool hitMaxIters = false;
+    bool stoppedOnStableResidual = false;
+    SmallVector<size_t, 0> prevOffsets(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i)
+      prevOffsets[i] = buffers[i]->offset;
+    while (true) {
+      ++iter;
       allocate(buffers, interference);
+      bool offsetsChanged = false;
+      for (size_t i = 0; i < buffers.size(); ++i) {
+        size_t cur = buffers[i]->offset;
+        if (cur != prevOffsets[i]) {
+          offsetsChanged = true;
+          prevOffsets[i] = cur;
+        }
+      }
       buildInterferenceGraph(buffers, interference);
-    } while (!interference.empty());
+      if (traceAllocationAnalysis && (iter <= 5 || iter % 10 == 0)) {
+        llvm::dbgs() << "[allocation-shared-memory] computeOffsets: iter="
+                     << iter
+                     << ", edges=" << countInterferenceEdges(interference)
+                     << ", shared_memory_size=" << allocation->sharedMemorySize
+                     << "\n";
+      }
+      if (interference.empty())
+        break;
+      if (!offsetsChanged) {
+        if (traceAllocationAnalysis) {
+          llvm::dbgs() << "[allocation-shared-memory] computeOffsets: offsets "
+                          "stabilized with residual edges="
+                       << countInterferenceEdges(interference) << "\n";
+        }
+        stoppedOnStableResidual = true;
+        break;
+      }
+      if (iter >= kMaxFixedPointIters) {
+        llvm::errs() << "[allocation-shared-memory] computeOffsets: reached "
+                     << kMaxFixedPointIters
+                     << " iterations without convergence; aborting with edges="
+                     << countInterferenceEdges(interference) << "\n";
+        hitMaxIters = true;
+        break;
+      }
+    }
+    if (hitMaxIters)
+      llvm::report_fatal_error(
+          "AllocationAnalysis::computeOffsets did not converge");
+    if (traceAllocationAnalysis) {
+      llvm::dbgs() << "[allocation-shared-memory] computeOffsets: "
+                   << (stoppedOnStableResidual ? "reached fixed point"
+                                               : "converged")
+                   << " in " << iter
+                   << " iterations, final_shared_memory_size="
+                   << allocation->sharedMemorySize << "\n";
+    }
 
     LLVM_DEBUG(dumpAllocationSize());
   }
@@ -570,43 +640,82 @@ private:
                               GraphT &interference) {
     // Reset interference graph
     interference.clear();
-    for (auto x : buffers) {
-      for (auto y : buffers) {
-        if (x == y)
+    SmallVector<Interval<size_t>, 0> allocRanges;
+    SmallVector<Interval<size_t>, 0> opRanges;
+    SmallVector<Region *, 0> parentRegions;
+    allocRanges.reserve(buffers.size());
+    opRanges.reserve(buffers.size());
+    parentRegions.reserve(buffers.size());
+
+    for (auto *buffer : buffers) {
+      allocRanges.push_back({buffer->offset, buffer->offset + buffer->size});
+      opRanges.push_back(bufferRange.lookup(buffer));
+      parentRegions.push_back(buffer->owner->getParentRegion());
+    }
+    DenseMap<Operation *, Operation *> asyncParentCache;
+    asyncParentCache.reserve(buffers.size());
+    auto getAsyncParent = [&](Operation *owner) -> Operation * {
+      if (auto it = asyncParentCache.find(owner); it != asyncParentCache.end())
+        return it->second;
+      Operation *parent = owner->getParentWithTrait<OpTrait::AsyncRegions>();
+      asyncParentCache[owner] = parent;
+      return parent;
+    };
+
+    // Compare only ranges that can overlap in offset-space using a sweep over
+    // intervals sorted by start offset.
+    SmallVector<size_t, 0> sortedIdx(buffers.size());
+    std::iota(sortedIdx.begin(), sortedIdx.end(), 0);
+    llvm::stable_sort(sortedIdx, [&](size_t a, size_t b) {
+      if (allocRanges[a].start() != allocRanges[b].start())
+        return allocRanges[a].start() < allocRanges[b].start();
+      return allocRanges[a].end() < allocRanges[b].end();
+    });
+    SmallVector<size_t, 0> active;
+    active.reserve(buffers.size());
+
+    for (size_t idx : sortedIdx) {
+      // Keep active intervals whose end can still overlap current start.
+      size_t compact = 0;
+      for (size_t activeIdx : active) {
+        if (allocRanges[activeIdx].end() > allocRanges[idx].start())
+          active[compact++] = activeIdx;
+      }
+      active.resize(compact);
+
+      auto *x = buffers[idx];
+      for (size_t j : active) {
+        auto *y = buffers[j];
+        if (!allocRanges[idx].intersects(allocRanges[j]))
           continue;
-        auto xStart = x->offset;
-        auto yStart = y->offset;
-        auto xSize = x->size;
-        auto ySize = y->size;
-        Interval xSizeRange = {xStart, xStart + xSize};
-        Interval ySizeRange = {yStart, yStart + ySize};
-        auto xOpRange = bufferRange.lookup(x);
-        auto yOpRange = bufferRange.lookup(y);
 
         // Buffers interfere if their allocation offsets overlap and they are
         // live at the same time.
-        if (xOpRange.intersects(yOpRange) &&
-            xSizeRange.intersects(ySizeRange)) {
+        if (opRanges[idx].intersects(opRanges[j])) {
           interference[x].insert(y);
+          interference[y].insert(x);
         }
 
         // Buffers also interfere if their allocation offsets overlap and they
         // exist within regions that may execute simultaneously with respect to
         // each other.
-        auto wsx = x->owner->getParentWithTrait<OpTrait::AsyncRegions>();
-        auto wsy = y->owner->getParentWithTrait<OpTrait::AsyncRegions>();
-        if (wsx && wsy && wsx == wsy &&
-            x->owner->getParentRegion() != y->owner->getParentRegion() &&
-            xSizeRange.intersects(ySizeRange)) {
-          interference[x].insert(y);
+        if (parentRegions[idx] != parentRegions[j]) {
+          auto wsx = getAsyncParent(x->owner);
+          auto wsy = getAsyncParent(y->owner);
+          if (wsx && wsy && wsx == wsy) {
+            interference[x].insert(y);
+            interference[y].insert(x);
+          }
         }
       }
+      active.push_back(idx);
+    }
 
-      // Partition neighbors interfere if they are in the same
-      // physical partition. This ensures that different partitions of the
-      // same partitioned tensor are placed in different physical partitions.
-      // Only check this when partitioning is enabled (partitionSize > 0).
-      if (partitionSize > 0) {
+    // Partition neighbors interfere if they are in the same physical
+    // partition. This ensures different partitions of the same partitioned
+    // tensor are placed in different physical partitions.
+    if (partitionSize > 0) {
+      for (auto *x : buffers) {
         for (auto *neighbor : x->neighbors) {
           if (getPartitionIndex(x->offset, partitionSize) ==
               getPartitionIndex(neighbor->offset, partitionSize)) {
@@ -664,8 +773,12 @@ private:
             std::find(x->neighbors.begin(), x->neighbors.end(), y) !=
             x->neighbors.end();
         if (isPartitionNeighbor && partitionSize > 0) {
-          // For partition neighbors, bump to the next partition
-          // boundary to ensure they are in different physical partitions
+          // For partition neighbors, enforce ordering to avoid cyclic chasing:
+          // only the higher-id buffer is bumped relative to the lower-id one.
+          if (x->id <= y->id)
+            continue;
+          // Bump to the next partition boundary to ensure they are in
+          // different physical partitions.
           size_t nextPartitionStart =
               (getPartitionIndex(y->offset, partitionSize) + 1) * partitionSize;
           newOffset = std::max(newOffset, nextPartitionStart);
@@ -674,8 +787,12 @@ private:
           newOffset = std::max(newOffset, y->offset + y->size);
         }
       }
-      if (colors.lookup(x) != 0)
+      if (colors.lookup(x) != 0) {
+        // Keep offsets monotonic across fixed-point iterations; this avoids
+        // oscillation and matches the algorithm's convergence assumption.
+        newOffset = std::max(newOffset, x->offset);
         x->setOffsetAligned(newOffset);
+      }
       allocation->sharedMemorySize =
           std::max(allocation->sharedMemorySize, x->offset + x->size);
     }
