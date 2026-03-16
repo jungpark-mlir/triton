@@ -63,10 +63,8 @@ See [membar-buffer-slot-coloring.md](membar-buffer-slot-coloring.md) for full de
 | **Handles separate counters** | N/A | No (different SSA bases) | Yes |
 | **Extensibility** | N/A | New index idioms need new pattern matchers | Producer stamps color; filter unchanged |
 
-## Recommendation
+## Where We Stand
 
-**Symbolic index analysis is the primary solution for the pipeliner path.** It is more principled — operates in core membar, requires no annotations or attributes, handles the single-buffer case correctly by construction, and benefits all backends. The AMD pipeliner must be adjusted to create separate `MemDescIndexOp`s from a unified phase counter, which is the same structural requirement as coloring.
+Both approaches address the same root cause — membar's inability to distinguish dynamic buffer slot indices — but from different angles. Symbolic index analysis works at the IR level in core membar, proving disjointness from index arithmetic. Buffer coloring works at the annotation level in the AMD filter, letting producers declare disjointness explicitly. Each has trade-offs in generality, extensibility, and backend scope.
 
-**Buffer slot coloring is complementary for the Gluon path.** It provides an explicit escape hatch for Gluon users whose index patterns may not match the recognized set (e.g., complex multi-stage pipelines with non-standard modular arithmetic). The two approaches can coexist: symbolic index analysis handles the automatic pipeliner case, while coloring handles explicit user-directed suppression.
-
-If both are implemented, the `syncedViaAsyncWait` annotation pass and `filterAsyncWriteDependencies` filter become unnecessary and can be removed.
+The two are not mutually exclusive. They operate at different layers and could coexist if both are warranted, or either could be adopted independently. Both share the same prerequisite: the AMD pipeliner must be adjusted to create separate `MemDescIndexOp`s for producer and consumer stages. Either approach would replace the existing `syncedViaAsyncWait` annotation pass and `filterAsyncWriteDependencies` filter.
