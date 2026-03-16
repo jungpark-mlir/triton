@@ -41,8 +41,11 @@ def get_wmma_layout(num_warps, packed, scale_preshuffle, ws_swizzle=False):
     # kernel, ws_swizzle is applied via shared-memory layout selection only.
     if num_warps == 4:
         if ws_swizzle:
-            # Make warp-id parity (LSB) move along M so even/odd warps map to
-            # disjoint bands on the A partitioned-M axis.
+            # Dispatch order S00,S11,S10,S01 → pair 0={w0,w2} (b0=0),
+            # pair 1={w1,w3} (b0=1).  b0 moves along M so each pair
+            # reads a disjoint A partition; b1 moves along N.
+            #   pair 0 (b0=0): M_warp = 0   → A partition 0
+            #   pair 1 (b0=1): M_warp = tpw → A partition 1
             warp_bases = [[tiles_per_warp, 0], [0, tiles_per_warp]]
         else:
             warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
@@ -85,6 +88,15 @@ class MXFPGEMMConfig:
 
     acc_layout: gl.constexpr
 
+    # Partition A layout across LDS segments
+    WS_PARTITION_A: gl.constexpr
+    # Partition B layout across LDS segments
+    WS_PARTITION_B: gl.constexpr
+    # WS swizzle: split B into two N-halves per partition
+    WS_SWIZZLE: gl.constexpr
+    BLOCK_N_HALF: gl.constexpr
+    layout_b_scale_half: gl.constexpr
+
     # Scales
     SCALE_PRESHUFFLE: gl.constexpr
     PRESHUFFLE_FACTOR: gl.constexpr
@@ -97,7 +109,8 @@ class MXFPGEMMConfig:
 
     @gluon.constexpr_function
     def __init__(self, BLOCK_M, BLOCK_N, BLOCK_K, DTYPE_A, DTYPE_B, SCALE_BLOCK, NUM_BUFFERS, TRANSPOSE_B, WITH_A_SCALE,
-                 SCALE_PRESHUFFLE, NUM_WARPS, ASYNC_COPY_SCALE=False, NUM_SUBTILES=(1, 1, 1), WS_SWIZZLE=False):
+                 SCALE_PRESHUFFLE, NUM_WARPS, ASYNC_COPY_SCALE=False, NUM_SUBTILES=(1, 1, 1), WS_SWIZZLE=False,
+                 WS_PARTITION_A=False, WS_PARTITION_B=False):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -127,8 +140,13 @@ class MXFPGEMMConfig:
         self.BLOCK_N_PRESHUFFLED = gl.constexpr(BLOCK_N // self.PRESHUFFLE_FACTOR)
         self.BLOCK_K_SCALE_PRESHUFFLED = gl.constexpr(BLOCK_K_SCALE * self.PRESHUFFLE_FACTOR)
 
-        WMMA_LAYOUT: gl.constexpr = get_wmma_layout(NUM_WARPS, False, SCALE_PRESHUFFLE, WS_SWIZZLE)
-        WMMA_LAYOUT_PACKED: gl.constexpr = get_wmma_layout(NUM_WARPS, True, SCALE_PRESHUFFLE, WS_SWIZZLE)
+        PARTITION_A_: gl.constexpr = WS_PARTITION_A or WS_SWIZZLE
+        self.WS_PARTITION_A = gl.constexpr(PARTITION_A_)
+        PARTITION_B_: gl.constexpr = WS_PARTITION_B or WS_SWIZZLE
+        self.WS_PARTITION_B = gl.constexpr(PARTITION_B_)
+
+        WMMA_LAYOUT: gl.constexpr = get_wmma_layout(NUM_WARPS, False, SCALE_PRESHUFFLE, PARTITION_A_)
+        WMMA_LAYOUT_PACKED: gl.constexpr = get_wmma_layout(NUM_WARPS, True, SCALE_PRESHUFFLE, PARTITION_A_)
 
         self.dot_layout_a = gl.constexpr(
             gl.DotOperandLayout(operand_index=0, parent=WMMA_LAYOUT_PACKED if DTYPE_A == "e2m1" else WMMA_LAYOUT,
@@ -144,40 +162,66 @@ class MXFPGEMMConfig:
                                                  [BLOCK_N // NUM_SUBTILES_N, BLOCK_K_SCALE // NUM_SUBTILES_K]))
         self.acc_layout = gl.constexpr(WMMA_LAYOUT)
 
+        self.WS_SWIZZLE = gl.constexpr(WS_SWIZZLE)
+        BLOCK_N_HALF_: gl.constexpr = BLOCK_N // 2
+        self.BLOCK_N_HALF = gl.constexpr(BLOCK_N_HALF_)
+        if WS_SWIZZLE:
+            self.layout_b_scale_half = gl.constexpr(
+                gl.amd.gfx1250.get_wmma_scale_layout(self.dot_layout_b,
+                                                     [BLOCK_N_HALF_, BLOCK_K_SCALE // NUM_SUBTILES_K]))
+        else:
+            self.layout_b_scale_half = gl.constexpr(None)
+
         BLOCK_K_PACKED_A = BLOCK_K // self.DIV_FACTOR_A // NUM_SUBTILES_K
         BLOCK_K_PACKED_B = BLOCK_K // self.DIV_FACTOR_B // NUM_SUBTILES_K
-        if WS_SWIZZLE:
-            # Experimental variant:
-            # - A uses PartitionedSharedLayout(PaddedSharedLayout) where inner
-            #   padded tile shape follows:
-            #   (M_subtile // num_groups // num_partitions, K_packed).
-            # - B remains on the original padded shared layout.
-            num_groups_a: gl.constexpr = (BLOCK_M // NUM_SUBTILES_M) // 64
-            num_partitions_a: gl.constexpr = 2
-            inner_shape_m_a: gl.constexpr = (BLOCK_M // NUM_SUBTILES_M) // num_groups_a // num_partitions_a
+
+        tiles_per_warp_: gl.constexpr = 2 if SCALE_PRESHUFFLE else 1
+        num_partitions_: gl.constexpr = 2
+
+        # --- operand A ---
+        if PARTITION_A_:
+            num_groups_a: gl.constexpr = (BLOCK_M // NUM_SUBTILES_M) // (tiles_per_warp_ * 16 * num_partitions_)
+            inner_shape_m_a: gl.constexpr = (BLOCK_M // NUM_SUBTILES_M) // num_groups_a // num_partitions_
             inner_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 [[BLOCK_K_PACKED_A, 16]],
                 [inner_shape_m_a, BLOCK_K_PACKED_A],
                 [1, 0],
             )
             self.shared_layout_a = gl.constexpr(
-                PartitionedSharedLayout(num_partitions=num_partitions_a, num_groups=num_groups_a, partition_dim=0,
+                PartitionedSharedLayout(num_partitions=num_partitions_, num_groups=num_groups_a, partition_dim=0,
                                         partition_layout=inner_a)
             )
-            if TRANSPOSE_B:
-                self.shared_layout_b = gl.constexpr(
-                    gl.PaddedSharedLayout.with_identity_for([[BLOCK_K_PACKED_B, 16]],
-                                                            [BLOCK_N // NUM_SUBTILES_N, BLOCK_K_PACKED_B], [1, 0])
-                )
-            else:
-                self.shared_layout_b = gl.constexpr(
-                    gl.PaddedSharedLayout.with_identity_for([[BLOCK_N // NUM_SUBTILES_N, 16]],
-                                                            [BLOCK_K_PACKED_B, BLOCK_N // NUM_SUBTILES_N], [1, 0])
-                )
         else:
             self.shared_layout_a = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for([[BLOCK_K_PACKED_A, 16]],
                                                         [BLOCK_M // NUM_SUBTILES_M, BLOCK_K_PACKED_A], [1, 0]))
+
+        # --- operand B ---
+        if PARTITION_B_:
+            BLOCK_N_EFF: gl.constexpr = BLOCK_N // NUM_SUBTILES_N
+            num_groups_b: gl.constexpr = BLOCK_N_EFF // (tiles_per_warp_ * 16 * num_partitions_)
+            inner_shape_n_b: gl.constexpr = BLOCK_N_EFF // num_groups_b // num_partitions_
+            if TRANSPOSE_B:
+                inner_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+                    [[BLOCK_K_PACKED_B, 16]],
+                    [inner_shape_n_b, BLOCK_K_PACKED_B],
+                    [1, 0],
+                )
+                self.shared_layout_b = gl.constexpr(
+                    PartitionedSharedLayout(num_partitions=num_partitions_, num_groups=num_groups_b, partition_dim=0,
+                                            partition_layout=inner_b)
+                )
+            else:
+                inner_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+                    [[inner_shape_n_b, 16]],
+                    [BLOCK_K_PACKED_B, inner_shape_n_b],
+                    [1, 0],
+                )
+                self.shared_layout_b = gl.constexpr(
+                    PartitionedSharedLayout(num_partitions=num_partitions_, num_groups=num_groups_b, partition_dim=1,
+                                            partition_layout=inner_b)
+                )
+        else:
             if TRANSPOSE_B:
                 self.shared_layout_b = gl.constexpr(
                     gl.PaddedSharedLayout.with_identity_for([[BLOCK_K_PACKED_B, 16]],
@@ -449,6 +493,16 @@ class MXFPGEMMPipelinedProgram:
         return c_offs, c_mask
 
     @gluon.jit
+    def get_store_offsets_and_mask_mn_range(self, m_start: gl.constexpr, m_len: gl.constexpr,
+                                            n_start: gl.constexpr, n_len: gl.constexpr):
+        cfg = self.cfg
+        offs_cm = self.c_base_m + m_start + gl.arange(0, m_len)
+        offs_cn = self.c_base_n + n_start + gl.arange(0, n_len)
+        c_offs = self.stride_cm * offs_cm[:, None] + self.stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < self.M) & (offs_cn[None, :] < self.N)
+        return c_offs, c_mask
+
+    @gluon.jit
     def issue_local_loads_n_range(self, wmma_idx, a_buffer, b_buffer, a_scale_buffer, b_scale_buffer,
                                   n_start: gl.constexpr, n_len: gl.constexpr):
         cfg = self.cfg
@@ -690,6 +744,16 @@ class MXFPGEMMWSMSplitProgram:
         return c_offs, c_mask
 
     @gluon.jit
+    def get_store_offsets_and_mask_mn_range(self, m_start: gl.constexpr, m_len: gl.constexpr,
+                                            n_start: gl.constexpr, n_len: gl.constexpr):
+        cfg = self.cfg
+        offs_cm = self.c_base_m + m_start + gl.arange(0, m_len, layout=gl.SliceLayout(1, cfg.acc_layout))
+        offs_cn = self.c_base_n + n_start + gl.arange(0, n_len, layout=gl.SliceLayout(0, cfg.acc_layout))
+        c_offs = self.stride_cm * offs_cm[:, None] + self.stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < self.M) & (offs_cn[None, :] < self.N)
+        return c_offs, c_mask
+
+    @gluon.jit
     def issue_loads(self, load_idx, pred=1):
         cfg = self.cfg
         BLOCK_K_PACKED_A: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_A
@@ -785,6 +849,59 @@ class MXFPGEMMWSMSplitProgram:
         return a, b, scale_a, scale_b
 
     @gluon.jit
+    def issue_local_load_a_ws(self, wmma_idx, first_half: gl.constexpr):
+        """Load A operand and its scale for the WS swizzle path."""
+        cfg = self.cfg
+        BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
+        a_buffer = self.a_buffer0 if first_half else self.a_buffer1
+        a = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+            a_buffer.index(wmma_idx % cfg.NUM_BUFFERS), cfg.dot_layout_a
+        )
+        if cfg.WITH_A_SCALE:
+            a_scale_buffer = self.a_scale_buffer0 if first_half else self.a_scale_buffer1
+            a_scale_buffer_slice = a_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
+            if cfg.SCALE_PRESHUFFLE:
+                a_scale_buffer_slice = a_scale_buffer_slice.reshape((
+                    cfg.BLOCK_M_PRESHUFFLED // cfg.NUM_SUBTILES[0],
+                    BLOCK_K_SCALE // cfg.SCALE_KWIDTH,
+                    cfg.PRESHUFFLE_FACTOR // 4,
+                    4,
+                    cfg.SCALE_KWIDTH)).permute((0, 3, 2, 1, 4)).reshape((cfg.BLOCK_M // cfg.NUM_SUBTILES[0], BLOCK_K_SCALE))
+            scale_a = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+                a_scale_buffer_slice, cfg.layout_a_scale
+            )
+        else:
+            scale_a = gl.constexpr(0)
+        return a, scale_a
+
+    @gluon.jit
+    def issue_local_load_b_half_ws(self, wmma_idx, n_start: gl.constexpr):
+        """Load half of B (BLOCK_N_HALF columns starting at n_start) and its scale."""
+        cfg = self.cfg
+        BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
+        N_HALF: gl.constexpr = cfg.BLOCK_N_HALF
+        b_buf = self.b_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
+        if cfg.TRANSPOSE_B:
+            b = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+                b_buf.slice(n_start // cfg.DIV_FACTOR_B, N_HALF // cfg.DIV_FACTOR_B, 0).permute([1, 0]),
+                cfg.dot_layout_b)
+        else:
+            b = gl.amd.gfx1250.async_copy.load_shared_relaxed(
+                b_buf.slice(n_start // cfg.DIV_FACTOR_B, N_HALF // cfg.DIV_FACTOR_B, 1),
+                cfg.dot_layout_b)
+        b_scale_buffer_slice = self.b_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
+        if cfg.SCALE_PRESHUFFLE:
+            b_scale_buffer_slice = b_scale_buffer_slice.reshape((
+                cfg.BLOCK_N_PRESHUFFLED,
+                BLOCK_K_SCALE // cfg.SCALE_KWIDTH,
+                cfg.PRESHUFFLE_FACTOR // 4,
+                4,
+                cfg.SCALE_KWIDTH)).permute((0, 3, 2, 1, 4)).reshape((cfg.BLOCK_N, BLOCK_K_SCALE))
+        b_scale_slice = b_scale_buffer_slice.slice(n_start, N_HALF, 0)
+        scale_b = gl.amd.gfx1250.async_copy.load_shared_relaxed(b_scale_slice, cfg.layout_b_scale_half)
+        return b, scale_b
+
+    @gluon.jit
     def issue_local_loads_noscale(self, wmma_idx, first_half: gl.constexpr):
         cfg = self.cfg
         HALF_M: gl.constexpr = cfg.BLOCK_M // cfg.NUM_SUBTILES[0]
@@ -815,14 +932,28 @@ class MXFPGEMMWSMSplitProgram:
         load_idx = 0
         wmma_idx = 0
         loop_ub = gl.cdiv(K, cfg.BLOCK_K) - (cfg.NUM_BUFFERS - 1)
-        # Two partitions: pipe0 = producer + first half, pipe1 = second half.
         gl.warp_specialize(
             [
                 (MXFPGEMMWSMSplitProgram.ws_pipe0, (self, load_idx, wmma_idx, loop_ub, HALF_M)),
                 (MXFPGEMMWSMSplitProgram.ws_pipe1, (self, wmma_idx, loop_ub, HALF_M)),
             ],
-            # In this Gluon path, worker_num_warps is a single total worker value,
-            # not a per-partition list.
+            [cfg.NUM_WARPS],
+        )
+
+    @gluon.jit
+    def warp_pipeline_ws_splitB(self, K):
+        cfg = self.cfg
+        gl.static_assert(cfg.NUM_WARPS == 4)
+        gl.static_assert(cfg.WS_SWIZZLE)
+        HALF_M: gl.constexpr = cfg.BLOCK_M // 2
+        load_idx = 0
+        wmma_idx = 0
+        loop_ub = gl.cdiv(K, cfg.BLOCK_K) - (cfg.NUM_BUFFERS - 1)
+        gl.warp_specialize(
+            [
+                (MXFPGEMMWSMSplitProgram.ws_pipe0_swizzle, (self, load_idx, wmma_idx, loop_ub, HALF_M)),
+                (MXFPGEMMWSMSplitProgram.ws_pipe1_swizzle, (self, wmma_idx, loop_ub, HALF_M)),
+            ],
             [cfg.NUM_WARPS],
         )
 
@@ -945,6 +1076,110 @@ class MXFPGEMMWSMSplitProgram:
             c1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, c1)
         c_offs, c_mask = self.get_store_offsets_and_mask_m_range(HALF_M, HALF_M)
         gl.amd.gfx1250.buffer_store(c1, self.c_ptr, c_offs, mask=c_mask)
+
+    @gluon.jit
+    def issue_local_loads_swizzled(self, wmma_idx, first_half: gl.constexpr):
+        """Load A + both B halves with swizzled B order per SIMD pair.
+
+        All ds_loads are issued together for efficient pipelining.
+        pair 0 (warp_id & 1 == 0): A, B_P0, B_P1
+        pair 1 (warp_id & 1 == 1): A, B_P1, B_P0
+        """
+        cfg = self.cfg
+        N_HALF: gl.constexpr = cfg.BLOCK_N_HALF
+        a, scale_a = self.issue_local_load_a_ws(wmma_idx, first_half)
+        gl.sched_barrier(0)
+        pair_id = gl.warp_id() & 1
+        if pair_id == 0:
+            b0, sb0 = self.issue_local_load_b_half_ws(wmma_idx, 0)
+            gl.sched_barrier(0)
+            b1, sb1 = self.issue_local_load_b_half_ws(wmma_idx, N_HALF)
+        else:
+            b1, sb1 = self.issue_local_load_b_half_ws(wmma_idx, N_HALF)
+            gl.sched_barrier(0)
+            b0, sb0 = self.issue_local_load_b_half_ws(wmma_idx, 0)
+        return a, scale_a, b0, sb0, b1, sb1
+
+    @gluon.jit
+    def ws_pipe0_swizzle(self, load_idx, wmma_idx, loop_ub, HALF_M):
+        cfg = self.cfg
+        NUM_LOADS_IN_BATCH_WS: gl.constexpr = cfg.NUM_LOADS_IN_BATCH + (2 if cfg.WITH_A_SCALE else 1)
+        N_HALF: gl.constexpr = cfg.BLOCK_N_HALF
+        c_n0 = gl.zeros((HALF_M, N_HALF), dtype=gl.float32, layout=cfg.acc_layout)
+        c_n1 = gl.zeros((HALF_M, N_HALF), dtype=gl.float32, layout=cfg.acc_layout)
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_loads(load_idx)
+
+        gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+        gl.sched_barrier(0)
+        gl.barrier(cta=False, addrspace=0b00001)
+        gl.sched_barrier(0)
+        gl.assume(loop_ub >= 0)
+        for _ in range(0, loop_ub):
+            a, scale_a, b0, sb0, b1, sb1 = self.issue_local_loads_swizzled(wmma_idx, True)
+            gl.sched_barrier(0)
+            wmma_idx += 1
+            load_idx = self.issue_loads(load_idx)
+
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+            c_n0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b0, sb0, cfg.DTYPE_B, c_n0)
+            c_n1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b1, sb1, cfg.DTYPE_B, c_n1)
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+        gl.barrier(cta=True, addrspace=0b00000)
+        gl.sched_barrier(0)
+        for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 1 - i) * NUM_LOADS_IN_BATCH_WS)
+            gl.barrier(cta=True, addrspace=0b00001)
+            a, scale_a, b0, sb0, b1, sb1 = self.issue_local_loads_swizzled(wmma_idx, True)
+            wmma_idx += 1
+            c_n0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b0, sb0, cfg.DTYPE_B, c_n0)
+            c_n1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b1, sb1, cfg.DTYPE_B, c_n1)
+        c_offs_n0, c_mask_n0 = self.get_store_offsets_and_mask_mn_range(0, HALF_M, 0, N_HALF)
+        gl.amd.gfx1250.buffer_store(c_n0, self.c_ptr, c_offs_n0, mask=c_mask_n0)
+        c_offs_n1, c_mask_n1 = self.get_store_offsets_and_mask_mn_range(0, HALF_M, N_HALF, N_HALF)
+        gl.amd.gfx1250.buffer_store(c_n1, self.c_ptr, c_offs_n1, mask=c_mask_n1)
+
+    @gluon.jit
+    def ws_pipe1_swizzle(self, wmma_idx, loop_ub, HALF_M):
+        cfg = self.cfg
+        NUM_LOADS_IN_BATCH_WS: gl.constexpr = cfg.NUM_LOADS_IN_BATCH + (2 if cfg.WITH_A_SCALE else 1)
+        N_HALF: gl.constexpr = cfg.BLOCK_N_HALF
+        c_n0 = gl.zeros((HALF_M, N_HALF), dtype=gl.float32, layout=cfg.acc_layout)
+        c_n1 = gl.zeros((HALF_M, N_HALF), dtype=gl.float32, layout=cfg.acc_layout)
+        gl.barrier(cta=True, addrspace=0b00000)
+        gl.assume(loop_ub >= 0)
+        for _ in range(0, loop_ub):
+            a, scale_a, b0, sb0, b1, sb1 = self.issue_local_loads_swizzled(wmma_idx, False)
+            wmma_idx += 1
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+            c_n0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b0, sb0, cfg.DTYPE_B, c_n0)
+            c_n1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b1, sb1, cfg.DTYPE_B, c_n1)
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+
+        for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            gl.sched_barrier(0)
+            gl.barrier(cta=True, addrspace=0b00000)
+            gl.sched_barrier(0)
+            a, scale_a, b0, sb0, b1, sb1 = self.issue_local_loads_swizzled(wmma_idx, False)
+            wmma_idx += 1
+            c_n0 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b0, sb0, cfg.DTYPE_B, c_n0)
+            c_n1 = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b1, sb1, cfg.DTYPE_B, c_n1)
+        c_offs_n0, c_mask_n0 = self.get_store_offsets_and_mask_mn_range(HALF_M, HALF_M, 0, N_HALF)
+        gl.amd.gfx1250.buffer_store(c_n0, self.c_ptr, c_offs_n0, mask=c_mask_n0)
+        c_offs_n1, c_mask_n1 = self.get_store_offsets_and_mask_mn_range(HALF_M, HALF_M, N_HALF, N_HALF)
+        gl.amd.gfx1250.buffer_store(c_n1, self.c_ptr, c_offs_n1, mask=c_mask_n1)
 
     @gluon.jit
     def ws_pipe0_local_pref(self, load_idx, wmma_idx, loop_ub, HALF_M):
@@ -1901,7 +2136,8 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
                                 ASYNC_COPY_SCALE: gl.constexpr, WITH_A_SCALE: gl.constexpr, SCHEDULE: gl.constexpr,
                                 NUM_WARPS: gl.constexpr, PINGPONG: gl.constexpr, WS: gl.constexpr,
                                 WS_NOSCALE: gl.constexpr, LPREF: gl.constexpr, LPREF2: gl.constexpr,
-                                WS_SWIZZLE: gl.constexpr):
+                                WS_SWIZZLE: gl.constexpr, WS_PARTITION_A: gl.constexpr,
+                                WS_PARTITION_B: gl.constexpr):
 
     if WS:
         gl.static_assert(SCHEDULE == 'baseline')
@@ -1930,7 +2166,8 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
         NUM_SUBTILES: gl.constexpr = (2, 1, 1) if WS else (1, 1, 1)
 
     cfg = MXFPGEMMConfig(BLOCK_M, BLOCK_N, BLOCK_K, DTYPE_A, DTYPE_B, SCALE_BLOCK, NUM_BUFFERS, TRANSPOSE_B,
-                         WITH_A_SCALE, SCALE_PRESHUFFLE, NUM_WARPS, ASYNC_COPY_SCALE, NUM_SUBTILES, WS_SWIZZLE)
+                         WITH_A_SCALE, SCALE_PRESHUFFLE, NUM_WARPS, ASYNC_COPY_SCALE, NUM_SUBTILES, WS_SWIZZLE,
+                         WS_PARTITION_A, WS_PARTITION_B)
 
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
@@ -1985,6 +2222,8 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
                 pgm.warp_pipeline_ws_local_pref2(K)
             elif LPREF:
                 pgm.warp_pipeline_ws_local_pref(K)
+            elif WS_SWIZZLE:
+                pgm.warp_pipeline_ws_splitB(K)
             else:
                 pgm.warp_pipeline_ws(K)
         else:
@@ -2101,8 +2340,8 @@ def get_ws_launch_params(num_warps, schedule, ws=False):
 def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B,
                                             NUM_BUFFERS, SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE,
                                             GROUP_SIZE_M, PINGPONG, WS=False, WS_NOSCALE=False, LPREF=False,
-                                            LPREF2=False, WS_SWIZZLE=False,
-                                            DEBUG_DETERMINISTIC=False,
+                                            LPREF2=False, WS_SWIZZLE=False, WS_PARTITION_A=False,
+                                            WS_PARTITION_B=False, DEBUG_DETERMINISTIC=False,
                                             DUMP_BOTTOM=False):
     SCALE_BLOCK = 32
     numWarps = 8
@@ -2197,7 +2436,7 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
                                           dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
                                           GROUP_SIZE_M, TRANSPOSE_B, NUM_BUFFERS, SCALE_PRESHUFFLE, ASYNC_COPY_SCALE,
                                           WITH_A_SCALE, SCHEDULE, kernel_num_warps, PINGPONG, WS, WS_NOSCALE, LPREF,
-                                          LPREF2, WS_SWIZZLE,
+                                          LPREF2, WS_SWIZZLE, WS_PARTITION_A, WS_PARTITION_B,
                                           num_warps=kernel_num_warps,
                                           num_ctas=numCtas,
                                           waves_per_eu=waves_per_eu)
@@ -2245,7 +2484,7 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
 def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B, NUM_BUFFERS,
                                       SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE, GROUP_SIZE_M,
                                       WS=False, WS_NOSCALE=False, LPREF=False, LPREF2=False, WS_SWIZZLE=False,
-                                      DEBUG_DETERMINISTIC=False):
+                                      WS_PARTITION_A=False, WS_PARTITION_B=False, DEBUG_DETERMINISTIC=False):
     SCALE_BLOCK = 32
     numWarps = 4
     numCtas = 1
@@ -2346,6 +2585,7 @@ def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_
                                           GROUP_SIZE_M, TRANSPOSE_B, NUM_BUFFERS, SCALE_PRESHUFFLE, ASYNC_COPY_SCALE,
                                           WITH_A_SCALE, SCHEDULE, NUM_WARPS=kernel_num_warps, PINGPONG=False, WS=WS,
                                           WS_NOSCALE=WS_NOSCALE, LPREF=LPREF, LPREF2=LPREF2, WS_SWIZZLE=WS_SWIZZLE,
+                                          WS_PARTITION_A=WS_PARTITION_A, WS_PARTITION_B=WS_PARTITION_B,
                                           num_warps=kernel_num_warps, num_ctas=numCtas,
                                           waves_per_eu=waves_per_eu)
     static_profile(k)
@@ -2391,6 +2631,8 @@ if __name__ == '__main__':
     parser.add_argument('--lpref', action='store_true')
     parser.add_argument('--lpref2', action='store_true')
     parser.add_argument('--ws_swizzle', action='store_true')
+    parser.add_argument('--ws_partition_a', action='store_true')
+    parser.add_argument('--ws_partition_b', action='store_true')
     parser.add_argument('--debug_deterministic', action='store_true')
     parser.add_argument('--dump_bottom', action='store_true')
 
@@ -2420,6 +2662,7 @@ if __name__ == '__main__':
         raise ValueError("--ws_swizzle requires --ws")
     if args.ws_swizzle and not args.pingpong:
         raise ValueError("--ws_swizzle requires --pingpong")
+    pass
 
     if args.pingpong:
         assert (args.num_warps == 8 and (args.schedule == 'baseline' or args.schedule == 'sliceK'))
@@ -2442,6 +2685,8 @@ if __name__ == '__main__':
                                                 LPREF=args.lpref,  #
                                                 LPREF2=args.lpref2,  #
                                                 WS_SWIZZLE=args.ws_swizzle,  #
+                                                WS_PARTITION_A=args.ws_partition_a,  #
+                                                WS_PARTITION_B=args.ws_partition_b,  #
                                                 DEBUG_DETERMINISTIC=args.debug_deterministic,  #
                                                 DUMP_BOTTOM=args.dump_bottom)
     else:
@@ -2461,4 +2706,6 @@ if __name__ == '__main__':
                                           LPREF=args.lpref,  #
                                           LPREF2=args.lpref2,  #
                                           WS_SWIZZLE=args.ws_swizzle,  #
+                                          WS_PARTITION_A=args.ws_partition_a,  #
+                                          WS_PARTITION_B=args.ws_partition_b,  #
                                           DEBUG_DETERMINISTIC=args.debug_deterministic)
