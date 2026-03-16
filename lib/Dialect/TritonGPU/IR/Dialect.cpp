@@ -2868,6 +2868,27 @@ struct TritonGPUInferLayoutInterface
           applyPermutation(invOrderUnsigned, enc.getOrder()), cgaLayout);
       return success();
     }
+    if (auto partitioned =
+            dyn_cast<PartitionedSharedEncodingAttr>(operandEncoding)) {
+      auto innerEnc = partitioned.getPartitionLayout();
+      Attribute transposedInner;
+      // Compute the inner shape: divide the full shape by the outer partition
+      // structure along the partition dimension.
+      SmallVector<int64_t> innerShape(shape);
+      unsigned partDim = partitioned.getPartitionDim();
+      innerShape[partDim] /=
+          (partitioned.getNumPartitions() * partitioned.getNumGroups());
+      auto res = inferTransOpEncoding(innerEnc, innerShape, order,
+                                      transposedInner, loc);
+      if (failed(res))
+        return failure();
+      unsigned newPartDim = order[partDim];
+      resultEncoding = PartitionedSharedEncodingAttr::get(
+          ctx, partitioned.getNumPartitions(), partitioned.getNumGroups(),
+          newPartDim, cast<SharedEncodingTrait>(transposedInner));
+      return success();
+    }
+
     // Generic case
     auto padded = dyn_cast<PaddedSharedEncodingAttr>(operandEncoding);
 

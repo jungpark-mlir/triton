@@ -1199,9 +1199,6 @@ LinearLayout TritonGPUDialect::toLinearLayout(ArrayRef<int64_t> shape,
       result = sharedToLinearLayoutAMDRotating(shape, sbl);
     } else if (auto partitioned =
                    dyn_cast<PartitionedSharedEncodingAttr>(layout)) {
-      assert(!isa<PaddedSharedEncodingAttr>(partitioned.getPartitionLayout()) &&
-             "toLinearLayout does not support partitioned layouts wrapping "
-             "padded layouts; use paddedLinearLayout instead");
       result = partitionedSharedToLinearLayout(shape, partitioned);
     } else if (auto tensorMemoryEncoding =
                    dyn_cast<TensorMemoryEncodingAttr>(layout)) {
