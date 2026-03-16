@@ -455,9 +455,8 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
     vals = removeBroadcast.apply(vals);
 
     LinearLayout sharedLayout;
-    if (auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(
-            sharedTy.getEncoding())) {
-      sharedLayout = paddedEnc.getLinearComponent();
+    if (isPaddedEncoding(sharedTy.getEncoding())) {
+      sharedLayout = paddedLinearLayout(sharedTy);
     } else {
       sharedLayout = triton::gpu::toLinearLayout(sharedTy);
     }
@@ -1105,8 +1104,8 @@ struct AsyncCopyLocalToGlobalOpConversion
 
     // For padded encodings restrict vec by the min interval
     auto srcEnc = srcTy.getEncoding();
-    if (auto padEnc = dyn_cast<PaddedSharedEncodingAttr>(srcEnc)) {
-      vec = std::min(vec, padEnc.getMinInterval());
+    if (isPaddedEncoding(srcEnc)) {
+      vec = std::min(vec, getMinInterval(srcEnc));
     }
 
     Type dstPtrTy = dstElems[0].getType();
