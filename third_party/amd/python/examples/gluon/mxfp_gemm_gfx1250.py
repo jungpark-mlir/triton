@@ -424,6 +424,84 @@ class MXFPGEMMPipelinedProgram:
 
         gl.amd.gfx1250.buffer_store(accumulator, self.c_ptr, self.c_offs, mask=self.c_mask)
 
+    @gluon.jit
+    def local_prefetch_pipeline(self, K):
+        cfg = self.cfg
+        load_idx = 0
+        wmma_idx = 0
+
+        # Prologue: fill NUM_BUFFERS-1 buffers via TDM
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_loads(load_idx, self.a_buffer, self.b_buffer, self.a_scale_buffer,
+                                        self.b_scale_buffer)
+
+        # Wait for first buffer and do initial local load (prefetch into registers)
+        gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * self.cfg.NUM_LOADS_IN_BATCH)
+        a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, self.a_buffer, self.b_buffer, self.a_scale_buffer,
+                                                        self.b_scale_buffer)
+        wmma_idx += 1
+
+        accumulator = gl.zeros((cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=self.cfg.acc_layout)
+        loop_ub = gl.cdiv(K, cfg.BLOCK_K)
+        gl.assume(loop_ub > 0)
+        epilogue_lb = loop_ub - (cfg.NUM_BUFFERS - 1)
+        for i in range(0, loop_ub):
+            # 1. WMMA first — consumes data prefetched in the previous iteration
+            accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, accumulator)
+
+            # 2. TDM load for a future iteration (predicated off in epilogue)
+            pred = i - epilogue_lb
+            pred = (pred >> 31) & 1
+            load_idx = self.issue_loads(load_idx, self.a_buffer, self.b_buffer, self.a_scale_buffer,
+                                        self.b_scale_buffer, pred=pred)
+
+            # 3. Wait for the buffer we're about to read
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * self.cfg.NUM_LOADS_IN_BATCH)
+
+            # 4. Local load for the NEXT iteration (local prefetch)
+            a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, self.a_buffer, self.b_buffer,
+                                                            self.a_scale_buffer, self.b_scale_buffer)
+            wmma_idx += 1
+
+        gl.amd.gfx1250.buffer_store(accumulator, self.c_ptr, self.c_offs, mask=self.c_mask)
+
+    @gluon.jit
+    def local_prefetch_warp_pipeline(self, K):
+        cfg = self.cfg
+        load_idx = 0
+        wmma_idx = 0
+
+        # Prologue: fill NUM_BUFFERS-1 buffers via TDM
+        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
+            load_idx = self.issue_loads(load_idx, self.a_buffer, self.b_buffer, self.a_scale_buffer,
+                                        self.b_scale_buffer)
+
+        # Wait for first buffer and prefetch into registers
+        gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * self.cfg.NUM_LOADS_IN_BATCH)
+        a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, self.a_buffer, self.b_buffer, self.a_scale_buffer,
+                                                        self.b_scale_buffer)
+        wmma_idx += 1
+
+        accumulator = gl.zeros((cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=self.cfg.acc_layout)
+        loop_ub = gl.cdiv(K, cfg.BLOCK_K)
+        gl.assume(loop_ub > 0)
+        epilogue_lb = loop_ub - (cfg.NUM_BUFFERS - 1)
+        for i in range(0, loop_ub):
+            accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, cfg.DTYPE_A, b, scale_b, cfg.DTYPE_B, accumulator)
+
+            pred = i - epilogue_lb
+            pred = (pred >> 31) & 1
+            load_idx = self.issue_loads(load_idx, self.a_buffer, self.b_buffer, self.a_scale_buffer,
+                                        self.b_scale_buffer, pred=pred)
+
+            gl.amd.gfx1250.tdm.async_wait((cfg.NUM_BUFFERS - 2) * self.cfg.NUM_LOADS_IN_BATCH)
+
+            a, b, scale_a, scale_b = self.issue_local_loads(wmma_idx, self.a_buffer, self.b_buffer,
+                                                            self.a_scale_buffer, self.b_scale_buffer)
+            wmma_idx += 1
+
+        gl.amd.gfx1250.buffer_store(accumulator, self.c_ptr, self.c_offs, mask=self.c_mask)
+
 
 @composition
 @aggregate
@@ -1032,7 +1110,8 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
                                 BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr,
                                 TRANSPOSE_B: gl.constexpr, NUM_BUFFERS: gl.constexpr, SCALE_PRESHUFFLE: gl.constexpr,
                                 ASYNC_COPY_SCALE: gl.constexpr, WITH_A_SCALE: gl.constexpr, SCHEDULE: gl.constexpr,
-                                NUM_WARPS: gl.constexpr, PINGPONG: gl.constexpr):
+                                NUM_WARPS: gl.constexpr, PINGPONG: gl.constexpr,
+                                LOCAL_PREFETCH: gl.constexpr = False):
 
     if PINGPONG:
         gl.static_assert(NUM_WARPS == 8 and (SCHEDULE == 'baseline' or SCHEDULE == 'sliceK'))
@@ -1082,7 +1161,13 @@ def mxgemm_tdm_pipelined_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, 
                                                   c_mask)
 
     if PINGPONG:
-        pgm.warp_pipeline(K)
+        if LOCAL_PREFETCH:
+            pgm.local_prefetch_warp_pipeline(K)
+        else:
+            pgm.warp_pipeline(K)
+    elif LOCAL_PREFETCH:
+        gl.static_assert(SCHEDULE == 'baseline')
+        pgm.local_prefetch_pipeline(K)
     else:
         pgm.pipeline(K)
 
@@ -1140,7 +1225,7 @@ def pack_scale(x):
 @pytest.mark.parametrize("PINGPONG", [True, False])
 def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B,
                                             NUM_BUFFERS, SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE,
-                                            GROUP_SIZE_M, PINGPONG):
+                                            GROUP_SIZE_M, PINGPONG, LOCAL_PREFETCH=False):
     SCALE_BLOCK = 32
     numWarps = 8
     numCtas = 1
@@ -1218,8 +1303,8 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
                                           stride_bn, stride_cm, stride_cn, stride_scale, dtype_converter[DTYPE_A],
                                           dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
                                           GROUP_SIZE_M, TRANSPOSE_B, NUM_BUFFERS, SCALE_PRESHUFFLE, ASYNC_COPY_SCALE,
-                                          WITH_A_SCALE, SCHEDULE, numWarps, PINGPONG, num_warps=numWarps,
-                                          num_ctas=numCtas, waves_per_eu=(numWarps // 4))
+                                          WITH_A_SCALE, SCHEDULE, numWarps, PINGPONG, LOCAL_PREFETCH=LOCAL_PREFETCH,
+                                          num_warps=numWarps, num_ctas=numCtas, waves_per_eu=(numWarps // 4))
     static_profile(k)
 
     if TRANSPOSE_B:
@@ -1242,7 +1327,8 @@ def test_runtime_mxgemm_tdm_8warps_pipeline(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, 
 @pytest.mark.parametrize("ASYNC_COPY_SCALE", [True, False])
 @pytest.mark.parametrize("GROUP_SIZE_M", [8])
 def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B, NUM_BUFFERS,
-                                      SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE, GROUP_SIZE_M):
+                                      SCALE_PRESHUFFLE, WITH_A_SCALE, SCHEDULE, ASYNC_COPY_SCALE, GROUP_SIZE_M,
+                                      LOCAL_PREFETCH=False):
     SCALE_BLOCK = 32
     numWarps = 4
     numCtas = 1
@@ -1257,8 +1343,8 @@ def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_
     if SCHEDULE != 'baseline' and not (SCALE_PRESHUFFLE and TRANSPOSE_B):
         pytest.skip('Only test with SCALE_PRESHUFFLE and TRANSPOSE_B in sliceK and sliceNK schedules')
 
-    if NUM_BUFFERS == 4 and BLOCK_M >= 256:
-        pytest.skip("Large block size with 4 buffers will exceed lds limit")
+    #if NUM_BUFFERS == 4 and BLOCK_M >= 256:
+    #    pytest.skip("Large block size with 4 buffers will exceed lds limit")
 
     if SCHEDULE == 'sliceNK':
         if BLOCK_K < 256 or BLOCK_N < 256:
@@ -1333,6 +1419,7 @@ def test_runtime_mxgemm_tdm_pipelined(DTYPE_A, DTYPE_B, M, N, K, BLOCK_M, BLOCK_
                                           dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
                                           GROUP_SIZE_M, TRANSPOSE_B, NUM_BUFFERS, SCALE_PRESHUFFLE, ASYNC_COPY_SCALE,
                                           WITH_A_SCALE, SCHEDULE, NUM_WARPS=numWarps, PINGPONG=False,
+                                          LOCAL_PREFETCH=LOCAL_PREFETCH,
                                           num_warps=numWarps, num_ctas=numCtas, waves_per_eu=numWarps // 4)
     static_profile(k)
 
@@ -1365,14 +1452,20 @@ if __name__ == '__main__':
     parser.add_argument('--dtype_a', type=str, default='float8_e4m3', choices=supported_dtypes)
     parser.add_argument('--dtype_b', type=str, default='float8_e4m3', choices=supported_dtypes)
     parser.add_argument('--pingpong', action='store_true')
+    parser.add_argument('--local_prefetch', action='store_true',
+                        help='Use v5-style local prefetch pipeline')
 
     args = parser.parse_args()
 
     if args.pingpong:
         assert (args.num_warps == 8 and (args.schedule == 'baseline' or args.schedule == 'sliceK'))
 
+    if args.local_prefetch:
+        assert args.schedule == 'baseline', \
+            'local_prefetch only supported with baseline schedule'
+
     if args.num_warps == 8:
-        assert (args.num_buffers == 3 and not args.async_copy_scale)
+        #assert (args.num_buffers == 3 and not args.async_copy_scale)
         test_runtime_mxgemm_tdm_8warps_pipeline(args.dtype_a, args.dtype_b,  #
                                                 args.M, args.N, args.K,  #
                                                 args.BM, args.BN, args.BK,  #
@@ -1383,7 +1476,8 @@ if __name__ == '__main__':
                                                 SCHEDULE=args.schedule,  #
                                                 ASYNC_COPY_SCALE=False,  #
                                                 GROUP_SIZE_M=args.group_size_m,  #
-                                                PINGPONG=args.pingpong)
+                                                PINGPONG=args.pingpong,  #
+                                                LOCAL_PREFETCH=args.local_prefetch)
     else:
         assert (args.num_buffers in (2, 4))
         test_runtime_mxgemm_tdm_pipelined(args.dtype_a, args.dtype_b,  #
@@ -1395,4 +1489,5 @@ if __name__ == '__main__':
                                           WITH_A_SCALE=args.with_a_scale,  #
                                           SCHEDULE=args.schedule,  #
                                           ASYNC_COPY_SCALE=args.async_copy_scale,  #
-                                          GROUP_SIZE_M=args.group_size_m)
+                                          GROUP_SIZE_M=args.group_size_m,  #
+                                          LOCAL_PREFETCH=args.local_prefetch)
