@@ -411,6 +411,9 @@ class InterpreterBuilder:
     def create_get_num_programs(self, axis):
         return TensorHandle(np.array([self.grid_dim[axis]], dtype=np.int32), tl.int32)
 
+    def create_get_warp_id(self):
+        return TensorHandle(np.array([0], dtype=np.int32), tl.int32)
+
     # memory ops
     def create_load(self, ptr, _0, _1, is_volatile):
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)

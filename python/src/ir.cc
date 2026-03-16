@@ -1660,6 +1660,10 @@ void init_triton_ir(py::module &&m) {
                throw pybind11::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
            })
+      .def("create_get_warp_id",
+           [](TritonOpBuilder &self) -> Value {
+             return self.create<mlir::triton::gpu::WarpIdOp>();
+           })
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &c, InputPrecision inputPrecision,

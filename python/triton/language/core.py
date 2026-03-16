@@ -1883,6 +1883,16 @@ def num_programs(axis, _semantic=None):
     return _semantic.num_programs(axis)
 
 
+@builtin
+def warp_id(_semantic=None):
+    """
+    Returns the warp ID of the current thread within the CTA.
+
+    :rtype: int32
+    """
+    return _semantic.warp_id()
+
+
 # -----------------------
 # Block Initialization
 # -----------------------

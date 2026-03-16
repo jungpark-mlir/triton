@@ -84,6 +84,7 @@ from ._core import (
     barrier,
     to_linear_layout,
     to_tensor,
+    warp_id,
     warp_specialize,
     where,
 )
