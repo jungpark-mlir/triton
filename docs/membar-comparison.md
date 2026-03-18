@@ -1,4 +1,4 @@
-# Membar False Positive Suppression: Comparison
+# Membar False Positive Suppression for Multi-Buffered Pipelines
 
 ## Problem
 
@@ -12,13 +12,9 @@ This false barrier exists on both the Triton pipeliner path and the Gluon path w
 
 An AMD-specific annotation pass stamps `local_load` ops whose token chains back to an `async_wait`, and a backend filter suppresses barriers for those annotated ops. This proves data visibility but does not structurally prove multi-buffering — a single-buffer case would be incorrectly filtered. The filter's correctness relies on the assumption that the pipeliner always generates `numBuffers >= 2`, violating pass independence.
 
-## Interaction with Other `local_load` Sources
+## Solution: Symbolic Buffer Index Analysis
 
-Other passes also generate `local_load` ops (e.g., `ReduceDataDuplication` for layout conversions via shared memory). These create their own separate `local_alloc`, which is assigned a distinct buffer ID with a non-overlapping allocation interval. Membar's first check in `AllocationSlice::intersects` compares allocation intervals — since different `local_alloc`s have disjoint intervals, membar already knows they access separate memory and never reports a hazard between them. Neither alternative affects these cases.
-
-## Proposed Alternative A: Symbolic Buffer Index Analysis
-
-Extend `AllocationSlice::intersects` in core `Membar.cpp` to decompose `MemDescIndexOp` indices into a canonical form `{baseValue, constantOffset, modulus}`. Two accesses are provably disjoint when they share the same SSA base value, the same modulus, and different constant offsets:
+The direct fix is to teach membar how to reason about `MemDescIndexOp` indices. Extend `AllocationSlice::intersects` in core `Membar.cpp` to decompose each index into a canonical form `{baseValue, constantOffset, modulus}`. Two accesses are provably disjoint when they share the same SSA base, the same modulus, and different constant offsets:
 
 ```
 slot[(phase + 1) % 3]  → {base=%phase, offset=1, mod=3}
@@ -28,43 +24,52 @@ slot[(phase + 2) % 3]  → {base=%phase, offset=2, mod=3}
 
 Recognized patterns: `arith.remsi` (Gluon `%` operator) and `select/cmpi` (pipeliner's `createIncrementModulo`). Unrecognized patterns fall back to conservative. Loop-carried slices (across backedges) are detected via `DominanceInfo` and excluded from expression matching.
 
+This approach is clean and self-contained:
+- Lives in core membar — benefits all backends, not AMD-specific.
+- No annotations or attributes — nothing to lose during lowering.
+- Single-buffer safe by construction — same offsets are never reported as disjoint.
+- Replaces the `syncedViaAsyncWait` machinery entirely.
+
 Requires the pipeliner to create separate `MemDescIndexOp`s for producer and consumer, both derived from the same SSA phase counter with different constant offsets.
 
-See [membar-dynamic-index-disjointness.md](docs/membar-dynamic-index-disjointness.md) for full design.
+See [membar-dynamic-index-disjointness.md](membar-dynamic-index-disjointness.md) for full design and implementation.
 
-## Proposed Alternative B: Buffer Slot Coloring
+## Considered Alternative: Buffer Slot Coloring
 
-Tag each `MemDescIndexOp` with a `buffer_color` integer attribute. The AMD membar filter treats accesses with different colors as provably disjoint:
+We also evaluated an attribute-based approach where each `MemDescIndexOp` is tagged with a `buffer_color` integer, and the AMD membar filter treats different colors as disjoint:
 
 ```mlir
 %read  = ttg.memdesc_index %alloc[%phase] {buffer_color = 0}
 %write = ttg.memdesc_index %alloc[%next]  {buffer_color = 1}
-// color 0 ≠ color 1 → filter suppresses barrier
 ```
 
-No pattern recognition needed — works with any index computation. Gluon users set colors via `amd.colored_memdesc_index`. The pipeliner stamps colors at `MemDescIndexOp` creation time. If any pass drops the attribute, membar falls back to conservative (safe).
+This decouples pattern recognition from the disjointness decision — the producer declares the contract, and the filter just compares integers. This has practical value in two areas:
 
-Requires the same pipeliner change (separate `MemDescIndexOp`s per stage) so the attribute is not lost to loop-carrying.
+- **Extensibility** — new index idioms or pipeliner strategies require no changes to the filter. With symbolic analysis, each new pattern needs a new case in `analyzeBufferIndex`.
+- **Gluon flexibility** — Gluon users can compute indices however they want without being constrained to patterns the compiler recognizes.
+
+However, it introduces AMD-specific machinery, depends on attributes surviving lowering, and requires a new Gluon API (`colored_memdesc_index`). It also requires the same pipeliner change as symbolic analysis (separate `MemDescIndexOp`s per stage).
 
 See [membar-buffer-slot-coloring.md](membar-buffer-slot-coloring.md) for full design.
 
 ## Comparison
 
-| | Current Solution | Symbolic Index Analysis | Buffer Coloring |
-|---|---|---|---|
-| **Where** | AMD filter + annotation pass | Core `Membar.cpp` | AMD filter |
-| **Mechanism** | Token chain → `syncedViaAsyncWait` | Symbolic index decomposition | `buffer_color` attribute |
-| **Single-buffer safe** | No (relies on pipeliner) | Yes (by construction) | Depends on correct assignment |
-| **Pipeliner change needed** | No | Yes (separate `MemDescIndexOp`s, unified counter) | Yes (separate `MemDescIndexOp`s) |
-| **Benefits all backends** | No | Yes | No |
-| **Pattern-dependent** | No (token chain) | Yes (`remsi`, `select/cmpi`) | No |
-| **Attribute/annotation needed** | Yes (`syncedViaAsyncWait`) | No | Yes (`buffer_color`) |
-| **Gluon support** | `load_shared_relaxed` | Automatic (if index patterns match) | `colored_memdesc_index` |
-| **Handles separate counters** | N/A | No (different SSA bases) | Yes |
-| **Extensibility** | N/A | New index idioms need new pattern matchers | Producer stamps color; filter unchanged |
+| | Symbolic Index Analysis | Buffer Coloring |
+|---|---|---|
+| **Where** | Core `Membar.cpp` | AMD filter |
+| **Mechanism** | Compiler infers disjointness from index arithmetic | Code generator declares disjointness via attribute |
+| **Single-buffer safe** | Yes (by construction) | Depends on correct assignment |
+| **Benefits all backends** | Yes | No |
+| **Pattern-dependent** | Yes (`remsi`, `select/cmpi`) | No |
+| **Attribute needed** | No | Yes (`buffer_color`) |
+| **Gluon support** | Automatic (if index patterns match) | Explicit (`colored_memdesc_index`) |
+| **Extensibility** | New idioms need new pattern matchers | Producer stamps color; filter unchanged |
+| **Pipeliner change** | Separate `MemDescIndexOp`s, unified counter | Separate `MemDescIndexOp`s |
 
 ## Where We Stand
 
-Both approaches address the same root cause — membar's inability to distinguish dynamic buffer slot indices — but from different angles. Symbolic index analysis works at the IR level in core membar, proving disjointness from index arithmetic. Buffer coloring works at the annotation level in the AMD filter, letting producers declare disjointness explicitly. Each has trade-offs in generality, extensibility, and backend scope.
+Symbolic index analysis is the straightforward solution — it fixes the gap in membar's reasoning directly, works across backends, and requires no annotations or new API surface. The recognized patterns (`remsi`, `select/cmpi`) already cover what the pipeliner and Gluon produce today.
 
-The two are not mutually exclusive. They operate at different layers and could coexist if both are warranted, or either could be adopted independently. Both share the same prerequisite: the AMD pipeliner must be adjusted to create separate `MemDescIndexOp`s for producer and consumer stages. Either approach would replace the existing `syncedViaAsyncWait` annotation pass and `filterAsyncWriteDependencies` filter.
+Buffer coloring remains a viable complement if we encounter index patterns that fall outside the recognized set, or if Gluon users need explicit control that doesn't depend on the compiler's pattern matching. The two operate at different layers and could coexist without conflict.
+
+Both share the same prerequisite: the AMD pipeliner must create separate `MemDescIndexOp`s for producer and consumer stages. Either approach replaces the existing `syncedViaAsyncWait` annotation pass and `filterAsyncWriteDependencies` filter.
