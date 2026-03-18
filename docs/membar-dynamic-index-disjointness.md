@@ -70,12 +70,27 @@ representation. This ensures two unambiguous states:
 
 ### Loop-Carried Dependencies
 
-The `resolve()` method uses MLIR's `DominanceInfo` to detect loop backedges.
-Slices propagated across a backedge are marked as loop-carried via
-`joinLoopCarried()`. The `BufferIndexExpr` check is disabled for loop-carried
-slices because the base SSA value may refer to a different iteration's
-definition, making intra-iteration reasoning unsound. Cross-iteration
-dependencies therefore remain conservative.
+The membar analysis works by propagating pending read/write slices through the
+control flow graph, including across loop backedges. This is how it detects
+cross-iteration hazards — a write in iteration N that hasn't been synchronized
+may conflict with a read in iteration N+1. The original analysis treats all
+such propagated slices uniformly, checking for overlap the same way regardless
+of whether the slice came from the current iteration or a previous one.
+
+The dynamic index analysis, however, cannot be applied uniformly. Within a
+single iteration, if two `memdesc_index` ops share the same SSA base value
+`%phase`, their constant offsets directly reflect which buffer slots they
+access. But when a slice crosses a backedge, its `%phase` refers to the
+*previous* iteration's value — a different SSA definition — so comparing it
+against a current-iteration slice on the basis of "same base" would be
+incorrect.
+
+To handle this, the `resolve()` method uses MLIR's `DominanceInfo` to identify
+backedges and marks all slices propagated across them as loop-carried via
+`joinLoopCarried()`. The `BufferIndexExpr` disjointness check is then
+**skipped** for any loop-carried slice, falling back to the original
+conservative behavior. The optimization only applies to intra-iteration
+read/write pairs where the base SSA value is meaningful.
 
 ## Implementation
 
