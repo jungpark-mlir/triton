@@ -219,6 +219,160 @@ There are a few places where range analysis could supplement `BufferIndexExpr`:
 None of these would replace `BufferIndexExpr`; they would only provide minor
 validation or preprocessing.
 
+## Other Approaches in the Wider Ecosystem
+
+To ensure we are not missing a better technique, this section surveys how
+other compilers and frameworks solve similar problems.
+
+### LLVM ScalarEvolution Alias Analysis (SCEV-AA)
+
+LLVM's `SCEVAAResult::alias()` proves `NoAlias` by computing the symbolic
+difference between two pointer expressions (`getMinusSCEV(A, B)`) and checking
+whether the unsigned range of the difference exceeds the access sizes.
+
+For our problem, the difference `(phase % 3) - ((phase + 2) % 3)` would
+require SCEV to reason symbolically about `srem`. SCEV does not have a
+first-class `srem` recurrence representation — it would model each index as an
+opaque expression, making `getMinusSCEV` return `SCEVCouldNotCompute`. Even if
+it could compute the difference, the result set `{-2, -1, 1, 2}` is
+non-contiguous, so the interval-based range check would lose precision and
+fall back to `MayAlias`.
+
+**Verdict**: SCEV-AA's difference-range technique cannot handle modular buffer
+indices. It is designed for linear pointer arithmetic, not modular slot
+selection.
+
+### MLIR Affine Dependence Analysis (Presburger Arithmetic)
+
+MLIR's affine dialect includes `checkMemrefAccessDependence`, which formulates
+dependence queries as integer linear programs over `FlatAffineValueConstraints`
+(built on MLIR's Presburger library). The Presburger library supports modulo
+and floor division via existential (local) variables — `addLocalModulo` encodes
+`x mod N` as an existential `q` with constraints `x = N*q + r, 0 ≤ r < N`.
+
+For our problem, the query "can `phase % 3 == (phase + 2) % 3`?" becomes:
+
+```
+r1 = phase - 3*q1,   0 ≤ r1 < 3
+r2 = phase + 2 - 3*q2, 0 ≤ r2 < 3
+r1 = r2
+```
+
+Substituting the equality: `3*(q2 - q1) = 2`. The GCD test (embedded in
+`IntegerRelation::isIntegerEmpty`) immediately sees `gcd(3) = 3` does not
+divide 2 — **no integer solution exists, accesses are provably disjoint**.
+
+This is mathematically the most powerful available approach. It handles
+arbitrary affine index expressions, not just recognized patterns.
+
+| Property | Assessment |
+|----------|------------|
+| **Proves disjointness** | Yes, for any affine + modulo index expression. |
+| **Runtime cost** | GCD test + Simplex + Fourier-Motzkin on ~5 variables, ~10 constraints. Negligible for our problem size. |
+| **Engineering effort** | **Medium-high.** Requires: (1) extracting index expressions from `arith` ops into affine form, (2) building an `IntegerRelation` with existential variables for modulo, (3) calling `isIntegerEmpty()`, (4) integrating the Presburger library into the membar build. |
+| **Maintenance risk** | Medium. Depends on MLIR's Presburger library (stable, upstream). The constraint-building code is the fragile part. |
+
+### Polyhedral Model / ISL
+
+The Integer Set Library (ISL), used by LLVM Polly and GCC Graphite, performs
+exact dependence analysis over quasi-affine expressions (including modulo and
+floor division). ISL could model our buffer index problem and solve it with
+exact integer arithmetic.
+
+ISL is strictly more powerful than MLIR's Presburger library but adds an
+external C library dependency. Since MLIR already provides equivalent
+Presburger functionality, using ISL directly would be redundant.
+
+**Verdict**: Equivalent capability to MLIR Presburger, but unnecessary given
+that the Presburger library is already linked into Triton.
+
+### Classical Dependence Tests (GCD, Banerjee)
+
+The **GCD test** checks whether `gcd(a1, a2, ..., an)` divides a constant `c`
+in a linear Diophantine equation. For our modular buffer problem, the GCD test
+is exactly what proves disjointness (as shown in the Presburger formulation
+above). It is a necessary condition for integer solutions — if it fails, no
+dependence exists.
+
+The **Banerjee test** provides tighter bounds using direction vectors but
+is designed for loop-carried dependences across iterations, not
+intra-iteration slot selection.
+
+**Verdict**: The GCD test is the core mathematical tool that makes disjointness
+proofs work. Both `BufferIndexExpr` and the Presburger approach ultimately
+rely on the same arithmetic property: `N ∤ k` implies `(x mod N) ≠ ((x+k) mod N)`.
+
+### MLIR GPU Barrier Elimination (`EliminateBarriers`)
+
+MLIR's upstream `GPUEliminateBarriers` pass (based on Moses et al., PPoPP 2023)
+removes `gpu.barrier` ops that do not enforce any conflicting memory effect
+pair. It works at the **memory effects interface** level — checking whether
+reads and writes to shared memory exist between barriers.
+
+This is a coarser analysis that does not reason about which sub-regions of
+shared memory are accessed. It can remove barriers when there are no
+conflicting effects at all, but cannot distinguish accesses to different slots
+of the same buffer.
+
+**Verdict**: Complementary to our problem but cannot solve it. It operates
+at the buffer level, not the slot level.
+
+### Relational Abstract Domains (Octagons, Polyhedra)
+
+In abstract interpretation theory, **relational domains** can express
+constraints between multiple variables:
+
+- **Difference constraints**: `x - y ≤ c` (O(n³) closure)
+- **Octagon domain**: `±x ± y ≤ c` (O(n³) closure)
+- **Polyhedral domain**: General linear constraints (exponential worst case)
+
+Any of these could express `idx_write - idx_read ≡ 2 (mod 3)` and prove
+disjointness. However:
+
+- MLIR has no built-in relational integer abstract domain.
+- Implementing one is a major undertaking (thousands of lines for octagons,
+  tens of thousands for polyhedra).
+- The runtime cost is at least O(n³) per join/transfer, where n is the number
+  of tracked variables.
+- Massively overengineered for our specific two-variable, one-modulus pattern.
+
+**Verdict**: Theoretically capable but impractical for this problem.
+
+## A New Idea: Lightweight Presburger Check
+
+The survey reveals a middle ground between `BufferIndexExpr` and full affine
+dependence analysis:
+
+Instead of pattern-matching specific index forms, we could:
+
+1. When `AllocationSlice::intersects()` sees two `MemDescIndexOp` accesses,
+   extract each index's definition as a small expression tree.
+2. Recursively build an `IntegerRelation` from the `arith` ops:
+   - `arith.constant C` → add equality `var = C`
+   - `arith.addi(x, y)` → add equality `var = x + y`
+   - `arith.remsi(x, N)` → use `addLocalModulo` (existential variable)
+   - Unknown op → leave as unconstrained variable (conservative)
+3. Add the equality constraint `idx1 = idx2`.
+4. Call `isIntegerEmpty()`. If empty → provably disjoint.
+
+This would handle **any** affine + modulo index expression, not just the
+`remsi` and `select/cmpi` patterns that `BufferIndexExpr` recognizes. It would
+also naturally handle nested expressions like `((phase + 1) % 3 + 1) % 3`.
+
+| Property | BufferIndexExpr | Lightweight Presburger |
+|----------|----------------|----------------------|
+| **Patterns handled** | `remsi`, `select/cmpi`, `addi` | Any affine + modulo expression |
+| **Implementation** | ~110 lines, zero dependencies | ~200-300 lines + Presburger library dependency |
+| **Runtime cost** | O(expression depth), ~ns | GCD + Simplex, ~µs (still negligible) |
+| **Extensibility** | Must add new patterns manually | Automatically handles new arith ops |
+| **Debugging** | Easy: inspect `{base, offset, mod}` | Harder: inspect constraint matrix |
+| **Build dependency** | None (self-contained in Membar) | MLIR Presburger library (already linked in the build) |
+
+The tradeoff is clear: `BufferIndexExpr` is simpler and covers the patterns
+we actually see today; the Presburger approach is more general but adds
+complexity. Whether the generality is worth the cost depends on how many
+unrecognized patterns we expect to encounter in practice.
+
 ## Design Suitability Evaluation
 
 ### Why Integer Range Analysis is Not Suitable
@@ -267,16 +421,25 @@ different problems:
   differ by a constant offset modulo N." This is a **relational** property,
   precisely what is needed to prove buffer slot disjointness.
 
-Attempting to use range analysis for this problem would require extending it
-into a relational domain (difference constraints or polyhedra), which would be
-disproportionately complex for the narrow pattern we need to handle.
-`BufferIndexExpr` is the correct tool: minimal, sound, and precisely scoped
+The wider ecosystem survey confirms that approaches capable of proving
+modular disjointness (Presburger arithmetic, polyhedral analysis, SCEV) all
+rely on the same core insight: reasoning about the *structure* of the index
+computation, not just its *range*. `BufferIndexExpr` is a minimal
+instantiation of this principle — it hand-rolls the GCD test for the specific
+modular patterns emitted by the pipeliner.
+
+The Presburger-based approach is a viable alternative if more generality is
+needed in the future, as it handles arbitrary affine + modulo expressions
+with existing MLIR infrastructure. For the current scope of patterns,
+`BufferIndexExpr` remains the best fit: minimal, sound, and precisely scoped
 to the pipeliner's multi-buffer idiom.
 
 ## Summary Table
 
-| Approach | Can Prove Disjointness | Implementation Effort | Maintenance Risk |
-|----------|----------------------|----------------------|-----------------|
-| Integer Range Analysis (as-is) | **No** | Zero (exists) | N/A — doesn't solve the problem |
-| Integer Range Analysis (relational extension) | Yes | Very High | High — modifying general infrastructure |
-| BufferIndexExpr (symbolic decomposition) | **Yes** | Low (~110 lines) | Low — self-contained in membar |
+| Approach | Can Prove Disjointness | Engineering Effort | Runtime Cost | Maintenance Risk |
+|----------|----------------------|-------------------|-------------|-----------------|
+| Integer Range Analysis (as-is) | **No** | Zero (exists) | N/A | N/A — doesn't solve the problem |
+| LLVM SCEV-AA | **No** | N/A | N/A | N/A — wrong abstraction level |
+| Relational Abstract Domain | Yes | Very High (~10k LOC) | O(n³) per join | High — new infrastructure |
+| Presburger / Affine Dependence | **Yes** | Medium (~200-300 LOC) | ~µs (GCD + Simplex) | Medium — depends on MLIR Presburger |
+| BufferIndexExpr (symbolic) | **Yes** | Low (~110 LOC) | ~ns (pattern match) | Low — self-contained |
