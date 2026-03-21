@@ -4,6 +4,25 @@
 
 In pipelined kernels with multi-buffering, `local_load` and `async_copy` (or TDM copy/gather) access different buffer slots of the same shared memory allocation. The buffer slot is selected via `MemDescIndexOp` with a dynamic loop-carried index.
 
+```
+  Pipeline stage 0 (prefetch)         Pipeline stage 1 (compute)
+  ┌──────────────────────────┐       ┌──────────────────────────┐
+  │                          │       │                          │
+  │  async_copy → slot[w]    │       │  local_load ← slot[r]   │
+  │                          │       │                          │
+  └──────────┬───────────────┘       └──────────┬───────────────┘
+             │                                  │
+             ▼                                  ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  memdesc<3x128x128xf16>  (shared memory)                    │
+  │  ┌──────────┬──────────┬──────────┐                          │
+  │  │  Slot 0  │  Slot 1  │  Slot 2  │                          │
+  │  └──────────┴──────────┴──────────┘                          │
+  │       w ≠ r (always), but membar sees same allocation        │
+  │       → false positive barrier                               │
+  └──────────────────────────────────────────────────────────────┘
+```
+
 Membar analysis (`AllocationSlice::intersects`) can only resolve static offsets from `MemDescSubsliceOp`. Since `MemDescIndexOp` uses dynamic indices, membar cannot distinguish disjoint buffer slots and conservatively reports a hazard, inserting an unnecessary barrier.
 
 This false barrier exists on both the Triton pipeliner path and the Gluon path when users write multi-buffered kernels by hand.
@@ -67,6 +86,35 @@ See [membar-buffer-slot-coloring.md](membar-buffer-slot-coloring.md) for full de
 | **Pipeliner change** | Separate `MemDescIndexOp`s, unified counter | Separate `MemDescIndexOp`s |
 
 ## Where We Stand
+
+```
+  Decision flow:
+
+  MemDescIndexOp with dynamic index?
+           │
+           ▼
+  ┌────────────────────────┐
+  │ Symbolic Index Analysis│ ← core membar, all backends
+  │ (BufferIndexExpr)      │
+  │                        │
+  │ Recognized pattern?    │
+  │   remsi / select+cmpi  │
+  │   / addi               │
+  ├────────┬───────────────┤
+  │  Yes   │      No       │
+  │  ↓     │      ↓        │
+  │ Prove  │  ┌────────────────────────┐
+  │ disjoint  │ Buffer Slot Coloring   │ ← AMD filter, explicit
+  │        │  │ (buffer_color attr)    │   annotation
+  │        │  │                        │
+  │        │  │ Colors assigned?       │
+  │        │  ├────────┬───────────────┤
+  │        │  │  Yes   │      No       │
+  │        │  │  ↓     │      ↓        │
+  │        │  │ Prove  │  Conservative │
+  │        │  │ disjoint  barrier      │
+  └────────┘  └────────────────────────┘
+```
 
 Symbolic index analysis is the straightforward solution — it fixes the gap in membar's reasoning directly, works across backends, and requires no annotations or new API surface. The recognized patterns (`remsi`, `select/cmpi`) already cover what the pipeliner and Gluon produce today.
 

@@ -14,17 +14,37 @@ pipelined loop, one slot is being written (prefetched from global memory) while
 a different slot is being read (consumed by compute):
 
 ```
-// Iteration i:
-//   Write to slot[(i + 2) % 3]   ← prefetch next tile
-//   Read from slot[i % 3]        ← consume current tile
+  memdesc<3x128x128xf16> allocation
+  ┌──────────┬──────────┬──────────┐
+  │  Slot 0  │  Slot 1  │  Slot 2  │
+  └──────────┴──────────┴──────────┘
+
+  Iteration i:
+    Write to slot[(i + 2) % 3]   ← prefetch next tile
+    Read from slot[i % 3]        ← consume current tile
+
+  i=0:  read slot 0,  write slot 2   ← disjoint
+  i=1:  read slot 1,  write slot 0   ← disjoint
+  i=2:  read slot 2,  write slot 1   ← disjoint
 ```
 
 These two slots are always disjoint, so no barrier is needed between them within
 the same iteration. However, because `memdesc_index` uses a *dynamic* index,
 the prior membar analysis could not distinguish the slots — it conservatively
-assumed they might overlap and inserted an unnecessary barrier. The existing
-`MemDescSubsliceOp` path already resolves static offsets, but `MemDescIndexOp`
-was unhandled.
+assumed they might overlap and inserted an unnecessary barrier:
+
+```
+  AllocationSlice::intersects() sees:
+
+  Write: memdesc_index %alloc[%w_idx]   →  interval = [0, 3×128×128×2)
+  Read:  memdesc_index %alloc[%r_idx]   →  interval = [0, 3×128×128×2)
+                                               ↑ same interval, dynamic offset unknown
+                                               → conservatively assumes overlap
+                                               → inserts barrier (false positive!)
+```
+
+The existing `MemDescSubsliceOp` path already resolves static offsets, but
+`MemDescIndexOp` was unhandled.
 
 ## Design
 
@@ -70,16 +90,25 @@ representation. This ensures two unambiguous states:
 
 ### Loop-Carried Dependencies
 
-The membar analysis works by propagating pending read/write slices through the
-control flow graph, including across loop backedges. This is how it detects
-cross-iteration hazards — a write in iteration N that hasn't been synchronized
-may conflict with a read in iteration N+1. The original analysis treats all
-such propagated slices uniformly, checking for overlap the same way regardless
-of whether the slice came from the current iteration or a previous one.
+The membar analysis propagates pending read/write slices through the control
+flow graph, including across loop backedges, to detect cross-iteration hazards.
 
-The dynamic index analysis, however, cannot be applied uniformly. Within a
-single iteration, if two `memdesc_index` ops share the same SSA base value
-`%phase`, their constant offsets directly reflect which buffer slots they
+```
+  Iteration N                      Iteration N+1
+  ┌───────────────────────┐       ┌───────────────────────┐
+  │ %phase_N = ...        │       │ %phase_N1 = ...       │
+  │                       │       │                       │
+  │ write slot[f(%phase)] │──────▶│ read slot[g(%phase)]  │
+  │ read  slot[g(%phase)] │  back │ write slot[f(%phase)] │
+  │                       │  edge │                       │
+  └───────────────────────┘       └───────────────────────┘
+         ↑ intra-iteration:              ↑ cross-iteration:
+           same %phase SSA                 different %phase SSA
+           → can prove disjoint            → cannot compare bases
+```
+
+Within a single iteration, if two `memdesc_index` ops share the same SSA base
+value `%phase`, their constant offsets directly reflect which buffer slots they
 access. But when a slice crosses a backedge, its `%phase` refers to the
 *previous* iteration's value — a different SSA definition — so comparing it
 against a current-iteration slice on the basis of "same base" would be
@@ -122,7 +151,24 @@ if (bufferIndexExpr && other.bufferIndexExpr &&
 
 ### `analyzeBufferIndex` (Membar.cpp)
 
-Recursive decomposition of an index value:
+Recursive decomposition of an index value into `BufferIndexExpr`:
+
+```
+  remsi(addi(%phase, 2), 3)
+       │
+       ▼
+  ┌─ remsi ────────────────────────┐
+  │  modulus = 3                   │
+  │  ┌─ addi ────────────────────┐ │
+  │  │  offset += 2              │ │
+  │  │  ┌─ %phase ─────────────┐ │ │
+  │  │  │  base = %phase        │ │ │
+  │  │  │  offset = 0           │ │ │
+  │  │  └───────────────────────┘ │ │
+  │  └────────────────────────────┘ │
+  └────────────────────────────────┘
+  Result: {base=%phase, offset=2, mod=3}
+```
 
 | IR Pattern | Decomposition |
 |---|---|
@@ -158,6 +204,26 @@ Both the read and write buffer indices must derive from the **same SSA base
 value** with different constant offsets. If the IR uses separate iteration
 arguments for load and compute phases, the analysis sees different bases and
 conservatively inserts a barrier:
+
+```
+  ╔═══════════════════════════════════════════════════════╗
+  ║  Separate counters → different SSA bases              ║
+  ║                                                       ║
+  ║    %load_idx ──┐                                      ║
+  ║                ├── different bases → can't compare     ║
+  ║    %wmma_idx ──┘       → conservative barrier         ║
+  ╚═══════════════════════════════════════════════════════╝
+
+  ╔═══════════════════════════════════════════════════════╗
+  ║  Unified counter → same SSA base                      ║
+  ║                                                       ║
+  ║    %phase ─── remsi(%phase, 3) ────── offset=0        ║
+  ║         │                                             ║
+  ║         └─── remsi(%phase + 2, 3) ── offset=2         ║
+  ║                                                       ║
+  ║    same base, 0 ≠ 2 (mod 3) → provably disjoint      ║
+  ╚═══════════════════════════════════════════════════════╝
+```
 
 ```python
 # Separate counters → different SSA bases → conservative barrier
@@ -198,6 +264,22 @@ is recorded and offsets are compared correctly:
 
 The common pipeliner (`LowerLoops.cpp`) currently creates two independent
 `iter_args` — `insertIdx` and `extractIdx` — to reduce register liverange:
+
+```
+  ┌── scf.for iter_args ──────────────────────────────────┐
+  │                                                       │
+  │   %insertIdx  ──── createIncrementModulo ──→ insert   │
+  │   %extractIdx ──── createIncrementModulo ──→ extract  │
+  │        │                    │                          │
+  │        └────── different SSA bases ──────┘             │
+  │                     ↓                                  │
+  │         BufferIndexExpr sees different bases           │
+  │              → conservative barrier                   │
+  └───────────────────────────────────────────────────────┘
+
+  In reality, they always differ by a fixed stage offset:
+    insertIdx  = (extractIdx + STAGE_OFFSET) % NUM_BUFFERS
+```
 
 ```cpp
 // Create two counters for the insert and extract indices to avoid creating

@@ -105,6 +105,24 @@ Range analysis computes:
 | `%w_idx` | `[0, 2]` |
 | `%r_idx` | `[0, 2]` |
 
+```
+  Range analysis view (non-relational):
+
+  %r_idx:  ├─────────────────────┤    range = [0, 2]
+  %w_idx:  ├─────────────────────┤    range = [0, 2]
+           0         1         2
+
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+           Complete overlap — "may alias"
+
+  Reality (relational — what actually happens per iteration):
+
+  iter 0:  %r_idx=0   %w_idx=2   → disjoint
+  iter 1:  %r_idx=1   %w_idx=0   → disjoint
+  iter 2:  %r_idx=2   %w_idx=1   → disjoint
+           ↑ never equal, but range analysis can't see this
+```
+
 Both `%w_idx` and `%r_idx` have range `[0, 2]`. These ranges **overlap
 completely**. Range analysis has no way to express the constraint that
 `%w_idx ≠ %r_idx` at any given program point. The information that they are
@@ -176,10 +194,22 @@ For the example above:
 | `%r_idx` = `remsi(%phase, 3)` | `{base=%phase, offset=0, mod=3}` |
 | `%w_idx` = `remsi(addi(%phase, 2), 3)` | `{base=%phase, offset=2, mod=3}` |
 
+```
+  BufferIndexExpr preserves the structural relationship:
+
+  %phase ───┬── remsi(%phase, 3)     → {base=%phase, offset=0, mod=3}
+            │
+            └── remsi(%phase+2, 3)   → {base=%phase, offset=2, mod=3}
+                                             │           │         │
+                                         same base   0 ≠ 2    same mod
+                                                  ↓
+                                          provably disjoint
+```
+
 The disjointness check is trivial:
-- Same base `%phase` ✓
-- Same modulus `3` ✓
-- Offsets `0 ≠ 2` (mod 3) ✓
+- Same base `%phase`
+- Same modulus `3`
+- Offsets `0 ≠ 2` (mod 3)
 - **Provably disjoint.**
 
 ### Why This Works and Range Analysis Does Not

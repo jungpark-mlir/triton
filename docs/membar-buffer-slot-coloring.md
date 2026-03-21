@@ -4,6 +4,20 @@
 
 Each buffer slot access is tagged with a **buffer color** — a compile-time integer that identifies its logical buffer slot role. The AMD membar filter treats accesses with different colors as disjoint.
 
+```
+  memdesc<2x16x16xf16> allocation
+  ┌─────────────────┬─────────────────┐
+  │   Slot 0        │   Slot 1        │
+  │   color = 0     │   color = 1     │
+  │   (consumer)    │   (producer)    │
+  └─────────────────┴─────────────────┘
+         │                   │
+         ▼                   ▼
+     local_load         async_copy
+         │                   │
+         └───── different colors ──→ no barrier needed
+```
+
 | | color=0 | color=1 | no color |
 |---|---|---|---|
 | **color=0** | may alias | **disjoint** | may alias |
@@ -24,7 +38,30 @@ Three placement options were evaluated against the AMD lowering chain, where `Co
 | On `MemDescIndexOp` | **YES** — `MemDescIndexOp` is never replaced | Recomputed each iteration, no block arg issue | Minimal |
 | On `MemDescType` | **YES** — type flows with value | **YES** — type is part of block arg | Type system change, heavy |
 
-**`MemDescIndexOp` is the best placement.** Dialect conversions replace memory ops but leave memdesc values untouched. `MemDescIndexOp` is a Pure op that is never replaced or erased by any AMD pass — it's only created (by the pipeliner via `createSingleBufferView`). In the pipeliner's pattern, `MemDescIndexOp` is recomputed each iteration from the allocation and the phase index, so it stays in the loop body and is not loop-carried — no block argument propagation needed.
+**`MemDescIndexOp` is the best placement.** The key insight is that dialect conversions replace memory ops but leave memdesc values untouched:
+
+```
+  Lowering pipeline — what survives?
+
+  ┌─────────────────────────────────────────────────┐
+  │ Before ConvertToBufferOps:                      │
+  │                                                 │
+  │   %idx = ttg.memdesc_index {buffer_color=1} ◄── survives (never replaced)
+  │          │                                      │
+  │          ▼                                      │
+  │   amdg.async_tdm_copy ... %idx ◄─── replaced by ConvertToBufferOps
+  │                                                 │
+  ├─────────────────────────────────────────────────┤
+  │ After ConvertToBufferOps:                       │
+  │                                                 │
+  │   %idx = ttg.memdesc_index {buffer_color=1} ◄── still here with attr
+  │          │                                      │
+  │          ▼                                      │
+  │   amdgpu.BufferLoadToLocalOp ... %idx           │
+  └─────────────────────────────────────────────────┘
+```
+
+`MemDescIndexOp` is a Pure op that is never replaced or erased by any AMD pass — it's only created (by the pipeliner via `createSingleBufferView`). In the pipeliner's pattern, `MemDescIndexOp` is recomputed each iteration from the allocation and the phase index, so it stays in the loop body and is not loop-carried — no block argument propagation needed.
 
 ## IR Representation
 
@@ -93,6 +130,40 @@ for i in range(num_iters):
 ## Pipeliner Integration
 
 The current AMD pipeliner creates a **single** `MemDescIndexOp` shared by both the async copy (producer) and `local_load` (consumer). When the `PipelineExpander` places them in different stages, the memdesc result crosses stages and becomes a **loop-carried block argument**, which loses all op attributes — including `buffer_color`.
+
+```
+  Current AMD pipeliner — shared MemDescIndexOp:
+
+  ┌── Stage 0 (producer) ─────────────────────────────────┐
+  │                                                       │
+  │  %view = memdesc_index %alloc[%idx] ──────┐           │
+  │  async_copy ... %view                     │           │
+  │                                           │           │
+  ├── Stage 1 (consumer) ─────────────────────┼───────────┤
+  │                                           │           │
+  │  local_load %view ◄───────────────────────┘           │
+  │       ↑                                               │
+  │       %view crosses stage boundary                    │
+  │       → becomes loop-carried block arg                │
+  │       → loses {buffer_color} attribute!               │
+  └───────────────────────────────────────────────────────┘
+
+  Required — separate MemDescIndexOps:
+
+  ┌── Stage 0 (producer) ─────────────────────────────────┐
+  │                                                       │
+  │  %wview = memdesc_index %alloc[%widx] {color=1}       │
+  │  async_copy ... %wview                                │
+  │                                                       │
+  ├── Stage 1 (consumer) ─────────────────────────────────┤
+  │                                                       │
+  │  %rview = memdesc_index %alloc[%ridx] {color=0}       │
+  │  local_load %rview                                    │
+  │       ↑                                               │
+  │       %rview created locally in this stage             │
+  │       → not loop-carried → attr preserved              │
+  └───────────────────────────────────────────────────────┘
+```
 
 To support coloring, the AMD pipeliner must be adjusted to create **separate** `MemDescIndexOp`s for the producer and consumer, each recomputed from the loop-carried integer phase index within its own stage. The NVIDIA pipeliner already follows this pattern — it uses separate `insertIdx`/`extractIdx` counters and calls `createSingleBufferView` twice:
 

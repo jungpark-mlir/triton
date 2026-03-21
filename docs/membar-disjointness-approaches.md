@@ -42,6 +42,15 @@ computes bounds for each value independently. For the example above:
 | `%w_idx` | `[0, 2]` |
 | `%r_idx` | `[0, 2]` |
 
+```
+  What range analysis sees:        What actually happens:
+
+  %r_idx: ├──────────────┤ [0,2]   iter 0: r=0, w=2 (disjoint)
+  %w_idx: ├──────────────┤ [0,2]   iter 1: r=1, w=0 (disjoint)
+          0      1      2          iter 2: r=2, w=1 (disjoint)
+    "total overlap → may alias"      "never equal → always disjoint"
+```
+
 Both indices have range `[0, 2]` — overlapping completely. The fact that they
 are derived from the **same base with different offsets** is lost once ranges
 are computed. Range analysis answers "what values can X take?" but cannot
@@ -149,6 +158,27 @@ r1 = r2
 
 Substituting: `3*(q2 - q1) = 2`. The GCD test sees `gcd(3) ∤ 2` → **no
 integer solution → provably disjoint**.
+
+```
+  Presburger encoding:
+
+  Variables: phase, q1, q2, r1, r2
+
+  Constraints:
+  ┌──────────────────────────────────────────────┐
+  │  r1 = phase - 3·q1          (mod definition) │
+  │  0 ≤ r1 < 3                 (range bound)    │
+  │  r2 = phase + 2 - 3·q2      (mod definition) │
+  │  0 ≤ r2 < 3                 (range bound)    │
+  │  r1 = r2                    (equality query)  │
+  └──────────────────────────────────────────────┘
+           ↓ substitute r1 = r2
+  3·(q2 - q1) = 2
+           ↓ GCD test
+  gcd(3) = 3,  3 ∤ 2  →  no integer solution
+           ↓
+  System is empty → indices are always different
+```
 
 Instead of pattern-matching specific index forms, the approach would:
 
