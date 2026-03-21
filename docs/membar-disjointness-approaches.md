@@ -70,11 +70,12 @@ SCEV-AA proves `NoAlias` by computing the symbolic difference between two
 pointer expressions (`getMinusSCEV`) and checking whether the range of the
 difference exceeds the access sizes.
 
-**Why it fails**: SCEV does not have a first-class `srem` recurrence. It would
-model each modular index as an opaque expression, returning
-`SCEVCouldNotCompute` for the difference. Even if it could compute it, the
-result set `{-2, -1, 1, 2}` is non-contiguous — the interval-based check
-would lose precision and fall back to `MayAlias`.
+**Why it fails for this pattern**: SCEV-AA is effective for proving non-aliasing
+of linear induction variables, but does not have a first-class `srem`
+recurrence. For our modular-index pattern, it would model each index as an
+opaque expression, returning `SCEVCouldNotCompute` for the difference. Even if
+it could compute it, the result set `{-2, -1, 1, 2}` is non-contiguous — the
+interval-based check would lose precision and fall back to `MayAlias`.
 
 ### 3. MLIR GPU Barrier Elimination (`EliminateBarriers`)
 

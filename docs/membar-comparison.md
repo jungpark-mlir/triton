@@ -85,6 +85,39 @@ See [membar-buffer-slot-coloring.md](membar-buffer-slot-coloring.md) for full de
 | **Extensibility** | New idioms need new pattern matchers | Producer stamps color; filter unchanged |
 | **Pipeliner change** | Separate `MemDescIndexOp`s, unified counter | Separate `MemDescIndexOp`s |
 
+## IR Shape Compatibility
+
+Both solutions require the pipeliner to create separate `MemDescIndexOp`s for
+producer and consumer stages. Beyond that, the two approaches have different
+requirements on the *integer counter* feeding those ops:
+
+- **BufferIndexExpr** needs both `MemDescIndexOp`s to derive from the **same**
+  SSA integer counter with different constant offsets. This is what Gluon
+  pipelines produce (a single `%phase` value with `addi`/`remsi` to compute
+  each slot). The common pipeliner uses separate loop-carried counters
+  (`insertIdx` / `extractIdx`), giving each `MemDescIndexOp` a different SSA
+  base — which `BufferIndexExpr` cannot relate.
+
+- **Buffer Coloring** only inspects the `buffer_color` attribute on the
+  `MemDescIndexOp` itself. It does not care how the integer index is computed.
+  Separate counters are fine as long as each op carries the right color.
+
+This is why the same pipeliner output (separate stage-local `MemDescIndexOp`s
+with separate counters) is a good fit for coloring but a bad fit for symbolic
+analysis.
+
+| IR Shape | BufferIndexExpr | Buffer Coloring |
+|---|---|---|
+| Separate producer/consumer `MemDescIndexOp`s, same SSA counter | Works | Works |
+| Separate producer/consumer `MemDescIndexOp`s, different SSA counters | Does not work | Works |
+| Single carried memdesc view across stages | Does not work | Does not work |
+
+The implementation in core `Membar.cpp` is backend-agnostic. The test evidence
+discussed in the detailed design docs is primarily AMD-centric because
+`AsyncTDMCopyGlobalToLocalOp` (AMD) is the primary consumer that triggers
+false-positive barriers today. NVIDIA's `cp.async` uses token-based
+synchronization that sidesteps the issue in many cases.
+
 ## Where We Stand
 
 ```
@@ -120,4 +153,4 @@ Symbolic index analysis is the straightforward solution — it fixes the gap in 
 
 Buffer coloring remains a viable complement if we encounter index patterns that fall outside the recognized set, or if Gluon users need explicit control that doesn't depend on the compiler's pattern matching. The two operate at different layers and could coexist without conflict.
 
-Both share the same prerequisite: the AMD pipeliner must create separate `MemDescIndexOp`s for producer and consumer stages. Either approach replaces the existing `syncedViaAsyncWait` annotation pass and `filterAsyncWriteDependencies` filter.
+Both share the same prerequisite: the AMD pipeliner must create separate `MemDescIndexOp`s for producer and consumer stages. On AMD, either approach replaces the existing `syncedViaAsyncWait` annotation pass and `filterAsyncWriteDependencies` filter (which cover the CTA-wide barrier for async-wait visibility). NVIDIA's token-based `cp.async.wait_group` provides its own fine-grained ordering and is a separate mechanism.

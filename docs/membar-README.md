@@ -101,6 +101,13 @@ and TDM copies.
 
 ## Reading Order
 
+> **Note:** The implemented `BufferIndexExpr` approach currently targets
+> Gluon-generated pipeliner IR, which uses a unified phase counter. The
+> common (NVIDIA-style) pipeliner produces a different IR shape (separate
+> `insertIdx` / `extractIdx` counters) that requires Buffer Coloring or
+> pipeliner-side changes. See the IR Shape Compatibility section in the
+> comparison doc for details.
+
 **For a quick overview of both problems:**
 → [membar-comparison.md](membar-comparison.md)
 

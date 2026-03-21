@@ -9,7 +9,7 @@ the same iteration, but membar cannot distinguish them because the slot index
 is dynamic. This causes **false positive** barrier insertions that hurt
 performance.
 
-The current solution in development (`BufferIndexExpr` in the `mbar` branch)
+The proposed solution (`BufferIndexExpr`, a symbolic index decomposition)
 uses symbolic decomposition of the index arithmetic to prove slot disjointness.
 This document evaluates whether Triton's **integer range analysis** could serve
 as an alternative or complement.

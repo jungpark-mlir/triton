@@ -365,17 +365,22 @@ bool areIndicesProvablyDifferent(Value idx1, Value idx2) {
   ┌─────────────────────┐      ┌─────────────────────┐
   │ Recognizes:          │      │ Handles:             │
   │  • remsi(x, N)      │      │  • Any composition   │
-  │  • addi(x, C)       │      │    of arith ops      │
-  │  • select/cmpi mod   │      │  • Nested modulo     │
-  │                      │      │  • Multi-step adds   │
-  │ Fails on:            │      │  • Mixed patterns    │
-  │  • andi(x, N-1)     │      │  • andi (power-of-2) │
-  │  • nested modulo     │      │  • Unrecognized ops  │
-  │  • complex chains    │      │    → unconstrained   │
-  │                      │      │    → conservative    │
-  │ Extend by:           │      │                      │
-  │  Adding new pattern  │      │ Extend by:           │
-  │  match cases         │      │  Nothing — automatic │
+  │  • addi(x, C)       │      │    of linear + modulo│
+  │  • select/cmpi mod   │      │    arith ops         │
+  │                      │      │  • Nested modulo     │
+  │ Fails on:            │      │  • Multi-step adds   │
+  │  • andi(x, N-1)     │      │  • Mixed patterns    │
+  │  • nested modulo     │      │  • andi (power-of-2, │
+  │  • complex chains    │      │    non-negative x)   │
+  │                      │      │  • Unrecognized ops  │
+  │ Extend by:           │      │    → unconstrained   │
+  │  Adding new pattern  │      │    → conservative    │
+  │  match cases         │      │                      │
+  │                      │      │ Extend by:           │
+  │                      │      │  Automatic for       │
+  │                      │      │  supported encodings;│
+  │                      │      │  unsupported ops →   │
+  │                      │      │  conservative        │
   └─────────────────────┘      └─────────────────────┘
 ```
 
@@ -383,10 +388,10 @@ bool areIndicesProvablyDifferent(Value idx1, Value idx2) {
 |----------|:-:|:-:|
 | Handles `remsi` + `addi` | Yes | Yes |
 | Handles `select/cmpi` mod | Yes | Yes |
-| Handles `andi(x, N-1)` (power-of-2) | No | Yes (with encoding) |
+| Handles `andi(x, N-1)` (power-of-2) | No | Yes (power-of-2 N, non-negative x) |
 | Handles nested `remsi(remsi(...))` | No | Yes |
-| Handles `muli` + `addi` chains | No | Yes |
-| Extending for new patterns | Manual | Automatic |
+| Handles `muli` + `addi` chains | No | Yes (constant factor only) |
+| Extending for new patterns | Manual | Automatic for linear + modulo ops |
 | Implementation size | ~110 LOC | ~200-300 LOC |
 | Runtime cost | ~ns | ~µs (GCD dominates) |
 | New dependencies | None | `MLIRPresburger` (already in MLIR) |
@@ -748,9 +753,9 @@ complex index expressions.
 
 | Aspect | BufferIndexExpr | With Presburger |
 |--------|:-:|:-:|
-| **Buffer index disjointness** | Pattern matching | Constraint solving (general) |
-| **Patterns handled** | `remsi`, `addi`, `select/cmpi` | Any linear + modular composition |
-| **New Gluon patterns** | Must extend pattern matcher | Handled automatically |
+| **Buffer index disjointness** | Pattern matching | Constraint solving (linear + modulo) |
+| **Patterns handled** | `remsi`, `addi`, `select/cmpi` | Any linear + modular composition (not variable×variable or general bitwise) |
+| **New Gluon patterns** | Must extend pattern matcher | Automatic for supported linear/modular encodings |
 | **Subslice overlap** | Static offsets only | Dynamic offsets (with constraints) |
 | **Pipeliner verification** | Not available | Automated disjointness assertion |
 | **Build dependency** | None | `MLIRPresburger` (stable upstream) |
@@ -760,7 +765,9 @@ complex index expressions.
 The MLIR Presburger library is a powerful, stable, and zero-external-dependency
 tool for reasoning about integer constraints in compiler analyses. For
 Triton's membar analysis, it offers a principled generalization of the
-pattern-matching approach — handling arbitrary linear + modular index
-expressions without manual pattern extension. Its primary value is as a
-future-proof foundation: as Gluon users write increasingly creative index
-computations, the Presburger approach scales without compiler changes.
+pattern-matching approach — handling a broader class of linear + modular index
+expressions without manual pattern extension. Its boundaries are clear:
+variable-variable multiplication and general bitwise operations fall outside
+the Presburger-expressible fragment and require conservative fallback. Within
+that fragment, it scales automatically as Gluon users write increasingly
+complex index computations.

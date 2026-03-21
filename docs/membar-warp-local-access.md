@@ -140,6 +140,32 @@ The check is a standard **Gaussian elimination** on the combined basis matrix
 — O(n²) where n is the number of offset bits (typically 10-15). Negligible
 cost.
 
+### Assumptions Behind the Criterion
+
+The GF(2) rank condition is a mathematical fact about linear algebra over
+GF(2). Its applicability to barrier elimination depends on the following
+preconditions about Triton's `LinearLayout` and hardware:
+
+1. **Complete layout.** The composed layout `cvt` maps all thread coordinates
+   `{register, lane, warp}` to shared memory offsets — i.e., every element
+   accessed by the operation is represented. This is guaranteed by Triton's
+   `toLinearLayout`, which always produces a complete mapping for the tensor
+   shape.
+
+2. **Static layout.** The composed layout is fully determined at compile time.
+   There is no runtime-dependent reshaping of the thread-to-offset mapping.
+   This holds for all current Triton encodings (`BlockedEncodingAttr`,
+   `SwizzledSharedEncodingAttr`, `AMDMfmaEncodingAttr`, etc.).
+
+3. **Warp dimension corresponds to hardware warps.** The `warp` dimension in
+   `LinearLayout` maps to the hardware warp IDs used by `warp.sync`. This is
+   an invariant of Triton's lowering: the `warp` dimension is derived from
+   `warpsPerCTA` and corresponds directly to `threadIdx / warpSize`.
+
+All three conditions hold in Triton today. If a future encoding introduces
+runtime-dependent address remapping or redefines the warp dimension, this
+check would need to be re-evaluated.
+
 ## MMA Dot Operand Layouts
 
 MMA operand layouts are **not always cross-warp**. The warp distribution for
@@ -215,8 +241,8 @@ The GF(2) check handles both cases correctly.
 
 ### TDM Copy (AMD gfx1250)
 
-TDM (Tensor Data Mover) copies are **inherently warp-partitioned on the
-write side**. The TDM linear layout distributes the block across warps:
+TDM (Tensor Data Mover) copies produce a **warp-partitioned write distribution**.
+The TDM linear layout distributes the block across warps:
 
 ```
   getTDMLinearLayout:
@@ -239,12 +265,14 @@ write side**. The TDM linear layout distributes the block across warps:
   ├──────────────────┤
   │ W3: rows 48-63   │ ← warp 3 DMA writes here
   └──────────────────┘
-  Write side: always warp-disjoint by construction
+  Write side: warp-disjoint (TDM assigns disjoint sub-blocks per warp)
 ```
 
 The composed mapping `tdmLayout.invertAndCompose(sharedLayout)` determines
-the actual shared memory offsets. Because TDM assigns each warp a disjoint
-sub-block, the destination addresses are warp-disjoint by construction.
+the actual shared memory offsets. The TDM layout assigns each warp a disjoint
+sub-block, making the *write-side* distribution warp-disjoint. However, the
+full barrier elimination result also depends on the consumer's composed layout
+(see below).
 
 **However**, the consumer (`local_load`) uses a different layout. Its
 warp-to-address mapping depends on the register encoding:
@@ -412,6 +440,6 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
 |--------|--------------|----------|
 | **Warp awareness** | `ConvertLayoutOp` scratch only (`isCvtDimSync`) | General shared memory ops via GF(2) independence |
 | **Detection** | Trivial-over-warp check | LinearLayout basis Gaussian elimination |
-| **Async/TDM** | Not considered | TDM write always disjoint; read checked via same mechanism |
+| **Async/TDM** | Not considered | TDM write-side disjoint; full result requires checking consumer layout too |
 | **MMA operands** | Assumed cross-warp | Checkable per-configuration via composed layout |
 | **Scope** | Situational; most encodings are cross-warp by design | Same, but catches cases where layout happens to be warp-local |
