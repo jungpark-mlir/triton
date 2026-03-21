@@ -112,18 +112,70 @@ address space identically in both ops, and no cross-warp conflict exists.
 This can be checked by inspecting the `LinearLayout` basis matrices without
 materializing actual addresses.
 
-### Simpler Sufficient Condition
+### GF(2) Linear Independence Check
 
-A practically useful sufficient condition that covers common cases:
+Since `LinearLayout` operates over GF(2) (XOR arithmetic), the address for
+a given `(register, lane, warp)` combination is:
 
-For a single composed layout `cvt`, the access is **warp-local** if:
-- `cvt` restricted to `{kWarp}` produces offset values that are all multiples
-  of the per-warp address range size, and
-- The per-warp address range `|{cvt(r, l, w, b) | ∀r, ∀l}|` for any fixed `w`
-  is less than or equal to the stride between warp partitions.
+```
+offset = Σ(reg_bit_i * reg_base_i) XOR Σ(lane_bit_j * lane_base_j)
+         XOR Σ(warp_bit_k * warp_base_k)
+```
 
-In practice, this means the warp ID selects a "chunk" of shared memory, and
-within that chunk, register and lane indices tile the addresses.
+Warp-disjointness holds if and only if the **warp basis vectors are linearly
+independent from the register + lane basis vectors** over GF(2). When this
+holds, different warp IDs flip offset bits that no register/lane combination
+can toggle, guaranteeing non-overlapping per-warp address sets.
+
+This reduces to a standard **Gaussian elimination** on the combined basis
+matrix: stack the register, lane, and warp bases as rows, then check whether
+the warp rows increase the rank. If `rank(R ∪ L ∪ W) = rank(R ∪ L) + |W|`,
+the warp bases are independent and addresses are warp-disjoint.
+
+### MMA Dot Operand Layouts
+
+MMA operand layouts are **not always cross-warp**. The warp distribution for
+dot operands is constructed by `broadcastedDotOperandLayout`:
+
+```cpp
+// For operand A: warps distributed along M, broadcast along K
+// For operand B: warps distributed along N, broadcast along K
+for (auto d : order) {
+  if (d == kDim)
+    layout *= LinearLayout::zeros1D(shape[d], "warp", dimNames[d]); // broadcast
+  else
+    layout *= LinearLayout::identity1D(shape[d], "warp", dimNames[d]); // partition
+}
+```
+
+This means:
+- **Operand A** (`warpsPerCTA = {Mw, Nw}`): each warp owns `M/Mw` rows,
+  all warps access all K columns.
+- **Operand B**: each warp owns `N/Nw` columns, all warps access all K rows.
+
+Whether this translates to warp-disjoint shared memory access depends on
+the composed layout `regLayout.invertAndCompose(sharedLayout)`. If the M
+(or N) dimension maps to a contiguous, warp-aligned region of shared memory,
+the warp bases will be independent from register/lane bases and the access
+is warp-local.
+
+With swizzling (e.g., `SwizzledSharedEncodingAttr`), the M/N offset bits may
+be XOR-mixed with K offset bits, potentially breaking independence. The
+GF(2) check handles this correctly — it would detect the dependence and
+conservatively require a barrier.
+
+**Concrete example**: Consider operand A with `warpsPerCTA = {4, 1}` and
+shape `[64, 64]`:
+- Each warp owns 16 rows of A (M/4 = 16).
+- If the shared layout maps row index to high-order offset bits (e.g.,
+  row stride = 64 elements × 2 bytes = 128), then:
+  - Warp 0: rows [0, 16) → offsets [0x000, 0x800)
+  - Warp 1: rows [16, 32) → offsets [0x800, 0x1000)
+  - etc.
+  - These are disjoint → no barrier needed.
+- If the shared layout swizzles row and column bits (e.g., `maxPhase=4,
+  perPhase=2`), the warp base bits may overlap with lane/register bits in
+  the offset space → independence check fails → barrier required.
 
 ## Integration with Membar
 
