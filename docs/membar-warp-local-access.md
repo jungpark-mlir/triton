@@ -3,18 +3,21 @@
 ## Problem
 
 Triton's membar analysis treats shared memory as a flat address space shared by
-all threads in a CTA. When a `local_store` and `local_load` touch the same
-allocation, membar inserts a CTA-wide barrier (`__syncthreads()` / `s_barrier`)
-even if the layout guarantees that each warp only accesses its own partition.
-In such cases, the barrier is unnecessary — there is no cross-warp data
-dependency.
+all threads in a CTA. When two operations touch the same allocation, membar
+inserts a CTA-wide barrier (`__syncthreads()` / `s_barrier`) even if the
+layout guarantees that each warp only accesses its own partition. In such
+cases, the barrier is unnecessary — there is no cross-warp data dependency.
 
 ```
-Warp 0: writes [0x000, 0x100)     reads [0x000, 0x100)
-Warp 1: writes [0x100, 0x200)     reads [0x100, 0x200)
-Warp 2: writes [0x200, 0x300)     reads [0x200, 0x300)
-                                                          ← no cross-warp overlap
-                                                          ← barrier is unnecessary
+  Shared Memory (one buffer slot)
+  ┌─────────────────────────────────────────────────┐
+  │  Warp 0 region      │  Warp 1 region            │
+  │  [0x000, 0x100)     │  [0x100, 0x200)           │
+  │                     │                           │
+  │  W0 writes here     │  W1 writes here           │
+  │  W0 reads here      │  W1 reads here            │
+  └─────────────────────┴───────────────────────────┘
+        ↑ no cross-warp overlap → barrier unnecessary
 ```
 
 ## Background: How Addresses Are Computed
@@ -24,122 +27,144 @@ Warp 2: writes [0x200, 0x300)     reads [0x200, 0x300)
 For `local_store` / `local_load`, the lowering computes a **composed layout**:
 
 ```cpp
-auto regLayout = toLinearLayout(regTy);       // register layout: maps logical elements to threads
-auto sharedLayout = toLinearLayout(memDescTy); // shared layout: maps logical elements to offsets
+auto regLayout = toLinearLayout(regTy);       // register: logical elements → threads
+auto sharedLayout = toLinearLayout(memDescTy); // shared: logical elements → offsets
 auto cvt = regLayout.invertAndCompose(sharedLayout);
 // cvt: {register, lane, warp, block} → {offset}
 ```
 
-This `cvt` maps thread coordinates `(register_idx, lane_id, warp_id,
-block_id)` to shared memory byte offsets. The actual address for each thread
-is computed by `applyLinearLayout(cvt, {kReg, kLane=laneId, kWarp=warpId,
-kBlock=blockId})`.
+This `cvt` maps thread coordinates to shared memory byte offsets:
 
-### Warp Dimension in the Address Function
+```
+  Input dimensions              Output dimension
+  ┌──────────┐
+  │ register │──┐
+  ├──────────┤  │    LinearLayout     ┌────────┐
+  │   lane   │──┼───────────────────▶ │ offset │
+  ├──────────┤  │    (XOR / GF(2))    └────────┘
+  │   warp   │──┘
+  └──────────┘
+```
 
-The `kWarp` input dimension contributes some bits to the `kOffset` output.
-How it contributes determines whether warps access overlapping or disjoint
-address ranges:
+Each input dimension contributes basis vectors. The offset is computed as:
 
-- **Overlapping (typical)**: The `kWarp` bits are mixed with `kLane`/`kReg`
-  bits in the offset computation (e.g., via swizzling). Different warps may
-  access the same offsets, and a CTA barrier is required.
+```
+offset = Σ(reg_bit_i × reg_base_i) ⊕ Σ(lane_bit_j × lane_base_j)
+         ⊕ Σ(warp_bit_k × warp_base_k)
+```
 
-- **Disjoint (warp-local)**: The `kWarp` bits map to high-order offset bits
-  that partition the address space. Each warp accesses a non-overlapping
-  region. No CTA barrier is needed — at most a `warp.sync` / `__syncwarp()`.
+where `⊕` is XOR (addition in GF(2)).
+
+### Warp-Disjoint vs Cross-Warp Access
+
+How the `warp` bases relate to the `register + lane` bases determines whether
+warps access overlapping or disjoint address ranges:
+
+```
+  Cross-warp (typical):              Warp-disjoint:
+  warp bases overlap with            warp bases are independent of
+  register/lane bases                register/lane bases
+
+  offset bits: [b7 b6 b5 b4 b3 b2 b1 b0]
+               ├── reg/lane ─┤├─ warp ─┤   ← warp selects high bits
+               ├── overlapping ────────┤   ← warp mixed with reg/lane
+
+  Cross-warp:                        Warp-disjoint:
+  W0: {0x00..0x3F, 0x80..0xBF}      W0: [0x00, 0x40)
+  W1: {0x40..0x7F, 0xC0..0xFF}      W1: [0x40, 0x80)
+       ↑ interleaved                      ↑ contiguous, non-overlapping
+```
 
 ### Existing Warp-Level Sync Detection
 
 Triton already has a partial version of this concept for `ConvertLayoutOp`
-scratch buffers:
+scratch buffers. `isCvtDimSync` checks if the conversion's composed layout
+is trivial over the warp dimension. When true, membar emits `warp.sync`
+instead of a CTA-wide barrier and avoids clearing CTA-wide pending
+dependencies. This mechanism is limited to `ConvertLayoutOp` scratch
+buffers.
 
-```cpp
-// lib/Analysis/Membar.cpp, line 336
-if (auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
-  auto kWarp = StringAttr::get(op->getContext(), "warp");
-  isWarpSync = mlir::isCvtDimSync(srcLayout, dstLayout, kWarp);
-}
-```
-
-`isCvtDimSync` checks if the conversion's composed layout is **trivial over
-the warp dimension** (identity mapping + no broadcasting). When true, membar
-avoids clearing CTA-wide pending dependencies and instead only syncs within
-the warp.
-
-This mechanism is limited to `ConvertLayoutOp` scratch buffers and does not
-apply to general `local_store` / `local_load` pairs.
-
-## Proposed Detection
-
-### Core Idea
-
-For a pair of shared memory operations (e.g., `local_store` + `local_load`)
-that membar considers as potentially conflicting, determine whether the
-address sets are **warp-disjoint**: the set of offsets accessed by warp W in
-one operation is disjoint from the set accessed by warp W' (W ≠ W') in the
-other.
+## Detection via GF(2) Linear Independence
 
 ### Formal Condition
 
 Given two composed layouts `cvt_A` and `cvt_B` (for the write and read ops),
-each mapping `{register, lane, warp, block} → {offset}`:
-
-**No cross-warp conflict exists if and only if:**
-For all warp ids `w ≠ w'`, the sets `Addr_A(w)` and `Addr_B(w')` are
-disjoint, where:
+no cross-warp conflict exists if, for all warp ids `w ≠ w'`, the address
+sets are disjoint:
 
 ```
-Addr_X(w) = { cvt_X(r, l, w, b) | for all register indices r, lane ids l }
+Addr_X(w) = { cvt_X(r, l, w, b) | ∀ register indices r, ∀ lane ids l }
+∀ w ≠ w':  Addr_A(w) ∩ Addr_B(w') = ∅
 ```
 
-### Detection via LinearLayout
+### GF(2) Independence Check
 
-In the `LinearLayout` framework, warp-disjointness can be detected by
-analyzing the basis vectors. A sufficient condition:
+Since `LinearLayout` uses GF(2) arithmetic, this reduces to checking
+**linear independence** of basis vectors.
 
-1. Extract the `kWarp → kOffset` sublayout from both composed layouts.
-2. Check that the `kWarp` bases map to offset bits that are **not** covered
-   by the `kReg` or `kLane` bases — i.e., the warp selects an address
-   partition that is independent of the within-warp thread/register indexing.
+For a single composed layout `cvt`, let:
+- `R ∪ L` = basis vectors from `register` and `lane` dimensions
+- `W` = basis vectors from `warp` dimension
 
-More precisely, let `W_A` and `W_B` be the sets of offset bits influenced by
-`kWarp` in `cvt_A` and `cvt_B` respectively, and let `T_A` and `T_B` be the
-sets of offset bits influenced by `kReg + kLane`. If `W_A ∩ T_B = ∅` and
-`W_B ∩ T_A = ∅` and `W_A = W_B`, then the warp dimension partitions the
-address space identically in both ops, and no cross-warp conflict exists.
+**Theorem**: The per-warp address sets are disjoint if and only if
+`rank(R ∪ L ∪ W) = rank(R ∪ L) + |W|` over GF(2).
 
-This can be checked by inspecting the `LinearLayout` basis matrices without
-materializing actual addresses.
-
-### GF(2) Linear Independence Check
-
-Since `LinearLayout` operates over GF(2) (XOR arithmetic), the address for
-a given `(register, lane, warp)` combination is:
+When warp bases are independent, different warp IDs flip offset bits that
+no register/lane combination can toggle:
 
 ```
-offset = Σ(reg_bit_i * reg_base_i) XOR Σ(lane_bit_j * lane_base_j)
-         XOR Σ(warp_bit_k * warp_base_k)
+  Example: 4 warps, 2 warp bits
+
+  Basis matrix (rows = basis vectors, columns = offset bits):
+
+  register bases:  [ 0 0 0 0 0 0 0 1 ]   ← bit 0
+                   [ 0 0 0 0 0 0 1 0 ]   ← bit 1
+                   [ 0 0 0 0 0 1 0 0 ]   ← bit 2
+  lane bases:      [ 0 0 0 0 1 0 0 0 ]   ← bit 3
+                   [ 0 0 0 1 0 0 0 0 ]   ← bit 4
+  ─────────────────────────────────────
+  warp bases:      [ 0 0 1 0 0 0 0 0 ]   ← bit 5  ← independent!
+                   [ 0 1 0 0 0 0 0 0 ]   ← bit 6  ← independent!
+
+  → Warp 0: offsets [0x00, 0x20)
+    Warp 1: offsets [0x20, 0x40)
+    Warp 2: offsets [0x40, 0x60)
+    Warp 3: offsets [0x60, 0x80)    → all disjoint ✓
 ```
 
-Warp-disjointness holds if and only if the **warp basis vectors are linearly
-independent from the register + lane basis vectors** over GF(2). When this
-holds, different warp IDs flip offset bits that no register/lane combination
-can toggle, guaranteeing non-overlapping per-warp address sets.
+For a **pair** of operations, both composed layouts must satisfy this check,
+and their warp bases must produce the same partitioning (i.e., same warp
+basis vectors in offset space).
 
-This reduces to a standard **Gaussian elimination** on the combined basis
-matrix: stack the register, lane, and warp bases as rows, then check whether
-the warp rows increase the rank. If `rank(R ∪ L ∪ W) = rank(R ∪ L) + |W|`,
-the warp bases are independent and addresses are warp-disjoint.
+The check is a standard **Gaussian elimination** on the combined basis matrix
+— O(n²) where n is the number of offset bits (typically 10-15). Negligible
+cost.
 
-### MMA Dot Operand Layouts
+## MMA Dot Operand Layouts
 
 MMA operand layouts are **not always cross-warp**. The warp distribution for
 dot operands is constructed by `broadcastedDotOperandLayout`:
 
+```
+  MMA output C tiled by warpsPerCTA = {2, 2}:
+
+  ┌─────────┬─────────┐
+  │  W0     │  W1     │        Operand A:         Operand B:
+  │         │         │        ┌────┬────┐        ┌────┬────┐
+  ├─────────┼─────────┤        │W0  │W0  │        │W0  │W1  │
+  │  W2     │  W3     │        │W1  │W1  │        │W2  │W3  │
+  │         │         │        ├────┼────┤        ├────┼────┤
+  └─────────┴─────────┘        │W2  │W2  │        │W0  │W1  │
+                               │W3  │W3  │        │W2  │W3  │
+  C: warps tile M × N          └────┴────┘        └────┴────┘
+                               A: partition M,     B: partition N,
+                                  broadcast K         broadcast K
+```
+
+The code creates identity (partition) along the non-K dimension and zeros
+(broadcast) along K:
+
 ```cpp
-// For operand A: warps distributed along M, broadcast along K
-// For operand B: warps distributed along N, broadcast along K
 for (auto d : order) {
   if (d == kDim)
     layout *= LinearLayout::zeros1D(shape[d], "warp", dimNames[d]); // broadcast
@@ -148,133 +173,43 @@ for (auto d : order) {
 }
 ```
 
-This means:
-- **Operand A** (`warpsPerCTA = {Mw, Nw}`): each warp owns `M/Mw` rows,
-  all warps access all K columns.
-- **Operand B**: each warp owns `N/Nw` columns, all warps access all K rows.
+Whether this translates to warp-disjoint shared memory access depends on the
+composed layout. Consider operand A with `warpsPerCTA = {4, 1}`, shape
+`[64, 64]`, `f16`:
 
-Whether this translates to warp-disjoint shared memory access depends on
-the composed layout `regLayout.invertAndCompose(sharedLayout)`. If the M
-(or N) dimension maps to a contiguous, warp-aligned region of shared memory,
-the warp bases will be independent from register/lane bases and the access
-is warp-local.
+```
+  Non-swizzled shared layout (row stride = 128 bytes):
 
-With swizzling (e.g., `SwizzledSharedEncodingAttr`), the M/N offset bits may
-be XOR-mixed with K offset bits, potentially breaking independence. The
-GF(2) check handles this correctly — it would detect the dependence and
-conservatively require a barrier.
+  Shared memory offsets:
+  ┌──────────────────────────┐ 0x0000
+  │ Rows  0-15  (Warp 0)    │
+  ├──────────────────────────┤ 0x0800
+  │ Rows 16-31  (Warp 1)    │
+  ├──────────────────────────┤ 0x1000
+  │ Rows 32-47  (Warp 2)    │
+  ├──────────────────────────┤ 0x1800
+  │ Rows 48-63  (Warp 3)    │
+  └──────────────────────────┘ 0x2000
 
-**Concrete example**: Consider operand A with `warpsPerCTA = {4, 1}` and
-shape `[64, 64]`:
-- Each warp owns 16 rows of A (M/4 = 16).
-- If the shared layout maps row index to high-order offset bits (e.g.,
-  row stride = 64 elements × 2 bytes = 128), then:
-  - Warp 0: rows [0, 16) → offsets [0x000, 0x800)
-  - Warp 1: rows [16, 32) → offsets [0x800, 0x1000)
-  - etc.
-  - These are disjoint → no barrier needed.
-- If the shared layout swizzles row and column bits (e.g., `maxPhase=4,
-  perPhase=2`), the warp base bits may overlap with lane/register bits in
-  the offset space → independence check fails → barrier required.
-
-## Integration with Membar
-
-### Option A: AllocationSlice with Warp Partitioning
-
-Extend `AllocationSlice` to carry per-warp interval information:
-
-```cpp
-struct AllocationSlice {
-  // ... existing fields ...
-  std::optional<WarpPartitionInfo> warpPartition;
-};
-
-struct WarpPartitionInfo {
-  int64_t warpStride;    // byte stride between warps
-  int64_t perWarpSize;   // bytes each warp accesses
-  int numWarps;
-};
+  Warp bases map to bits 11-12 of offset → independent of
+  register/lane bases (bits 0-10) → warp-disjoint ✓
 ```
 
-In `intersects()`, if both slices have `WarpPartitionInfo` with matching
-parameters, they don't intersect (each warp only conflicts with itself, and
-within a warp, execution is lockstep — no barrier needed).
+```
+  Swizzled shared layout (maxPhase=4, perPhase=2):
 
-**Pros**: Minimal change, fits existing `AllocationSlice` model.
+  Shared memory offsets:
+  ┌──────────────────────────┐
+  │ Row 0:  col XOR (row>>2) │   ← row bits mixed into column
+  │ Row 1:  col XOR (row>>2) │      address via swizzle
+  │ ...                      │
+  └──────────────────────────┘
 
-**Cons**: Requires constructing the composed layout at analysis time (membar
-currently works at the allocation level, not the lowering level). May need
-layout information that is not easily available in `AllocationSlice`.
-
-### Option B: Layout-Aware Filter
-
-Add a **filter function** (similar to the AMD async-write filter) that checks
-warp-disjointness for a pair of operations:
-
-```cpp
-bool isWarpDisjoint(Operation *write, Operation *read, Allocation *alloc) {
-  auto writeMemDesc = getMemDescType(write);
-  auto readMemDesc = getMemDescType(read);
-  if (!writeMemDesc || !readMemDesc)
-    return false;
-  auto writeCvt = computeComposedLayout(write);
-  auto readCvt = computeComposedLayout(read);
-  return checkWarpDisjointness(writeCvt, readCvt);
-}
+  Warp bases (from row index) overlap with register/lane bases
+  (from column index) after XOR → NOT independent → cross-warp ✗
 ```
 
-**Pros**: Composable with existing filter mechanism. Can be backend-specific.
-
-**Cons**: Requires computing composed layouts during membar analysis, which
-currently happens later during lowering to LLVM. The layout composition logic
-would need to be available earlier.
-
-### Option C: Pre-Analysis Annotation
-
-Run a pre-pass before membar that annotates `local_store`/`local_load` ops
-with a `warp_disjoint` attribute when the layout guarantees warp-local access.
-Membar then checks this attribute.
-
-**Pros**: Clean separation. Layout analysis happens once, membar consumes a
-simple boolean.
-
-**Cons**: Another pass to maintain. Attribute could be lost by transforms
-between annotation and membar.
-
-## When Does This Apply?
-
-### Cases Where Warps Access Disjoint Shared Memory
-
-1. **Blocked register layout with matching shared layout**: If the register
-   layout assigns each warp a contiguous block of elements, and the shared
-   layout maps elements to contiguous offsets in the same order, the warp
-   dimension naturally partitions the shared memory.
-
-2. **Warp-specialized kernels**: Gluon kernels where different warps perform
-   different roles (e.g., producer vs consumer) and explicitly partition
-   shared memory by warp ID.
-
-3. **Per-warp scratch buffers**: Temporary shared memory used for warp-local
-   reductions or shuffles where the data never crosses warp boundaries.
-
-4. **`ConvertLayoutOp` with warp-trivial conversion**: Already handled by
-   `isCvtDimSync` for scratch buffers.
-
-### Cases Where This Does NOT Apply
-
-1. **`SwizzledSharedEncodingAttr`**: The documentation explicitly states that
-   all threads in `{0, ..., 32*num_warps-1}` may access any element. Swizzling
-   mixes warp and lane bits in the offset, making the access cross-warp by
-   design.
-
-2. **Matrix multiply operands** (`DotOperandLayout`): Typically loaded by
-   multiple warps cooperatively, with each warp reading a different part of
-   the shared buffer but potentially overlapping with adjacent warps due to
-   the MMA instruction's data consumption pattern.
-
-3. **NVIDIA `async_copy_global_to_local`**: Each thread issues its own
-   `cp.async` instruction. The destination address depends on the shared
-   encoding, which is typically cross-warp (`SwizzledSharedEncodingAttr`).
+The GF(2) check handles both cases correctly.
 
 ## Async Copy, TDM Copy, and Async Wait
 
@@ -283,128 +218,200 @@ between annotation and membar.
 TDM (Tensor Data Mover) copies are **inherently warp-partitioned on the
 write side**. The TDM linear layout distributes the block across warps:
 
-```cpp
-// lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp
-getTDMLinearLayout = identityStandardND("message", messageShape, order)
-                   * identityStandardND("warp", warpsPerCTA, order)
-                   * cgaLayout;
 ```
+  getTDMLinearLayout:
 
-The `warp` dimension is a higher-order factor than `message` (per-warp data
-elements). Each warp's DMA instruction targets a distinct sub-block of the
-tensor, producing non-overlapping shared memory writes. The per-warp
-sub-block shape is computed by `tdmGetAdjustedBlockShape`, which divides
-the block dimensions by the warp distribution.
+  ┌─────────────────────────────────────────────────────────────┐
+  │ identity("message", messageShape)                           │
+  │    × identity("warp", warpsPerCTA)    ← warp partitions    │
+  │    × cgaLayout                        ← cluster             │
+  └─────────────────────────────────────────────────────────────┘
+
+  For a 64×64 block with 4 warps distributed as {4, 1}:
+
+  TDM DMA targets:
+  ┌──────────────────┐
+  │ W0: rows  0-15   │ ← warp 0 DMA writes here
+  ├──────────────────┤
+  │ W1: rows 16-31   │ ← warp 1 DMA writes here
+  ├──────────────────┤
+  │ W2: rows 32-47   │ ← warp 2 DMA writes here
+  ├──────────────────┤
+  │ W3: rows 48-63   │ ← warp 3 DMA writes here
+  └──────────────────┘
+  Write side: always warp-disjoint by construction
+```
 
 The composed mapping `tdmLayout.invertAndCompose(sharedLayout)` determines
-which shared memory offsets each warp's DMA writes to. Because the TDM
-layout assigns each warp a disjoint sub-block, the destination addresses
-are warp-disjoint by construction.
+the actual shared memory offsets. Because TDM assigns each warp a disjoint
+sub-block, the destination addresses are warp-disjoint by construction.
 
-**However**, the consumer (`local_load`) uses a different layout — its
-composed mapping `regLayout.invertAndCompose(sharedLayout)` depends on the
-register encoding of the result tensor (e.g., `BlockedLayout`,
-`AMDWMMALayout`, `AMDMFMALayout`). The reader's warp-to-address mapping
-may NOT match the writer's:
+**However**, the consumer (`local_load`) uses a different layout. Its
+warp-to-address mapping depends on the register encoding:
 
 ```
-TDM write:   warp 0 → offsets [0x000, 0x100)    warp 1 → [0x100, 0x200)
-local_load:  warp 0 → offsets [0x000, 0x080) ∪ [0x100, 0x180)   ← cross-warp!
-```
+  TDM write → local_load (cross-warp reader):
 
-In this (common) scenario, warp 0 reads data written by both warp 0 and
-warp 1, so a CTA barrier is still needed. The warp-local optimization only
-applies when the reader also has a matching warp partition.
+  Write:                    Read (MMA operand):
+  ┌──────────┐              ┌──────────┐
+  │ W0 only  │              │ W0 + W1  │ ← reads from both
+  ├──────────┤              │          │    warp 0 and warp 1
+  │ W1 only  │              ├──────────┤    regions
+  ├──────────┤              │ W2 + W3  │
+  │ W2 only  │              │          │
+  ├──────────┤              └──────────┘
+  │ W3 only  │              CTA barrier needed!
+  └──────────┘
+
+  TDM write → local_load (matching partition):
+
+  Write:                    Read:
+  ┌──────────┐              ┌──────────┐
+  │ W0 only  │              │ W0 only  │
+  ├──────────┤              ├──────────┤
+  │ W1 only  │              │ W1 only  │
+  ├──────────┤              ├──────────┤
+  │ W2 only  │              │ W2 only  │
+  ├──────────┤              ├──────────┤
+  │ W3 only  │              │ W3 only  │
+  └──────────┘              └──────────┘
+  No CTA barrier needed — each warp reads its own data
+```
 
 ### NVIDIA `async_copy_global_to_local`
 
-NVIDIA's `cp.async` is a **per-thread** async copy instruction. Each thread
-independently copies its assigned elements from global to shared memory.
-The shared memory address per thread is determined by the shared encoding
-and the source tensor's layout.
-
-Whether the resulting write pattern is warp-disjoint depends on the shared
-encoding. With `SwizzledSharedEncodingAttr`, the swizzling mixes lane and
-warp bits, making writes cross-warp. With other encodings it could be
-warp-partitioned, though this is uncommon in practice.
+NVIDIA's `cp.async` is a **per-thread** async copy. Each thread independently
+copies its assigned elements. The destination address depends on the shared
+encoding. With `SwizzledSharedEncodingAttr`, swizzling mixes lane and warp
+bits, making writes cross-warp. Whether the write pattern is warp-disjoint
+can be checked with the same GF(2) independence test on the composed layout.
 
 ### `async_wait` Semantics
 
-`async_wait` ensures that outstanding async DMA operations have completed
-and their results are visible in shared memory. Key points:
+`async_wait` ensures outstanding DMA operations have completed and their
+results are visible in shared memory:
 
-- **AMD**: `async_wait` makes DMA results visible **CTA-wide** — all warps
-  can see the data, not just the issuing warp. This is a memory visibility
-  guarantee, not an execution barrier (no CTA execution sync).
-- **NVIDIA**: `cp.async.wait_group` waits for the issuing thread's async
-  copies. A subsequent `__syncthreads()` is needed for cross-warp visibility.
+- **AMD**: CTA-wide memory visibility (all warps see the data). Not an
+  execution barrier.
+- **NVIDIA**: Per-thread `cp.async.wait_group`. Cross-warp visibility
+  requires a subsequent `__syncthreads()`.
 
-For the warp-local optimization, `async_wait` is not a concern:
+`async_wait` is **not an obstacle** to the warp-local optimization:
 
-- If both the DMA write and the subsequent `local_load` are warp-disjoint
-  with matching partitioning, each warp only reads data that it wrote (or
-  that was made visible to it after the wait). No cross-warp data flow
-  means no CTA barrier is needed.
-- The existing AMD membar filter already handles the DMA-completion aspect
-  (suppressing false RAW barriers when the `local_load` token chains to an
-  `async_wait`). Warp-disjointness is an orthogonal check that could
-  further reduce barriers even without the token-chain filter.
+```
+  Timeline (warp-disjoint case):
+
+  Warp 0:  [TDM write → region A] ... [async_wait] ... [local_load ← region A]
+  Warp 1:  [TDM write → region B] ... [async_wait] ... [local_load ← region B]
+
+  Each warp reads only what it wrote → no cross-warp dependency
+  → async_wait is sufficient, no CTA barrier needed
+```
+
+The existing AMD membar filter handles DMA-completion sequencing (token chain
+to `async_wait`). Warp-disjointness is an orthogonal check that could further
+reduce barriers.
 
 ### Interaction Summary
 
-| Operation | Write Warp-Partitioned? | Read Warp-Partitioned? | Barrier Needed? |
-|-----------|:-----------------------:|:----------------------:|:---------------:|
+| Operation | Write Warp-Disjoint? | Read Warp-Disjoint? | Barrier? |
+|-----------|:--------------------:|:--------------------:|:--------:|
 | TDM copy → local_load (matching partition) | Yes | Yes | **No** |
-| TDM copy → local_load (MMA layout) | Yes | Typically no | **Yes** |
-| NVIDIA async_copy → local_load | Depends on encoding | Depends on encoding | Usually **yes** |
-| local_store → local_load (warp-local) | Depends on layout | Depends on layout | **No** if both warp-local |
+| TDM copy → local_load (MMA layout) | Yes | Usually no | **Yes** |
+| NVIDIA async_copy → local_load | Depends | Depends | Usually **yes** |
+| local_store → local_load (warp-local) | Depends | Depends | **No** if both |
 
-The key takeaway: **TDM copy is always warp-partitioned on the write side,
-but this alone is insufficient** — the read side must also be warp-partitioned
-with a matching scheme. The most common consumer layout (MMA operand) is
-cross-warp, so the practical benefit is limited to cases where the reader
-layout happens to align with the TDM write partition (e.g., blocked layouts
-with warp-major ordering, or Gluon kernels with explicit warp partitioning).
+## Integration with Membar
 
-## Challenges
+### Option A: Filter Function
 
-### Layout Availability at Membar Time
+Add a filter (similar to the AMD async-write filter) that checks
+warp-disjointness for a pair of operations:
 
-Membar runs during the `TritonGPUToLLVM` conversion, where `MemDescType`
-encodings are available. However, the **composed layout** (`regLayout.
-invertAndCompose(sharedLayout)`) requires knowing the register-side layout
-of the operation's tensor operand, which may not be trivially available from
-the `MemDescType` alone.
+```
+  membar analysis
+       │
+       ▼
+  ┌─────────────────────────────────────────┐
+  │ AllocationSlice::intersects()           │
+  │  1. Check allocation interval overlap   │
+  │  2. Check BufferIndexExpr disjointness  │  ← buffer slot
+  │  3. Check warp-disjointness (NEW)       │  ← per-warp partition
+  │  4. Check subslice overlap              │
+  └─────────────────────────────────────────┘
+```
 
-For `local_store`, the source tensor has a register layout. For `local_load`,
-the result tensor has a register layout. Both are needed to compute the
-composed layout and determine warp-disjointness.
+For step 3, compute the composed layouts from both operations and run the
+GF(2) independence check. If both layouts have independent warp bases with
+matching partitions, return `false` (no intersection).
+
+**Pros**: Composable with existing checks. Single point of implementation.
+
+**Cons**: Requires computing composed layouts during membar analysis. The
+register-side layout must be available from the operation's tensor type.
+
+### Option B: Pre-Analysis Annotation
+
+A pre-pass annotates `local_store`/`local_load` ops with a `warp_disjoint`
+attribute when the layout guarantees warp-local access. Membar checks this
+attribute.
+
+**Pros**: Clean separation. Layout analysis happens once.
+
+**Cons**: Another pass to maintain. Attribute fragility across transforms.
+
+## Applicability
+
+### When This Optimization Applies
+
+1. **Blocked register layout with non-swizzled shared layout**: The warp
+   dimension naturally partitions both the register and shared address spaces.
+
+2. **MMA dot operand with non-swizzled shared layout**: When `warpsPerCTA`
+   partitions the M (or N) dimension and the shared layout maps rows (or
+   columns) to contiguous, non-overlapping offset ranges.
+
+3. **Warp-specialized Gluon kernels**: Explicit per-warp shared memory
+   partitioning.
+
+4. **Per-warp scratch buffers**: Warp-local reductions or shuffles.
+
+### When This Does NOT Apply
+
+1. **Swizzled shared encodings**: XOR-mixing of row/column bits breaks warp
+   independence.
+
+2. **Cross-warp MMA operand loading**: When the MMA layout requires each warp
+   to read data from multiple warp regions.
+
+3. **Cooperative DMA patterns**: Where the shared encoding distributes writes
+   across all warps.
 
 ### Interaction with Multi-Buffering
 
-If the allocation is multi-buffered (e.g., `memdesc<3x128x128xf16>`) and
-accessed via `MemDescIndexOp`, the warp-disjointness check applies to the
-sub-buffer level. The `MemDescIndexOp` selects the buffer slot (handled by
-`BufferIndexExpr`), and within each slot, the warp-disjointness check
-determines whether a barrier is needed.
+Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
+**orthogonal** and compose naturally:
 
-These are orthogonal optimizations that compose naturally.
-
-### Shared Encoding Design Intent
-
-Most shared memory encodings in Triton are designed for **cross-warp
-cooperative access** — this is the fundamental purpose of shared memory in
-GPU programming. Warp-local shared memory access is a special case that
-arises in specific optimization patterns (warp-level scratch, warp
-specialization). The barrier elimination opportunity is real but
-situational.
+```
+  ┌─────────────────────────────────────┐
+  │ Multi-buffer allocation             │
+  │ ┌───────────┬───────────┬─────────┐ │
+  │ │  Slot 0   │  Slot 1   │ Slot 2  │ │  ← BufferIndexExpr
+  │ │┌───┬─────┐│           │         │ │     proves slot
+  │ ││W0 │ W1  ││           │         │ │     disjointness
+  │ │├───┼─────┤│           │         │ │
+  │ ││W2 │ W3  ││           │         │ │  ← GF(2) check proves
+  │ │└───┴─────┘│           │         │ │     warp disjointness
+  │ └───────────┴───────────┴─────────┘ │     within a slot
+  └─────────────────────────────────────┘
+```
 
 ## Summary
 
 | Aspect | Current State | Proposed |
 |--------|--------------|----------|
-| **Warp awareness in membar** | None for `local_store`/`local_load`; only `ConvertLayoutOp` scratch via `isCvtDimSync` | Extend to general shared memory ops via composed layout analysis |
-| **Detection mechanism** | N/A | Check warp-disjointness of composed layouts using `LinearLayout` basis analysis |
-| **Integration** | N/A | Filter function (Option B) or pre-analysis annotation (Option C) |
-| **Applicability** | N/A | Blocked layouts with warp partitioning, warp-specialized kernels, per-warp scratch |
-| **Limitation** | N/A | Most shared encodings are cross-warp by design; layout composition must be available at membar time |
+| **Warp awareness** | `ConvertLayoutOp` scratch only (`isCvtDimSync`) | General shared memory ops via GF(2) independence |
+| **Detection** | Trivial-over-warp check | LinearLayout basis Gaussian elimination |
+| **Async/TDM** | Not considered | TDM write always disjoint; read checked via same mechanism |
+| **MMA operands** | Assumed cross-warp | Checkable per-configuration via composed layout |
+| **Scope** | Situational; most encodings are cross-warp by design | Same, but catches cases where layout happens to be warp-local |
