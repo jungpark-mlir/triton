@@ -26,7 +26,8 @@ cases, the barrier is unnecessary — there is no cross-warp data dependency.
 [`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe).
 The check compares `warpsPerCTA` distributions from the writer and reader.
 If they match, each warp owns the same tensor-element partition on both
-sides. A bijection argument then proves the byte addresses are also disjoint.
+sides, and since shared memory encodings never let two different elements
+share the same address, the byte addresses are also disjoint.
 
 ### How warpsPerCTA Determines Warp Ownership
 
@@ -122,55 +123,57 @@ Concrete examples:
   [4] == [4] → MATCH → barrier suppressed ✓
 ```
 
-### Why Matching warpsPerCTA Proves Disjointness: The Bijection Argument
+### Why Matching warpsPerCTA Proves Disjointness
 
-The check operates in **tensor space** (which elements does each warp own?),
-not byte-address space. The bridge between the two is the **bijection
-argument**:
+The check operates in **tensor space** — it only asks "which rows/columns
+does each warp own?" It does not look at byte addresses at all. So why is
+this safe? Because of a simple property of how shared memory works:
 
-> **All Triton shared memory encodings are bijections from tensor elements to
-> byte addresses.** A bijection maps distinct elements to distinct addresses —
-> it never collapses two elements onto the same byte offset.
+> **Every tensor element gets its own unique address in shared memory.
+> No two different elements ever land on the same byte offset.**
 
-This is true for all current shared encodings: padded, swizzled, linear,
-and rotating. Swizzling permutes which byte offset a `(row, col)` pair maps
-to, but never maps two distinct `(row, col)` pairs to the same offset.
-Padding adds unused bytes at the end of each row but does not change the
-one-to-one property.
+This is a property called a **bijection** (one-to-one mapping), and it holds
+for all Triton shared memory encodings — padded, swizzled, linear, and
+rotating. The encoding may rearrange *where* each element goes (swizzling
+shuffles addresses, padding adds gaps), but it never puts two elements at the
+same place. Each element always occupies its own unique bytes.
 
-With this, the proof is simple:
+This means: **if two warps own different elements, they automatically access
+different addresses.** The encoding cannot break this — it can only rearrange
+which addresses they use, not cause them to collide.
+
+The full reasoning:
 
 1. Same `warpsPerCTA` → each warp owns the **same set of tensor elements**
    on both the write and read sides.
-2. The shared encoding is a bijection → the same elements map to the
-   **same set of byte addresses**.
-3. Different warps own disjoint element sets → different warps access
-   **disjoint byte-address sets**.
-4. No cross-warp byte overlap → **no CTA-wide barrier needed**.
+2. Different warps own different elements (warp partitions don't overlap).
+3. The shared encoding gives each element a unique address (no collisions).
+4. Therefore, different warps access **different addresses**.
+5. No cross-warp address overlap → **no CTA-wide barrier needed**.
 
 ```
-  Tensor space                Shared encoding              Byte addresses
-  (warpsPerCTA = [4, 1])      (bijection)
+  Tensor elements             Shared encoding              Byte addresses
+  (warpsPerCTA = [4, 1])      (one-to-one mapping)
 
   ┌──────────────────┐                                ┌──────────────────┐
   │ W0: rows  0-15   │ ──── 1024 elements ──────────▶ │ W0: 1024 addrs   │
-  ├──────────────────┤       ↕ one-to-one             ├──────────────────┤
-  │ W1: rows 16-31   │ ──── 1024 elements ──────────▶ │ W1: 1024 addrs   │
-  ├──────────────────┤                                ├──────────────────┤
+  ├──────────────────┤       each element gets         ├──────────────────┤
+  │ W1: rows 16-31   │ ──── its own address ─────────▶ │ W1: 1024 addrs   │
+  ├──────────────────┤       (never shared)            ├──────────────────┤
   │ W2: rows 32-47   │ ──── 1024 elements ──────────▶ │ W2: 1024 addrs   │
   ├──────────────────┤                                ├──────────────────┤
   │ W3: rows 48-63   │ ──── 1024 elements ──────────▶ │ W3: 1024 addrs   │
   └──────────────────┘                                └──────────────────┘
   Disjoint elements                                   Disjoint addresses
-  (by warpsPerCTA)                                    (by bijection)
+  (by warpsPerCTA)                                    (guaranteed by encoding)
 ```
 
-The encoding determines the specific byte offsets (contiguous for non-padded,
-strided for padded, XOR-scattered for swizzled), but disjointness is
-guaranteed regardless:
+The encoding determines the specific byte offsets — contiguous blocks for
+non-padded, strided blocks for padded, XOR-scattered for swizzled — but
+disjointness holds regardless because no two elements share an address:
 
 ```
-  Same element partition, different encodings:
+  Same element partition, different encodings — all disjoint:
 
   Non-padded (stride = 128 bytes):    Padded (stride = 144 bytes):
   W0: bytes [0x0000, 0x0800)          W0: bytes [0x0000, 0x0900)
@@ -180,8 +183,8 @@ guaranteed regardless:
        all disjoint ✓                      all disjoint ✓
 
   Swizzled (XOR-based):
-  W0: 1024 addrs (XOR-scattered)      ← still 1024 unique addrs
-  W1: 1024 addrs (different set)      ← bijection guarantees uniqueness
+  W0: 1024 addrs (XOR-scattered)      ← same elements, shuffled addresses
+  W1: 1024 addrs (different set)      ← still unique, still disjoint
   ...                                      all disjoint ✓
 ```
 
@@ -209,9 +212,10 @@ the row stride from a power-of-2 to a non-power-of-2 value (e.g., stride
 ```
 
 The `warpsPerCTA` check does not inspect the stride at all. It operates
-entirely in tensor space (which rows does each warp own?), and the bijection
-does the rest. This is why it handles padded layouts natively — unlike the
-GF(2) approach which fails for non-power-of-2 strides (see Appendix A).
+entirely in tensor space (which rows does each warp own?), and the one-to-one
+address mapping guarantees the rest. This is why it handles padded layouts
+natively — unlike the GF(2) approach which fails for non-power-of-2 strides
+(see Appendix A).
 
 ### Why This Supersedes GF(2)
 
@@ -487,11 +491,12 @@ scratch buffers and does not generalize to TDM or `local_store`/`local_load`.
 1. **Blocked register layout with matching warp distribution**: The
    `warpsPerCTA` on the write and read sides match, and each warp owns
    a disjoint partition of tensor elements. Works with any shared encoding
-   (padded, swizzled, linear) due to the bijection argument.
+   (padded, swizzled, linear) because each element always gets a unique address.
 
 2. **MMA dot operand with matching warp distribution**: When `warpsPerCTA`
-   partitions the M (or N) dimension identically on both sides. The shared
-   encoding is irrelevant — the bijection guarantees address disjointness.
+   partitions the M (or N) dimension identically on both sides. The specific
+   shared encoding doesn't matter — unique-address-per-element guarantees
+   address disjointness.
 
 3. **Batched MMA with warps across batch dimension**: Each warp executes
    an independent MMA on its own partition (e.g., FA MQA decode with
@@ -543,13 +548,13 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
 
 | Aspect | Before | Implemented |
 |--------|--------|-------------|
-| **Warp awareness** | `ConvertLayoutOp` scratch only (`isCvtDimSync`) | General shared memory ops via `warpsPerCTA` comparison + bijection argument |
+| **Warp awareness** | `ConvertLayoutOp` scratch only (`isCvtDimSync`) | General shared memory ops via `warpsPerCTA` comparison + one-to-one address mapping |
 | **Detection** | Trivial-over-warp check | `warpsPerCTA` comparison with trailing-1 normalization |
 | **Async/TDM** | Not considered | TDM `warpsPerCTA` via `tdmGetWarpDistribution`; consumer `warpsPerCTA` from distributed encoding |
 | **MMA operands** | Assumed cross-warp | Checkable; batched MMA with matching distributions detected |
 | **Batched MMA** | Not distinguished from standard MMA | Detected: warps across batch dimension → matching `warpsPerCTA` → barrier suppressed |
-| **Padded layouts** | Not considered | Handled natively (bijection argument is encoding-agnostic) |
-| **Swizzled layouts** | Not considered | Handled natively (bijection argument: swizzle permutes but never collapses addresses) |
+| **Padded layouts** | Not considered | Handled natively (encoding-agnostic: each element always gets a unique address) |
+| **Swizzled layouts** | Not considered | Handled natively (swizzle shuffles addresses but never puts two elements at the same address) |
 | **Scope** | Situational | Currently TDM op pairs only; extensible to `local_store`/`local_load` |
 
 ---
