@@ -210,6 +210,12 @@ index is dynamic — computed from a loop-carried phase counter:
 Membar analysis sees both accesses targeting the same allocation with
 unknown offsets and conservatively inserts a barrier.
 
+Note: this shows the **unified-counter** pattern (Gluon pipelines), where
+both indices derive from the same `%phase` SSA value. The common
+(NVIDIA-style) pipeliner generates **separate counters** (`insertIdx` /
+`extractIdx`) as distinct block arguments — that IR shape is addressed in
+Section 6 as a further extension.
+
 **BufferIndexExpr (current approach).**
 Pattern matching decomposes index arithmetic into `{base, offset, modulus}`
 and compares structurally:
@@ -512,9 +518,11 @@ multiple pipeline stages.
     → Barrier required (correct: offset 4 ≡ 0 mod 4)
 ```
 
-This generalizes: Presburger automatically determines whether a given
-`(numBuffers, stageDistance)` pair guarantees disjointness, without
-hard-coding the arithmetic.
+This generalizes: given a shared phase counter, Presburger automatically
+determines whether a given `(numBuffers, stageDistance)` pair guarantees
+disjointness, without hard-coding the arithmetic. When the pipeliner uses
+separate counters instead of a shared phase, the loop-carried extension
+(Section 6) is needed to establish the relationship between them.
 
 ### 3.5 Gluon: Complex Index Patterns
 
@@ -711,8 +719,8 @@ recognize:
   │ → skip  │    ↓          │
   │ barrier │               │
   │         │  ┌────────────────────────┐
-  │         │  │ Layer 2: Presburger    │  ~µs, handles everything
-  │         │  │ Constraint solve       │
+  │         │  │ Layer 2: Presburger    │  ~µs, handles linear +
+  │         │  │ modulo patterns        │
   │         │  ├─────────┬──────────────┤
   │         │  │ Empty   │ Not empty    │
   │         │  │ → skip  │ → insert     │
@@ -723,7 +731,140 @@ recognize:
 This preserves the fast path for common cases while adding coverage for
 complex index expressions.
 
-## 6. Limitations
+## 6. Further Extension: Loop-Carried Induction Variables
+
+The initial Presburger design (Section 3.1) builds constraints by walking
+the arith op DAG backwards from each `MemDescIndexOp` index. This works
+when both producer and consumer indices derive from the **same SSA value**
+(e.g., a single `%phase` counter in Gluon pipelines).
+
+The common (NVIDIA-style) pipeliner generates a different IR shape: two
+**separate loop-carried block arguments** (`%insertIdx` and `%extractIdx`)
+with no shared SSA ancestor. Since block arguments have no defining op, the
+constraint builder treats them as unrelated unconstrained variables — and
+the disjointness query trivially says "may alias."
+
+```
+  Common pipeliner IR:
+
+  scf.for iter_args(%insertIdx = C_insert, %extractIdx = C_extract) {
+      %write = ttg.memdesc_index %alloc[%insertIdx]
+      %read  = ttg.memdesc_index %alloc[%extractIdx]
+
+      %nextInsert  = incrementModulo(%insertIdx, N)
+      %nextExtract = incrementModulo(%extractIdx, N)
+      yield %nextInsert, %nextExtract
+  }
+
+  Initial design sees:
+    %insertIdx  → block arg → unconstrained variable x
+    %extractIdx → block arg → unconstrained variable y
+    Query: can x = y?  → trivially yes → conservative barrier
+```
+
+### Why Presburger Can Handle This (With Extension)
+
+The mathematical relationship between the two counters is:
+
+- Both start at known constants (`C_insert`, `C_extract`)
+- Both advance by the same recurrence: `(x + 1) % N` per iteration
+- At iteration `i`: `insertIdx = (C_insert + i) mod N`,
+  `extractIdx = (C_extract + i) mod N`
+
+The disjointness question reduces to: can `(C_insert + i) mod N =
+(C_extract + i) mod N`? The `i` cancels, leaving `N | (C_insert -
+C_extract)` — the same GCD test. When the stage distance is not divisible
+by `N`, the counters are always different.
+
+```
+  Extended constraint builder — loop-carried analysis:
+
+  Detect: both indices are block args of the same scf.for
+          with incrementModulo recurrence and constant inits
+
+  Introduce shared iteration variable i:
+    insertIdx  = (C_insert + i)  mod N
+    extractIdx = (C_extract + i) mod N
+
+  Presburger encoding:
+    r₁ = C_insert  + i - N·q₁,   0 ≤ r₁ < N
+    r₂ = C_extract + i - N·q₂,   0 ≤ r₂ < N
+    r₁ = r₂
+
+  Substituting:
+    N·(q₂ - q₁) = C_insert - C_extract
+
+  GCD test: N ∤ (C_insert - C_extract)?
+    → EMPTY → always disjoint → no barrier needed
+
+  Example: 3-buffer pipeline, stage distance 2
+    C_insert = 2, C_extract = 0, N = 3
+    3·(q₂ - q₁) = 2,  gcd(3) = 3,  3 ∤ 2
+    → always disjoint ✓
+```
+
+### What the Constraint Builder Needs
+
+The extension requires recognizing **modular induction variables** —
+loop-carried block arguments with an `incrementModulo` recurrence:
+
+1. Detect that the index is a block argument of an `scf.for`.
+2. Trace the corresponding yield operand to find the recurrence.
+3. Match the `incrementModulo` pattern: `select(cmpi(x+1, N), 0, x+1)` or
+   `remsi(x+1, N)`.
+4. Extract the constant initial value from `iter_args`.
+5. Introduce a shared iteration variable `i` and encode
+   `blockArg = (init + i) mod N`.
+
+This is itself a pattern match, but a qualitatively different one from
+`BufferIndexExpr`'s approach:
+
+- `BufferIndexExpr` matches on arbitrary **index arithmetic** chains
+  (open-ended variety of arith op compositions).
+- The loop-carried extension matches on **loop recurrence structure** (a
+  single, well-known pipeliner idiom: `incrementModulo`).
+
+The common pipeliner always emits exactly this shape, so the pattern is
+stable.
+
+### Relationship to BufferIndexExpr
+
+This extension gives Presburger a capability that `BufferIndexExpr`
+fundamentally cannot achieve. `BufferIndexExpr` requires a shared SSA
+base — two separate block arguments will never have one. Presburger's
+constraint system can relate the two variables through the shared
+iteration variable `i`, a synthetic variable not present in the IR.
+
+```
+  Why BufferIndexExpr cannot handle separate counters:
+
+  BufferIndexExpr decomposes each index independently:
+    %insertIdx  → {base=%insertIdx,  offset=0, mod=N}
+    %extractIdx → {base=%extractIdx, offset=0, mod=N}
+                         ↑ different bases → cannot compare
+
+  Presburger introduces a shared variable i:
+    %insertIdx  = (C_insert  + i) mod N  ─┐
+    %extractIdx = (C_extract + i) mod N  ─┤ shared i
+                                           ↓
+    Relationship between the two is captured
+    → GCD test resolves disjointness
+```
+
+### Not Part of Initial Design
+
+This extension is not needed for the initial Presburger integration, which
+targets the same Gluon-generated unified-counter IR that `BufferIndexExpr`
+already handles. The initial value is in covering more complex arith op
+chains (Section 3.5) and providing a fallback for patterns that
+`BufferIndexExpr` misses.
+
+The loop-carried extension becomes relevant when we want to handle the
+common pipeliner's separate-counter IR without requiring pipeliner-side
+changes. It is a natural second step after the initial constraint builder
+is in place.
+
+## 7. Limitations
 
 1. **No variable-variable multiplication.** Presburger arithmetic does not
    support multiplying two variables (`x * y`). When an index involves
@@ -749,7 +890,7 @@ complex index expressions.
    `x mod N` only when N is a power of 2 and x is non-negative. General
    bitwise operations require over-approximation or special-case handling.
 
-## 7. Summary
+## 8. Summary
 
 | Aspect | BufferIndexExpr | With Presburger |
 |--------|:-:|:-:|
@@ -757,6 +898,7 @@ complex index expressions.
 | **Patterns handled** | `remsi`, `addi`, `select/cmpi` | Any linear + modular composition (not variable×variable or general bitwise) |
 | **New Gluon patterns** | Must extend pattern matcher | Automatic for supported linear/modular encodings |
 | **Subslice overlap** | Static offsets only | Dynamic offsets (with constraints) |
+| **Separate-counter pipeliners** | Cannot handle (no shared SSA base) | Possible via loop-carried extension (Section 6) |
 | **Pipeliner verification** | Not available | Automated disjointness assertion |
 | **Build dependency** | None | `MLIRPresburger` (stable upstream) |
 | **Engineering effort** | Done (~110 LOC) | ~200-300 LOC for constraint builder |
