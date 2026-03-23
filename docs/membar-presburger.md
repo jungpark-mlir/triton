@@ -699,38 +699,6 @@ To integrate Presburger-based disjointness checking:
     return true (conservative)
 ```
 
-### Incremental Adoption Strategy
-
-The Presburger approach doesn't need to replace `BufferIndexExpr` — it can
-**augment** it as a fallback for patterns that `BufferIndexExpr` doesn't
-recognize:
-
-```
-  Layered disjointness checking:
-
-  MemDescIndexOp indices?
-         │
-         ▼
-  ┌─────────────────────────┐
-  │  Layer 1: BufferIndexExpr│  ~ns, handles common patterns
-  │  Pattern match → disjoint│
-  ├─────────┬───────────────┤
-  │ Success │    Fail       │
-  │ → skip  │    ↓          │
-  │ barrier │               │
-  │         │  ┌────────────────────────┐
-  │         │  │ Layer 2: Presburger    │  ~µs, handles linear +
-  │         │  │ modulo patterns        │
-  │         │  ├─────────┬──────────────┤
-  │         │  │ Empty   │ Not empty    │
-  │         │  │ → skip  │ → insert     │
-  │         │  │ barrier │   barrier    │
-  └─────────┘  └─────────┴──────────────┘
-```
-
-This preserves the fast path for common cases while adding coverage for
-complex index expressions.
-
 ## 6. Further Extension: Loop-Carried Induction Variables
 
 The initial Presburger design (Section 3.1) builds constraints by walking
