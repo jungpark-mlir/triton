@@ -279,3 +279,56 @@ tt.func @missing_barrier_reused_allocation(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
 }
 
 }
+
+// -----
+
+// Warp-local barrier suppression.
+//
+// With warpsPerCTA = [4, 1], each of the 4 warps owns 16 of the 64 rows.
+// Since all Triton shared memory encodings are bijections from tensor elements
+// to byte addresses, identical warp distributions on write and read sides
+// guarantee each warp accesses a disjoint set of addresses. A CTA-wide
+// barrier between a TDM write and a local_load is therefore unnecessary.
+//
+// The check compares warpsPerCTA on both sides: TDM distributes warps as
+// [4, 1], blocked encoding also has warpsPerCTA = [4, 1] — matching warp
+// distribution means each warp reads exactly what it wrote.
+#blocked_wl = #ttg.blocked<{sizePerThread = [8, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared_wl = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#smem_wl = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "hip:gfx1250"} {
+
+// CHECK-LABEL: warp_local_padded
+tt.func @warp_local_padded(
+    %desc: !tt.tensordesc<tensor<64x64xf16>>,
+    %pred: i32) {
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable>
+
+  %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<tensor<64x64xf16>> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+
+  // async_tdm_wait has MemWaitOpTrait — membar always inserts barrier here.
+  %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
+  // CHECK: amdg.async_tdm_wait
+  // CHECK-NEXT: ttg.barrier local
+
+  // TDM write and local_load access the same allocation. Without warp-local
+  // analysis, membar would insert a barrier. But each warp touches disjoint
+  // rows, so no cross-warp synchronization is needed.
+  %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<tensor<64x64xf16>> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+
+  %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+  // CHECK: amdg.async_tdm_copy_global_to_local
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: ttg.local_load
+  %load = ttg.local_load %slot0_r : !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable> -> tensor<64x64xf16, #blocked_wl>
+
+  tt.return
+}
+
+}
