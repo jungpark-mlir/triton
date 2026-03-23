@@ -699,6 +699,25 @@ To integrate Presburger-based disjointness checking:
     return true (conservative)
 ```
 
+### Adoption: Replace, Not Layer
+
+Presburger handles every pattern that `BufferIndexExpr` handles (`remsi`,
+`addi`, `select/cmpi`) and more (`andi`, nested modulo, `muli` by
+constant). Having both at runtime is technically redundant — Presburger is
+a strict superset. The choice is between the two, not a layered
+combination:
+
+| | BufferIndexExpr | Presburger |
+|---|---|---|
+| **When to choose** | Sufficient for current patterns, minimal dependency | Need broader pattern coverage or future-proofing |
+| **Trade-off** | Simpler (~110 LOC), no build dep, ~ns | More general (~200-300 LOC), `MLIRPresburger` dep, ~µs |
+
+If the patterns emitted by the pipeliner and Gluon remain limited to
+`remsi` / `addi` / `select+cmpi`, `BufferIndexExpr` is the simpler
+choice. If more complex index idioms emerge (power-of-2 bitwise AND,
+multi-level indexing, nested modulo), switching to Presburger avoids
+ongoing pattern-matcher maintenance.
+
 ## 6. Further Extension: Loop-Carried Induction Variables
 
 The initial Presburger design (Section 3.1) builds constraints by walking
