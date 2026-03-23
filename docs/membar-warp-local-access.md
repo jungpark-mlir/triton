@@ -53,7 +53,71 @@ offset = Σ(reg_bit_i × reg_base_i) ⊕ Σ(lane_bit_j × lane_base_j)
          ⊕ Σ(warp_bit_k × warp_base_k)
 ```
 
-where `⊕` is XOR (addition in GF(2)).
+where `⊕` is XOR (addition in GF(2)). See below for what GF(2) means and
+why `LinearLayout` uses it.
+
+### GF(2): The Arithmetic Behind LinearLayout
+
+**GF(2)** (Galois Field of order 2) is arithmetic on just two values,
+`{0, 1}`, with two operations:
+
+```
+  GF(2) addition (= XOR):          GF(2) multiplication (= AND):
+
+  0 + 0 = 0                        0 × 0 = 0
+  0 + 1 = 1                        0 × 1 = 0
+  1 + 0 = 1                        1 × 0 = 0
+  1 + 1 = 0  ← key difference!     1 × 1 = 1
+```
+
+The crucial property: `1 + 1 = 0`, not 2. There are no carries. This is
+exactly bitwise XOR. And multiplication is exactly bitwise AND.
+
+**A vector over GF(2)** is simply a bit pattern. For example, `[0,1,0,0]`
+is a 4-bit vector. Adding two vectors means XOR-ing them bitwise:
+
+```
+  [1, 0, 1, 0]  ⊕  [0, 1, 1, 0]  =  [1, 1, 0, 0]
+       ↑                  ↑                 ↑
+   basis A            basis B           A XOR B
+```
+
+**Why LinearLayout uses GF(2).** GPU shared memory layouts often use
+XOR-based swizzling to avoid bank conflicts. The address each thread
+accesses is not a simple sum of coordinates — it's a XOR combination.
+`LinearLayout` models this directly: each input bit (from register index,
+lane ID, or warp ID) selects a basis vector (via AND), and all selected
+basis vectors are combined via XOR:
+
+```
+  Concrete example: 2 lanes, 2 warps, 2 register elements
+
+  Basis vectors (each maps one input bit to offset bits):
+    register bit 0:  [0, 0, 0, 1]     ← offset bit 0
+    lane bit 0:      [0, 0, 1, 0]     ← offset bit 1
+    warp bit 0:      [0, 1, 0, 0]     ← offset bit 2
+
+  Thread (reg=1, lane=1, warp=0):
+    offset = (1 AND [0,0,0,1]) XOR (1 AND [0,0,1,0]) XOR (0 AND [0,1,0,0])
+           = [0,0,0,1] XOR [0,0,1,0] XOR [0,0,0,0]
+           = [0,0,1,1]  → offset 3
+
+  Thread (reg=1, lane=1, warp=1):
+    offset = [0,0,0,1] XOR [0,0,1,0] XOR [0,1,0,0]
+           = [0,1,1,1]  → offset 7
+
+  Warp 0 accesses: {0, 1, 2, 3}    (offsets 0-3)
+  Warp 1 accesses: {4, 5, 6, 7}    (offsets 4-7)
+  → disjoint, because the warp basis [0,1,0,0] flips a bit that
+    no register/lane combination can produce
+```
+
+**Linear independence over GF(2)** means: no vector in a set can be
+produced by XOR-ing any combination of the others. In practical terms,
+each basis vector contributes a unique bit pattern that cannot be
+replicated by combining other basis vectors. This is exactly what
+determines whether changing the warp ID produces an address that some
+other register/lane combination could also reach.
 
 ### Warp-Disjoint vs Cross-Warp Access
 
@@ -97,10 +161,24 @@ Addr_X(w) = { cvt_X(r, l, w, b) | ∀ register indices r, ∀ lane ids l }
 ∀ w ≠ w':  Addr_A(w) ∩ Addr_B(w') = ∅
 ```
 
-### GF(2) Independence Check
+### The Key Insight
 
-Since `LinearLayout` uses GF(2) arithmetic, this reduces to checking
-**linear independence** of basis vectors.
+The question "can two different warps access the same address?" becomes
+a question about GF(2) linear algebra:
+
+- Each warp ID is a different bit pattern (warp 0 = `00`, warp 1 = `01`,
+  warp 2 = `10`, warp 3 = `11` for 4 warps).
+- The warp ID bits select warp basis vectors via AND, then XOR them into
+  the offset.
+- If the warp basis vectors are **linearly independent** of the
+  register/lane basis vectors, then changing the warp ID flips offset
+  bits that no register/lane combination can compensate for. The
+  resulting address ranges are guaranteed disjoint.
+- If a warp basis vector **can** be produced by XOR-ing some register/lane
+  basis vectors, then a different warp could reach the same address by
+  toggling different register/lane bits. The address ranges overlap.
+
+### GF(2) Independence Check
 
 For a single composed layout `cvt`, let:
 - `R ∪ L` = basis vectors from `register` and `lane` dimensions
@@ -108,6 +186,12 @@ For a single composed layout `cvt`, let:
 
 **Theorem**: The per-warp address sets are disjoint if and only if
 `rank(R ∪ L ∪ W) = rank(R ∪ L) + |W|` over GF(2).
+
+In plain terms: put all basis vectors (register, lane, and warp) into a
+matrix and count the number of linearly independent rows (the rank). If
+adding the warp rows increases the rank by exactly the number of warp
+rows, they are independent — no warp basis can be built from
+register/lane bases.
 
 When warp bases are independent, different warp IDs flip offset bits that
 no register/lane combination can toggle:
@@ -130,6 +214,28 @@ no register/lane combination can toggle:
     Warp 1: offsets [0x20, 0x40)
     Warp 2: offsets [0x40, 0x60)
     Warp 3: offsets [0x60, 0x80)    → all disjoint ✓
+```
+
+Counter-example — when warp bases are NOT independent (cross-warp):
+
+```
+  Example: warp basis overlaps with register basis
+
+  register bases:  [ 0 0 0 0 0 0 0 1 ]   ← bit 0
+                   [ 0 0 0 0 0 0 1 0 ]   ← bit 1
+                   [ 0 0 1 0 0 0 0 0 ]   ← bit 5  ← same as warp!
+  lane bases:      [ 0 0 0 0 1 0 0 0 ]   ← bit 3
+                   [ 0 0 0 1 0 0 0 0 ]   ← bit 4
+  ─────────────────────────────────────
+  warp bases:      [ 0 0 1 0 0 0 0 0 ]   ← bit 5  ← NOT independent
+
+  rank(R ∪ L) = 5,  rank(R ∪ L ∪ W) = 5  (warp row adds nothing)
+  5 ≠ 5 + 1 → NOT independent
+
+  What happens: warp 0 with reg bit 2 set → offset has bit 5 set
+                warp 1 with reg bit 2 clear → offset also has bit 5 set
+                → same address reached by different (warp, reg) combos
+                → address ranges overlap → barrier needed
 ```
 
 For a **pair** of operations, both composed layouts must satisfy this check,
@@ -431,7 +537,8 @@ reduce barriers.
 | Operation | Write Warp-Disjoint? | Read Warp-Disjoint? | Barrier? |
 |-----------|:--------------------:|:--------------------:|:--------:|
 | TDM copy → local_load (matching partition) | Yes | Yes | **No** |
-| TDM copy → local_load (MMA layout) | Yes | Usually no | **Yes** |
+| TDM copy → local_load (batched MMA, warps across batch) | Yes | Yes | **No** |
+| TDM copy → local_load (standard MMA, K broadcast) | Yes | Usually no | **Yes** |
 | NVIDIA async_copy → local_load | Depends | Depends | Usually **yes** |
 | local_store → local_load (warp-local) | Depends | Depends | **No** if both |
 
