@@ -89,13 +89,17 @@ verification.
 ### Problem 2: Warp-Local Shared Memory Access
 
 **[membar-warp-local-access.md](membar-warp-local-access.md)**
-— Design document for detecting and exploiting warp-local access patterns.
-When a shared memory layout (expressed as a `LinearLayout`) guarantees that
-each warp accesses a disjoint partition, no CTA-wide barrier is needed between
-operations by different warps. Proposes a GF(2) linear independence test on
-the composed `register × lane × warp → address` layout to detect this
-property, and extends the analysis to MMA dot operand loads, `async_copy`,
-and TDM copies.
+— Design and implementation of warp-local barrier suppression. When a shared
+memory layout guarantees each warp accesses a disjoint partition, a CTA-wide
+barrier is unnecessary. **Implemented** via `warpsPerCTA` comparison with a
+bijection argument (commit
+[`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe)):
+if both writer and reader distribute warps identically, the shared encoding's
+bijection property guarantees disjoint byte-address partitioning. Currently
+scoped to `AsyncTDMCopyGlobalToLocalOp` pairs. The originally proposed GF(2)
+linear independence test is documented as a design alternative but was not
+implemented — the `warpsPerCTA` comparison is simpler, handles padded layouts,
+and covers all practical cases.
 
 ---
 
@@ -124,7 +128,7 @@ and TDM copies.
 **To understand the alternative (attribute-based) approach:**
 → [membar-buffer-slot-coloring.md](membar-buffer-slot-coloring.md)
 
-**To understand the warp-local barrier elimination problem:**
+**To understand the warp-local barrier elimination (implemented):**
 → [membar-warp-local-access.md](membar-warp-local-access.md)
 
 ---
@@ -154,6 +158,6 @@ and TDM copies.
          │                                                 │
          └── Problem 2: Warp-Local Access ─────────────────┘
                  │
-                 └── membar-warp-local-access.md
-                     (LinearLayout, GF(2) test, MMA, TDM)
+                 └── membar-warp-local-access.md  ← IMPLEMENTED
+                     (warpsPerCTA comparison + bijection argument)
 ```

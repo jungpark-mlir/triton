@@ -440,6 +440,15 @@ the current iteration and one for the next:
 
 ### 3.3 Warp-Specialized Pipeline Buffers
 
+> **Note**: The basic warp-local access problem (Problem 2 in the doc set)
+> has been solved via `warpsPerCTA` comparison with a bijection argument
+> (commit [`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe)).
+> That approach compares static encoding metadata and works for all current
+> cases. The Presburger formulation below would be relevant for more complex
+> warp-partition patterns where the partition depends on dynamic values or
+> non-trivial address arithmetic — e.g., warp-specialized pipelines with
+> asymmetric producer/consumer partitioning.
+
 In warp-specialized pipelines (e.g., Gluon tutorial `08-warp-specialization`),
 different warps may access different regions of shared memory as part of a
 producer-consumer handoff. Presburger constraints can formalize the

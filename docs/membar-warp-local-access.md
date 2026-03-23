@@ -20,6 +20,111 @@ cases, the barrier is unnecessary — there is no cross-warp data dependency.
         ↑ no cross-warp overlap → barrier unnecessary
 ```
 
+## Implementation Status
+
+**Implemented** in commit
+[`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe)
+via the `warpsPerCTA` comparison approach (see "Implemented Detection"
+below). The GF(2) linear independence approach described later in this
+document was the original design proposal but was superseded during
+implementation by a simpler and strictly more general method.
+
+### Implemented Detection: warpsPerCTA Comparison
+
+The implemented check compares the `warpsPerCTA` distribution on both
+the write and read sides. If both operations distribute warps identically
+across tensor dimensions, each warp owns the same partition of tensor
+elements on both sides.
+
+The key insight is the **bijection argument**: all Triton shared memory
+encodings (padded, swizzled, linear, rotating) are bijections from
+tensor elements to byte addresses. Swizzling permutes which byte offset
+a `(row, col)` pair maps to, but never collapses two distinct elements
+onto the same address. Therefore, identical tensor-space partitioning
+implies disjoint byte-address partitioning — regardless of encoding.
+
+```
+  Writer (TDM copy)                 Reader (local_load)
+  warpsPerCTA = [4, 1]              warpsPerCTA = [4, 1]
+
+  Tensor space (elements):          Tensor space (elements):
+  ┌──────────────────┐              ┌──────────────────┐
+  │ W0: rows  0-15   │              │ W0: rows  0-15   │
+  ├──────────────────┤              ├──────────────────┤
+  │ W1: rows 16-31   │              │ W1: rows 16-31   │
+  ├──────────────────┤              ├──────────────────┤
+  │ W2: rows 32-47   │              │ W2: rows 32-47   │
+  ├──────────────────┤              ├──────────────────┤
+  │ W3: rows 48-63   │              │ W3: rows 48-63   │
+  └──────────────────┘              └──────────────────┘
+         │                                 │
+         │  shared encoding                │  shared encoding
+         │  (bijection)                    │  (bijection)
+         ▼                                 ▼
+  Byte addresses:                   Byte addresses:
+  ┌──────────────────┐              ┌──────────────────┐
+  │ W0: addr set A   │              │ W0: addr set A   │
+  ├──────────────────┤              ├──────────────────┤
+  │ W1: addr set B   │              │ W1: addr set B   │
+  ├──────────────────┤              ├──────────────────┤
+  │ W2: addr set C   │              │ W2: addr set C   │
+  ├──────────────────┤              ├──────────────────┤
+  │ W3: addr set D   │              │ W3: addr set D   │
+  └──────────────────┘              └──────────────────┘
+  A∩B = B∩C = ... = ∅              A∩B = B∩C = ... = ∅
+
+  Key: bijection means distinct elements → distinct addresses.
+  Same warp partition in tensor space → same disjoint partitions
+  in address space, regardless of encoding (padded, swizzled, etc.)
+```
+
+Trailing 1s in `warpsPerCTA` are stripped before comparison to handle
+rank changes from `memdesc_reshape`/`trans` (e.g., `[4,1]` matches
+`[4,1,1]`).
+
+### Why This Supersedes GF(2)
+
+The GF(2) approach operates on `LinearLayout` basis vectors and proves
+disjointness via linear independence over GF(2). While mathematically
+elegant, it has practical limitations:
+
+1. **Fails for padded layouts.** Non-power-of-2 strides cause carry
+   interactions that GF(2) (XOR-only arithmetic) cannot model. The
+   primary motivating use case (FA MQA decode) uses padded shared
+   layouts.
+
+2. **Requires `LinearLayout` computation.** The composed layout must be
+   computed during membar analysis, adding complexity.
+
+3. **No additional coverage.** The warpsPerCTA comparison covers all
+   practical cases where warp-local access matters. The only theoretical
+   case GF(2) catches but warpsPerCTA does not is 2D warp distributions
+   (e.g., `warpsPerCTA = [2, 2]`) where warps partition both rows and
+   columns simultaneously. In practice, such layouts are cross-warp
+   (MMA operands with K-broadcast) and the optimization doesn't apply.
+
+The bijection argument is stronger: it works for **all** shared memory
+encodings without needing to inspect the address computation at all.
+
+### Integration
+
+The check is implemented as a new `filterWarpLocalAccesses` clause in
+the AMD `membarFilter` in `MembarUtility.cpp`:
+
+```cpp
+bool membarFilter(...) {
+  return (filterAsyncLocalLoadsDependencies(...) ||
+          filterLDSMemoryBarriersDependencies(...) ||
+          filterWarpLocalAccesses(op1, op2));  // NEW
+}
+```
+
+Currently scoped to operation pairs involving `AsyncTDMCopyGlobalToLocalOp`
+to avoid changing barrier behavior for existing non-TDM code paths. The
+`hasMatchingWarpDistribution` helper extracts `warpsPerCTA` from either
+a TDM op (via `tdmGetWarpDistribution`) or a register-side op (via
+the encoding's `getWarpsPerCTA`), normalizes trailing 1s, and compares.
+
 ## Background: How Addresses Are Computed
 
 ### Composed Layout
@@ -148,7 +253,13 @@ instead of a CTA-wide barrier and avoids clearing CTA-wide pending
 dependencies. This mechanism is limited to `ConvertLayoutOp` scratch
 buffers.
 
-## Detection via GF(2) Linear Independence
+## Design Alternative: GF(2) Linear Independence
+
+> **Note**: This was the original design proposal. The implementation uses
+> the simpler `warpsPerCTA` comparison with the bijection argument instead
+> (see "Implementation Status" above). This section is retained as
+> background for understanding the `LinearLayout` address model and for
+> cases where finer-grained analysis might be needed in the future.
 
 ### Formal Condition
 
@@ -341,7 +452,10 @@ composed layout. Consider operand A with `warpsPerCTA = {4, 1}`, shape
   (from column index) after XOR → NOT independent → cross-warp ✗
 ```
 
-The GF(2) check handles both cases correctly.
+The `warpsPerCTA` comparison handles both cases correctly: matching
+`warpsPerCTA` on both sides means warp-disjoint, mismatching means
+cross-warp (barrier needed). The GF(2) check (design alternative)
+would also distinguish them, though it was not implemented.
 
 ## Batched MMA (Warps Across Batch Dimension)
 
@@ -412,22 +526,22 @@ In batched MMA, warps are across the batch dimension. There is **no
 K-dimension broadcast** — each warp has its own K data entirely. This
 makes it a simpler case: the warp dimension selects which batch element
 (which `BLOCK_N × HEAD_SZ` block in shared memory), and each warp's
-register/lane bases address only within that block.
+threads address only within that block.
 
 ### Detection
 
-The GF(2) independence check applies directly:
+The `warpsPerCTA` comparison detects this case directly:
 
-- **TDM write side**: warp-disjoint by construction (TDM layout assigns
-  each warp a contiguous row block).
-- **Local_load (WMMA operand) side**: the composed layout maps warps to
-  different row blocks. If the shared encoding is non-swizzled, warp bases
-  map to high-order row-offset bits, independent of register/lane bases.
+- **TDM write side**: `tdmGetWarpDistribution` returns `warpsPerCTA`
+  matching the block shape partitioning (e.g., `[4, 1]` for 4 warps
+  distributed along rows).
+- **Local_load (WMMA operand) side**: the distributed encoding's
+  `warpsPerCTA` from `getWarpsPerCTA` (e.g., `[4, 1]` for batched WMMA
+  with all warps along the batch/M dimension).
 
-The conditions for this to work are the same as for standard MMA operands:
-non-swizzled (or warp-compatible swizzled) shared encoding required. See
-"Padded and Non-Power-of-2 Shared Layouts" below for an additional
-consideration relevant to this case.
+If both sides report the same normalized `warpsPerCTA`, the bijection
+argument guarantees disjoint byte-address partitioning regardless of
+shared encoding (padded, swizzled, or otherwise).
 
 ## Async Copy, TDM Copy, and Async Wait
 
@@ -504,7 +618,9 @@ NVIDIA's `cp.async` is a **per-thread** async copy. Each thread independently
 copies its assigned elements. The destination address depends on the shared
 encoding. With `SwizzledSharedEncodingAttr`, swizzling mixes lane and warp
 bits, making writes cross-warp. Whether the write pattern is warp-disjoint
-can be checked with the same GF(2) independence test on the composed layout.
+can be checked with the same `warpsPerCTA` comparison (or the GF(2) design
+alternative). The current implementation is scoped to AMD TDM ops and does
+not cover NVIDIA `cp.async`.
 
 ### `async_wait` Semantics
 
@@ -529,8 +645,8 @@ results are visible in shared memory:
 ```
 
 The existing AMD membar filter handles DMA-completion sequencing (token chain
-to `async_wait`). Warp-disjointness is an orthogonal check that could further
-reduce barriers.
+to `async_wait`). Warp-disjointness is an orthogonal check that further
+reduces barriers when the access pattern is warp-local.
 
 ### Interaction Summary
 
@@ -544,34 +660,39 @@ reduce barriers.
 
 ## Integration with Membar
 
-### Option A: Filter Function
+**Implemented**: `MembarFilterFn` in the AMD backend (Option A below).
 
-Add a filter (similar to the AMD async-write filter) that checks
-warp-disjointness for a pair of operations:
+### Option A: Filter Function (Implemented)
+
+The warp-local check is implemented as a `filterWarpLocalAccesses`
+clause in the AMD `membarFilter` (`MembarUtility.cpp`). The filter
+receives both operations in a potential RAW/WAR/WAW pair and returns
+`true` to suppress the barrier when `warpsPerCTA` distributions match.
 
 ```
   membar analysis
        │
        ▼
-  ┌─────────────────────────────────────────┐
-  │ AllocationSlice::intersects()           │
-  │  1. Check allocation interval overlap   │
-  │  2. Check BufferIndexExpr disjointness  │  ← buffer slot
-  │  3. Check warp-disjointness (NEW)       │  ← per-warp partition
-  │  4. Check subslice overlap              │
-  └─────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────┐
+  │ BlockInfo::isIntersected()                           │
+  │   for each (slice, ops) pair with overlapping slices │
+  │     → MembarFilterFn(op1, op2, ...)                  │
+  │       1. filterAsyncLocalLoadsDependencies (existing) │
+  │       2. filterLDSMemoryBarriersDependencies          │
+  │       3. filterWarpLocalAccesses (NEW)                │
+  │          → hasMatchingWarpDistribution(op1, op2)      │
+  │            compares normalized warpsPerCTA             │
+  └──────────────────────────────────────────────────────┘
 ```
 
-For step 3, compute the composed layouts from both operations and run the
-GF(2) independence check. If both layouts have independent warp bases with
-matching partitions, return `false` (no intersection).
+**Pros**: Fits the existing architecture. Has access to both operations
+(needed to extract encoding metadata). No `LinearLayout` computation.
 
-**Pros**: Composable with existing checks. Single point of implementation.
+**Current scope**: Only fires when at least one op is
+`AsyncTDMCopyGlobalToLocalOp`. Can be extended to `local_store` /
+`local_load` pairs in the future.
 
-**Cons**: Requires computing composed layouts during membar analysis. The
-register-side layout must be available from the operation's tensor type.
-
-### Option B: Pre-Analysis Annotation
+### Option B: Pre-Analysis Annotation (Not implemented)
 
 A pre-pass annotates `local_store`/`local_load` ops with a `warp_disjoint`
 attribute when the layout guarantees warp-local access. Membar checks this
@@ -585,12 +706,14 @@ attribute.
 
 ### When This Optimization Applies
 
-1. **Blocked register layout with non-swizzled shared layout**: The warp
-   dimension naturally partitions both the register and shared address spaces.
+1. **Blocked register layout with matching warp distribution**: The
+   `warpsPerCTA` on the write and read sides match, and each warp owns
+   a disjoint partition of tensor elements. Works with any shared encoding
+   (padded, swizzled, linear) due to the bijection argument.
 
-2. **MMA dot operand with non-swizzled shared layout**: When `warpsPerCTA`
-   partitions the M (or N) dimension and the shared layout maps rows (or
-   columns) to contiguous, non-overlapping offset ranges.
+2. **MMA dot operand with matching warp distribution**: When `warpsPerCTA`
+   partitions the M (or N) dimension identically on both sides. The shared
+   encoding is irrelevant — the bijection guarantees address disjointness.
 
 3. **Batched MMA with warps across batch dimension**: Each warp executes
    an independent MMA on its own partition (e.g., FA MQA decode with
@@ -603,19 +726,21 @@ attribute.
 
 ### When This Does NOT Apply
 
-1. **Swizzled shared encodings** (for GF(2) check): XOR-mixing of row/column
-   bits breaks warp independence in the `LinearLayout` representation.
+1. **Mismatched warp distributions**: When the writer and reader distribute
+   warps differently (e.g., TDM writes with `[4, 1]` but MMA reads with
+   `[2, 2]` due to K-broadcast). The `warpsPerCTA` comparison correctly
+   rejects these.
 
-2. **Padded shared encodings** (for GF(2) check): Non-power-of-2 row strides
-   are not faithfully representable in GF(2) arithmetic. The warp-disjointness
-   property still holds geometrically — use the integer row-range check or
-   unpadded-equivalent check instead (see above).
+2. **Cross-warp MMA operand loading**: When the MMA layout requires each warp
+   to read data from multiple warp regions (K-broadcast in standard MMA).
 
-3. **Cross-warp MMA operand loading**: When the MMA layout requires each warp
-   to read data from multiple warp regions.
-
-4. **Cooperative DMA patterns**: Where the shared encoding distributes writes
+3. **Cooperative DMA patterns**: Where the shared encoding distributes writes
    across all warps.
+
+4. **Non-TDM code paths** (current scope limitation): The implementation
+   currently only fires when at least one operation is
+   `AsyncTDMCopyGlobalToLocalOp`. The `warpsPerCTA` comparison logic itself
+   is general and could be extended to `local_store`/`local_load` pairs.
 
 ### Padded and Non-Power-of-2 Shared Layouts
 
@@ -640,9 +765,23 @@ non-overlapping regardless of stride:
                                    → still disjoint ✓
 ```
 
-**However, the GF(2) detection mechanism cannot verify it.** `LinearLayout`
-computes offsets via XOR (GF(2) addition), which equals integer addition
-only when there are no carries. A row stride with multiple bits set (e.g.,
+**The implemented `warpsPerCTA` comparison handles padded layouts
+natively.** Because the check operates on tensor-space warp partitioning
+rather than byte addresses, padding is irrelevant — the bijection
+argument guarantees that identical warp distributions produce disjoint
+byte ranges regardless of the encoding's stride or swizzling. This was a
+key advantage over the GF(2) approach, which cannot model non-power-of-2
+strides.
+
+The FA MQA decode case (the primary motivation) uses
+`PaddedSharedEncodingAttr` (e.g., `padded_shared<[32:+4]>` → stride
+272 bytes). The implementation correctly suppresses barriers in this
+case because `warpsPerCTA` comparison does not inspect address
+computation at all.
+
+**Why GF(2) fails here** (for reference): `LinearLayout` computes
+offsets via XOR (GF(2) addition), which equals integer addition only
+when there are no carries. A row stride with multiple bits set (e.g.,
 144 = `0b10010000`) produces carry interactions when multiple row-index
 bits are combined:
 
@@ -653,35 +792,6 @@ bits are combined:
   row = 2:  GF(2): 6     integer: 6     ✓ (matches)
   row = 3:  GF(2): 3⊕6=5 integer: 9     ✗ (carry breaks it)
 ```
-
-When `toLinearLayout` produces basis vectors for such a layout, the XOR
-composition does not faithfully reproduce the actual integer address
-computation. The GF(2) independence check may give incorrect results.
-
-**Alternative detection approaches for padded layouts:**
-
-1. **Row-range check (integer arithmetic).** If warps are distributed
-   along a single contiguous dimension (e.g., rows) and each warp gets a
-   contiguous block of rows, the byte ranges `[w * rows_per_warp * stride,
-   (w+1) * rows_per_warp * stride)` are trivially disjoint regardless of
-   stride value. This check uses integer arithmetic and does not require
-   `LinearLayout` at all.
-
-2. **Check the unpadded equivalent.** If the only difference is the row
-   stride (padding), verify GF(2) independence on the unpadded layout. If
-   warp bases are independent in the unpadded version, they are independent
-   in the padded version too — padding widens each warp's byte range
-   without causing overlap.
-
-3. **Use encoding metadata directly.** `PartitionedSharedEncodingAttr`
-   (used for TDM on gfx1250) carries the warp-partitioning information
-   explicitly. The check could read the partitioning from the encoding
-   rather than deriving it from basis vectors.
-
-For the FA MQA decode case, approach 1 is the most practical: TDM
-distributes warps along the row dimension, and each warp's WMMA reads
-from its own contiguous row range. The stride value is irrelevant to
-disjointness — only the row assignment matters.
 
 ### Interaction with Multi-Buffering
 
@@ -696,7 +806,7 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
   │ │┌───┬─────┐│           │         │ │     proves slot
   │ ││W0 │ W1  ││           │         │ │     disjointness
   │ │├───┼─────┤│           │         │ │
-  │ ││W2 │ W3  ││           │         │ │  ← GF(2) check proves
+  │ ││W2 │ W3  ││           │         │ │  ← warpsPerCTA check proves
   │ │└───┴─────┘│           │         │ │     warp disjointness
   │ └───────────┴───────────┴─────────┘ │     within a slot
   └─────────────────────────────────────┘
@@ -704,12 +814,14 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
 
 ## Summary
 
-| Aspect | Current State | Proposed |
-|--------|--------------|----------|
-| **Warp awareness** | `ConvertLayoutOp` scratch only (`isCvtDimSync`) | General shared memory ops via GF(2) independence |
-| **Detection** | Trivial-over-warp check | GF(2) Gaussian elimination; integer row-range check for padded layouts |
-| **Async/TDM** | Not considered | TDM write-side disjoint; full result requires checking consumer layout too |
-| **MMA operands** | Assumed cross-warp | Checkable per-configuration via composed layout |
-| **Batched MMA** | Not distinguished from standard MMA | Simpler case: no K-broadcast, each warp fully independent |
-| **Padded layouts** | Not considered | Property holds; GF(2) inapplicable, use integer row-range check |
-| **Scope** | Situational; most encodings are cross-warp by design | Same, but catches cases where layout happens to be warp-local |
+| Aspect | Before | Implemented |
+|--------|--------|-------------|
+| **Warp awareness** | `ConvertLayoutOp` scratch only (`isCvtDimSync`) | General shared memory ops via `warpsPerCTA` comparison + bijection argument |
+| **Detection** | Trivial-over-warp check | `warpsPerCTA` comparison with trailing-1 normalization |
+| **Async/TDM** | Not considered | TDM `warpsPerCTA` via `tdmGetWarpDistribution`; consumer `warpsPerCTA` from distributed encoding |
+| **MMA operands** | Assumed cross-warp | Checkable; batched MMA with matching distributions detected |
+| **Batched MMA** | Not distinguished from standard MMA | Detected: warps across batch dimension → matching `warpsPerCTA` → barrier suppressed |
+| **Padded layouts** | Not considered | Handled natively (bijection argument is encoding-agnostic) |
+| **Swizzled layouts** | Not considered | Handled natively (bijection argument: swizzle permutes but never collapses addresses) |
+| **Scope** | Situational | Currently TDM op pairs only; extensible to `local_store`/`local_load` |
+| **GF(2) approach** | N/A | Not implemented; superseded by simpler `warpsPerCTA` comparison |
