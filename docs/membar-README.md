@@ -91,15 +91,18 @@ verification.
 **[membar-warp-local-access.md](membar-warp-local-access.md)**
 — Design and implementation of warp-local barrier suppression. When a shared
 memory layout guarantees each warp accesses a disjoint partition, a CTA-wide
-barrier is unnecessary. **Implemented** via `warpsPerCTA` comparison with a
-bijection argument (commit
+barrier is unnecessary. **Implemented** via `warpsPerCTA` comparison (commit
 [`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe)):
-if both writer and reader distribute warps identically, the shared encoding's
-bijection property guarantees disjoint byte-address partitioning. Currently
-scoped to `AsyncTDMCopyGlobalToLocalOp` pairs. The originally proposed GF(2)
-linear independence test is documented as a design alternative but was not
-implemented — the `warpsPerCTA` comparison is simpler, handles padded layouts,
-and covers all practical cases.
+if both writer and reader distribute warps identically, and every tensor
+element gets a unique address (one-to-one mapping), the byte-address
+partitions are disjoint. Currently scoped to `AsyncTDMCopyGlobalToLocalOp`
+pairs; extends naturally to `AsyncCopyGlobalToLocalOp` and
+`local_store`/`local_load`. Also documents a proposed change to the
+`MemWaitOpTrait` handler to allow the `MembarFilterFn` to suppress the
+unconditional CTA barrier after `async_wait` in warp-disjoint pipelines.
+The originally proposed GF(2) linear independence test is documented as a
+design alternative but was not implemented — the `warpsPerCTA` comparison is
+simpler, handles padded layouts, and covers all practical cases.
 
 ---
 
@@ -159,5 +162,5 @@ and covers all practical cases.
          └── Problem 2: Warp-Local Access ─────────────────┘
                  │
                  └── membar-warp-local-access.md  ← IMPLEMENTED
-                     (warpsPerCTA comparison + bijection argument)
+                     (warpsPerCTA comparison + one-to-one address mapping)
 ```

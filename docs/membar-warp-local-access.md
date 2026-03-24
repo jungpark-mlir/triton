@@ -420,7 +420,8 @@ results are visible in shared memory:
 - **NVIDIA**: Per-thread `cp.async.wait_group`. Cross-warp visibility
   requires a subsequent `__syncthreads()`.
 
-`async_wait` is **not an obstacle** to the warp-local optimization:
+`async_wait` is **not a conceptual obstacle** to the warp-local
+optimization — each warp reads only what it wrote:
 
 ```
   Timeline (warp-disjoint case):
@@ -432,13 +433,20 @@ results are visible in shared memory:
   → async_wait is sufficient, no CTA barrier needed
 ```
 
+However, there is a **practical obstacle**: the membar analysis
+unconditionally inserts a CTA barrier after every `MemWaitOpTrait` op
+(including `async_wait`), bypassing the `MembarFilterFn` entirely. See
+[`MemWaitOpTrait`: Unconditional Barrier Problem](#memwaitoptrait-unconditional-barrier-problem)
+for details and a proposed solution.
+
 ### Interaction Summary
 
 | Operation | Write warpsPerCTA | Read warpsPerCTA | Match? | Barrier? |
 |-----------|:-:|:-:|:-:|:-:|
 | TDM → local_load (batched MMA) | `[4,1]` | `[4,1]` | Yes | **No** |
 | TDM → local_load (standard MMA, K-broadcast) | `[4,1]` | `[2,2]` | No | **Yes** |
-| NVIDIA async_copy → local_load | N/A | N/A | — | Not in scope |
+| async_copy → local_load (matching) | from src encoding | from dst encoding | If match | **No** |
+| async_copy → local_load (mismatched) | from src encoding | from dst encoding | If mismatch | **Yes** |
 | local_store → local_load | Encoding | Encoding | If match | Extensible |
 
 ## Integration with Membar
@@ -473,16 +481,157 @@ bool membarFilter(Operation *op1, Operation *op2, ...) {
 ```
 
 **Current scope**: Only fires when at least one op is
-`AsyncTDMCopyGlobalToLocalOp`. Can be extended to `local_store` /
-`local_load` pairs in the future.
+`AsyncTDMCopyGlobalToLocalOp`. Extensible to `AsyncCopyGlobalToLocalOp`,
+`local_store`/`local_load` pairs, and `MemWaitOpTrait` barrier
+suppression (see sections below).
 
-### Existing Warp-Level Sync Detection
+### Relationship to `isCvtDimSync` (ConvertLayoutOp)
 
-Triton already has a partial version of this concept for `ConvertLayoutOp`
-scratch buffers. `isCvtDimSync` checks if the conversion's composed layout
-is trivial over the warp dimension. When true, membar emits `warp.sync`
-instead of a CTA-wide barrier. This mechanism is limited to `ConvertLayoutOp`
-scratch buffers and does not generalize to TDM or `local_store`/`local_load`.
+Triton already has warp-level sync detection for `ConvertLayoutOp` via
+`isCvtDimSync` (`lib/Analysis/Utility.cpp`), recently improved by
+[PR #9778](https://github.com/triton-lang/triton/pull/9778). These two
+solutions address the same conceptual question — "does data cross warp
+boundaries?" — but operate on **different codepaths** and handle
+**different op types**.
+
+**`isCvtDimSync`** handles `ConvertLayoutOp`, which is a single op that
+internally allocates a scratch buffer, writes, syncs, and reads. Membar
+treats this as a special case (the `scratchBufferId` path in `Membar.cpp`):
+
+```cpp
+if (auto cvt = dyn_cast<ConvertLayoutOp>(op)) {
+    auto srcLayout = triton::gpu::toLinearLayout(srcTy);
+    auto dstLayout = triton::gpu::toLinearLayout(dstTy);
+    isWarpSync = isCvtDimSync(srcLayout, dstLayout, kWarp);
+}
+```
+
+**`warpsPerCTA` comparison** handles separate write/read op pairs (TDM →
+local_load, async_copy → local_load, local_store → local_load). These are
+distinct operations in the IR, and the membar analysis checks barriers
+between them via the general `isIntersected` path and `MembarFilterFn`.
+
+The two solutions cannot substitute for each other:
+
+| | `isCvtDimSync` | `warpsPerCTA` comparison |
+|---|---|---|
+| **Op scope** | `ConvertLayoutOp` (single op, internal scratch) | Separate write/read op pairs |
+| **Membar codepath** | `scratchBufferId` branch (intra-op) | `isIntersected` + `MembarFilterFn` (inter-op) |
+| **Mechanism** | `LinearLayout` algebra (`invertAndCompose`, `isTrivialOver`) | Direct vector comparison |
+| **Handles broadcasting** | Yes — `getFreeVariableMasks` detects deduplication | Not needed — async copies and local_store don't broadcast |
+| **Barrier outcome** | Downgrades CTA → warp.sync (within the op) | Eliminates inter-op barrier entirely |
+
+**Why `isCvtDimSync` needs `LinearLayout` but `warpsPerCTA` does not:**
+`ConvertLayoutOp` can involve **broadcasting** — where the source or
+destination layout replicates a value across multiple threads. Broadcasting
+causes write deduplication: only one thread writes each unique value. This
+can create cross-warp dependencies even when `warpsPerCTA` matches, because
+a warp might not write every byte it later needs to read (another warp's
+thread handled that write during deduplication). The `getFreeVariableMasks`
+check in `isCvtDimSync` detects this. TDM copies, `async_copy`, and
+`local_store`/`local_load` don't broadcast — each element is written
+exactly once by exactly one warp — so the simpler `warpsPerCTA` check is
+sufficient.
+
+### Extension to `async_copy`
+
+The `warpsPerCTA` check naturally extends to `AsyncCopyGlobalToLocalOp`
+(NVIDIA `cp.async`, AMD `buffer_load_to_local`). The writer's `warpsPerCTA`
+comes from the source pointer tensor's distributed encoding; the reader's
+comes from the `local_load` result's distributed encoding. Both are
+standard `DistributedEncodingTrait` attributes — no vendor-specific API
+needed (unlike TDM which requires `tdmGetWarpDistribution`).
+
+```
+  async_copy_global_to_local:
+    src = TT_PtrTensor with distributed encoding → warpsPerCTA = [4, 1]
+    dst = MemDescType (shared memory)
+
+  local_load:
+    src = MemDescType (shared memory)
+    result = tensor with distributed encoding   → warpsPerCTA = [4, 1]
+
+  [4, 1] == [4, 1] → MATCH → barrier can be suppressed
+```
+
+This makes the `warpsPerCTA` check a strong candidate for common membar
+analysis code (not AMD-specific), since `async_copy` is used by both
+NVIDIA and AMD backends.
+
+### `MemWaitOpTrait`: Unconditional Barrier Problem
+
+The `warpsPerCTA` check in the `MembarFilterFn` cannot suppress all
+unnecessary barriers in async pipelines. The membar analysis has a
+separate, earlier codepath that inserts a CTA-wide barrier
+unconditionally after any op with `MemWaitOpTrait` (`async_wait`,
+`async_tdm_wait`, `async_tma_store_wait`):
+
+```cpp
+// Membar.cpp — MembarAnalysis::update()
+if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
+    !containsLocalBarrier(op->getNextNode())) {
+    builder->setInsertionPointAfter(op);
+    insertBarrier(op, builder);   // CTA-wide barrier
+    blockInfo->sync();            // clears all tracked dependencies
+    return;                       // early return — filter never consulted
+}
+```
+
+This handler fires **before** the `isIntersected` / `MembarFilterFn` path.
+It inserts a CTA barrier and returns — the filter is never consulted.
+After `sync()`, all tracked write/read dependencies are cleared, so the
+subsequent `local_load` sees a clean `blockInfo` and doesn't trigger any
+additional barrier.
+
+In a warp-disjoint pipeline:
+
+```
+  async_copy  → blockInfo records shared write
+  async_wait  → unconditional CTA barrier inserted, sync()  ← UNNECESSARY
+  local_load  → blockInfo is clean, no barrier needed
+```
+
+The CTA barrier after `async_wait` is unnecessary when warps are disjoint:
+`async_wait` ensures the data has arrived, and matching `warpsPerCTA`
+ensures each warp reads only what it wrote. No cross-warp synchronization
+is needed.
+
+**Proposed solution**: make the `MemWaitOpTrait` handler defer to the
+normal inter-op flow when a `MembarFilterFn` is provided. Instead of
+unconditionally inserting a barrier, let the pending writes stay in
+`blockInfo`. When the next read op arrives, `isIntersected` checks
+overlap and the filter decides based on `warpsPerCTA`:
+
+```cpp
+if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
+    !containsLocalBarrier(op->getNextNode())) {
+    if (!filter) {
+        // No filter → conservative: insert barrier now
+        builder->setInsertionPointAfter(op);
+        insertBarrier(op, builder);
+        blockInfo->sync();
+        return;
+    }
+    // With a filter: don't insert barrier here.
+    // Let the filter decide when the read op arrives.
+}
+```
+
+The resulting flow:
+
+```
+  async_copy  → blockInfo records shared write
+  async_wait  → filter present, no barrier inserted, pending writes stay
+  local_load  → curBlockInfo records shared read
+               isIntersected checks overlap
+               → MembarFilterFn(async_copy, local_load, ...)
+                 warpsPerCTA match → filter returns true → barrier suppressed
+```
+
+When `warpsPerCTA` does NOT match, the filter returns false, and
+`isIntersected` returns true, causing the normal CTA barrier to be
+inserted before the read op — same net effect as today, just at the
+read op instead of at `async_wait`.
 
 ## Applicability
 
@@ -502,10 +651,16 @@ scratch buffers and does not generalize to TDM or `local_store`/`local_load`.
    an independent MMA on its own partition (e.g., FA MQA decode with
    split-k). No K-dimension broadcast — strictly simpler than case 2.
 
-4. **Warp-specialized Gluon kernels**: Explicit per-warp shared memory
+4. **`async_copy` pipelines with matching warp distribution**: Same
+   check as TDM — writer `warpsPerCTA` from source tensor encoding,
+   reader `warpsPerCTA` from `local_load` result encoding. Combined with
+   the `MemWaitOpTrait` deferred-barrier approach, eliminates both the
+   inter-op barrier and the post-wait barrier.
+
+5. **Warp-specialized Gluon kernels**: Explicit per-warp shared memory
    partitioning.
 
-5. **Per-warp scratch buffers**: Warp-local reductions or shuffles.
+6. **Per-warp scratch buffers**: Warp-local reductions or shuffles.
 
 ### When This Does NOT Apply
 
@@ -520,10 +675,15 @@ scratch buffers and does not generalize to TDM or `local_store`/`local_load`.
 3. **Cooperative DMA patterns**: Where the shared encoding distributes writes
    across all warps.
 
-4. **Non-TDM code paths** (current scope limitation): The implementation
-   currently only fires when at least one operation is
-   `AsyncTDMCopyGlobalToLocalOp`. The `warpsPerCTA` comparison logic itself
-   is general and could be extended to `local_store`/`local_load` pairs.
+4. **`ConvertLayoutOp` with broadcasting**: Layout conversions where the
+   source or destination has free variables (broadcasting). These require
+   `LinearLayout`-based `isCvtDimSync` analysis, not `warpsPerCTA`
+   comparison, because write deduplication can create cross-warp dependencies.
+
+5. **Non-TDM/non-async_copy code paths** (current scope limitation): The
+   implementation currently only fires for `AsyncTDMCopyGlobalToLocalOp`.
+   Extension to `async_copy` and `local_store`/`local_load` is
+   straightforward — the `warpsPerCTA` comparison logic is the same.
 
 ### Interaction with Multi-Buffering
 
@@ -546,16 +706,18 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
 
 ## Summary
 
-| Aspect | Before | Implemented |
+| Aspect | Before | Implemented / Proposed |
 |--------|--------|-------------|
 | **Warp awareness** | `ConvertLayoutOp` scratch only (`isCvtDimSync`) | General shared memory ops via `warpsPerCTA` comparison + one-to-one address mapping |
 | **Detection** | Trivial-over-warp check | `warpsPerCTA` comparison with trailing-1 normalization |
 | **Async/TDM** | Not considered | TDM `warpsPerCTA` via `tdmGetWarpDistribution`; consumer `warpsPerCTA` from distributed encoding |
+| **`async_copy`** | Not considered | Extensible: writer `warpsPerCTA` from source encoding, reader from `local_load` encoding |
 | **MMA operands** | Assumed cross-warp | Checkable; batched MMA with matching distributions detected |
 | **Batched MMA** | Not distinguished from standard MMA | Detected: warps across batch dimension → matching `warpsPerCTA` → barrier suppressed |
+| **`MemWaitOpTrait`** | Unconditional CTA barrier after `async_wait` | Proposed: defer to `MembarFilterFn` when filter is present |
 | **Padded layouts** | Not considered | Handled natively (encoding-agnostic: each element always gets a unique address) |
 | **Swizzled layouts** | Not considered | Handled natively (swizzle shuffles addresses but never puts two elements at the same address) |
-| **Scope** | Situational | Currently TDM op pairs only; extensible to `local_store`/`local_load` |
+| **Scope** | Situational | TDM op pairs implemented; `async_copy`, `local_store`/`local_load`, `MemWaitOpTrait` extensible |
 
 ---
 

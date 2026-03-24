@@ -161,8 +161,11 @@ The warp-local shared memory access problem (Problem 2) has been
 implemented via a `warpsPerCTA` comparison in the AMD `membarFilter`
 (commit [`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe)).
 If both the writer and reader distribute warps identically across tensor
-dimensions, the shared encoding's bijection property guarantees disjoint
-byte-address partitioning — no CTA-wide barrier is needed. Currently
-scoped to `AsyncTDMCopyGlobalToLocalOp` pairs. See
+dimensions, and every tensor element gets a unique shared memory address
+(one-to-one mapping), the byte-address partitions are disjoint — no
+CTA-wide barrier is needed. Currently scoped to
+`AsyncTDMCopyGlobalToLocalOp` pairs; extends naturally to
+`AsyncCopyGlobalToLocalOp` and `local_store`/`local_load`. See
 [membar-warp-local-access.md](membar-warp-local-access.md) for full
-design and rationale.
+design, comparison with `isCvtDimSync`, and a proposed `MemWaitOpTrait`
+handler change.
