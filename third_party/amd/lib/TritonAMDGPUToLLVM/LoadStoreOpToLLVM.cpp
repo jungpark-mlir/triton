@@ -8,6 +8,7 @@
 #include "Utility.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -1866,6 +1867,61 @@ struct BufferStoreOpConversion
       : ConvertOpToLLVMPattern(converter, benefit),
         LoadStoreConversionBase(targetInfo, axisAnalysisPass) {}
 
+  // Detect offset = arith.addi(tt.broadcast(row), tt.broadcast(col)).
+  // Returns true and populates rowElems/colElems with the LLVM-converted
+  // broadcast components.
+  bool tryDetectFactoredOffsets(
+      triton::amdgpu::BufferStoreOp op,
+      ConversionPatternRewriter &rewriter, unsigned numElems,
+      SmallVector<Value> &rowElems, SmallVector<Value> &colElems) const {
+    Value offset = op.getOffsets();
+    auto addOp = offset.getDefiningOp<arith::AddIOp>();
+    if (!addOp)
+      return false;
+
+    if (!addOp.getLhs().getDefiningOp<triton::BroadcastOp>() ||
+        !addOp.getRhs().getDefiningOp<triton::BroadcastOp>())
+      return false;
+
+    Value llRow = rewriter.getRemappedValue(addOp.getLhs());
+    Value llCol = rewriter.getRemappedValue(addOp.getRhs());
+    if (!llRow || !llCol)
+      return false;
+
+    auto loc = op->getLoc();
+    rowElems = unpackLLElements(loc, llRow, rewriter);
+    colElems = unpackLLElements(loc, llCol, rewriter);
+    return rowElems.size() == numElems && colElems.size() == numElems;
+  }
+
+  // Emit buffer stores grouped by row, with sched_barrier(0) between groups.
+  // This prevents the scheduler from reordering stores across group boundaries,
+  // limiting how many accumulator VGPRs are live simultaneously.
+  // storeVals/storePreds: row-major ordered [g0_c0..g0_cN, g1_c0..g1_cN, ...]
+  // uniqueRows: one row base per row group
+  // uniqueCols: one col base per col index
+  void emitGroupedStores(
+      ConversionPatternRewriter &rewriter, TritonLLVMOpBuilder &b,
+      LLVM::AMD::BufferEmitter &bufferEmitter, Location loc,
+      ArrayRef<Value> storeVals, ArrayRef<Value> storePreds,
+      ArrayRef<Value> uniqueRows, ArrayRef<Value> uniqueCols,
+      Value rsrcDesc, triton::CacheModifier cacheMod,
+      unsigned numRowGroups, unsigned storesPerGroup) const {
+
+    // Fence before the first store to prevent WMMAs from being interleaved.
+    ROCDL::SchedBarrier::create(rewriter, loc, 0);
+    for (unsigned g = 0; g < numRowGroups; g++) {
+      Value rowBase = uniqueRows[g];
+      for (unsigned j = 0; j < storesPerGroup; j++) {
+        unsigned idx = g * storesPerGroup + j;
+        Value offset = b.add(rowBase, uniqueCols[j]);
+        bufferEmitter.emitStore(rsrcDesc, offset, storeVals[idx],
+                                storePreds[idx], cacheMod);
+      }
+      ROCDL::SchedBarrier::create(rewriter, loc, 0);
+    }
+  }
+
   LogicalResult
   matchAndRewrite(triton::amdgpu::BufferStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -1873,7 +1929,6 @@ struct BufferStoreOpConversion
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     LLVM::AMD::BufferEmitter bufferEmitter(rewriter, loc, targetInfo);
 
-    // original values
     Value ptr = op.getPtr();
     Value offset = op.getOffsets();
     Value mask = op.getMask();
@@ -1886,7 +1941,6 @@ struct BufferStoreOpConversion
     Value llData = adaptor.getValue();
     Value llStride = adaptor.getStride();
 
-    // Determine the vectorization size
     Type valueTy = data.getType();
     Type valueElemTy =
         typeConverter->convertType(getElementTypeOrSelf(valueTy));
@@ -1894,41 +1948,118 @@ struct BufferStoreOpConversion
 
     unsigned numElems = getTotalElemsPerThread(ptrType);
     unsigned vec = getVectorSize(ptr, offset, axisAnalysisPass);
-    // If the op has a contiguity hint use it to increase the vector size.
     vec = std::max(vec, op.getContiguity());
 
-    // Get the offsets and value
-    SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
-    SmallVector<Value> valueElems = unpackLLElements(loc, llData, rewriter);
+    // Try to use factored offsets with a loop to reduce VGPR pressure.
+    SmallVector<Value> rowElems, colElems;
+    bool useFactoredOffsets =
+        tryDetectFactoredOffsets(op, rewriter, numElems, rowElems, colElems);
 
-    // Get the mask
+    SmallVector<Value> valueElems = unpackLLElements(loc, llData, rewriter);
     SmallVector<Value> maskElems =
         getMaskElemsAndUpdateVeclen(rewriter, loc, llMask, mask, vec);
 
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
     MLIRContext *ctx = rewriter.getContext();
-    auto moduleOp = op->getParentOfType<ModuleOp>();
     auto freeVarMasks = getFreeVariableMasks(valueTy);
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
-    for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
-      if (!isCanonicalIndex(vecStart, regMask)) {
-        // Don't emit store ops for redundant elements within a thread
-        continue;
+
+    if (useFactoredOffsets) {
+      // Use layout offsets (dim0/dim1 coordinates) to determine row/col
+      // grouping.  SSA value identity doesn't work because broadcast lowering
+      // creates distinct extractvalue ops for each element even when they
+      // share the same runtime value.
+      auto tensorTy = cast<RankedTensorType>(offset.getType());
+      auto layoutOffsets =
+          emitOffsetForLayout(tensorTy.getEncoding(), tensorTy);
+
+      // Map dim0 coordinates to row group indices, dim1 to col indices.
+      DenseMap<unsigned, unsigned> dim0ToGroup;
+      SmallVector<unsigned> uniqueDim0;
+      DenseMap<unsigned, unsigned> dim1ToIdx;
+      SmallVector<unsigned> uniqueDim1;
+
+      struct StoreInfo {
+        Value val, pred;
+        unsigned rowGroup, colIdx;
+        size_t vecStart;
+      };
+      SmallVector<StoreInfo> stores;
+      Type vecTy = LLVM::getVectorType(valueElemTy, vec);
+
+      for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
+        if (!isCanonicalIndex(vecStart, regMask))
+          continue;
+
+        unsigned d0 = layoutOffsets[vecStart][0];
+        unsigned d1 = layoutOffsets[vecStart][1];
+
+        if (!dim0ToGroup.count(d0)) {
+          dim0ToGroup[d0] = uniqueDim0.size();
+          uniqueDim0.push_back(d0);
+        }
+        if (!dim1ToIdx.count(d1)) {
+          dim1ToIdx[d1] = uniqueDim1.size();
+          uniqueDim1.push_back(d1);
+        }
+
+        Value pred =
+            llMask ? b.and_(threadPred, maskElems[vecStart]) : threadPred;
+        Value storeVal = packElementRangeIntoVector(
+            rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
+            valueElems, vecStart);
+
+        stores.push_back(
+            {storeVal, pred, dim0ToGroup[d0], dim1ToIdx[d1], vecStart});
       }
+
+      unsigned numRowGroups = uniqueDim0.size();
+      unsigned storesPerGroup = uniqueDim1.size();
+
+      if (numRowGroups >= 2 &&
+          stores.size() == numRowGroups * storesPerGroup) {
+        // Reorder stores to row-major and collect unique row/col base values.
+        SmallVector<Value> orderedVals(stores.size());
+        SmallVector<Value> orderedPreds(stores.size());
+        // Use first occurrence of each row/col group for its base value.
+        SmallVector<Value> uniqueRowBases(numRowGroups);
+        SmallVector<Value> uniqueColBases(storesPerGroup);
+        for (auto &s : stores) {
+          unsigned idx = s.rowGroup * storesPerGroup + s.colIdx;
+          orderedVals[idx] = s.val;
+          orderedPreds[idx] = s.pred;
+          if (!uniqueRowBases[s.rowGroup])
+            uniqueRowBases[s.rowGroup] = rowElems[s.vecStart];
+          if (!uniqueColBases[s.colIdx])
+            uniqueColBases[s.colIdx] = colElems[s.vecStart];
+        }
+
+        emitGroupedStores(rewriter, b, bufferEmitter, loc, orderedVals,
+                          orderedPreds, uniqueRowBases, uniqueColBases,
+                          rsrcDesc, cacheMod, numRowGroups, storesPerGroup);
+        rewriter.eraseOp(op);
+        return success();
+      }
+    }
+
+    // Fallback: straight-line stores (original path).
+    SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
+    for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
+      if (!isCanonicalIndex(vecStart, regMask))
+        continue;
 
       Value pred =
           llMask ? b.and_(threadPred, maskElems[vecStart]) : threadPred;
 
       Type vecTy = LLVM::getVectorType(valueElemTy, vec);
-      // Create the store val
       Value storeVal = packElementRangeIntoVector(
           rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
           valueElems, vecStart);
       bufferEmitter.emitStore(rsrcDesc, offsetElems[vecStart], storeVal, pred,
                               cacheMod);
-    } // end vec
+    }
 
     rewriter.eraseOp(op);
     return success();
