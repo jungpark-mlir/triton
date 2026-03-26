@@ -599,90 +599,123 @@ In a warp-disjoint pipeline:
   local_load  → blockInfo is clean, no barrier needed
 ```
 
-### Why `isIntersected` Can Handle This
+### Why the Original Code Uses the Unconditional Handler
 
-`async_wait` is neither a read nor a write — it has no memory effect
-that membar tracks. It is a synchronization point that makes prior DMA
-writes visible, but membar never records it in `blockInfo`. The actual
-dependency is a **RAW hazard between `async_copy` (writer) and
-`local_load` (reader)** — `async_wait` is transparent in between:
+Both `AsyncCopyGlobalToLocalOp` and `AsyncTDMCopyGlobalToLocalOp`
+declare `MemWrite<SharedMemory>` in their ODS definitions, so membar
+**does** track their writes in `blockInfo` via the `getEffects` path.
+And `AsyncWaitOp` has **no** `MemoryEffectsOpInterface` — only
+`MemWaitOpTrait` — so it would be fully transparent to `isIntersected`.
+
+One might expect that removing the unconditional handler would let the
+normal RAW dependency path handle it:
 
 ```
   async_copy   → blockInfo records: WRITE to shared [0, N)
-  async_wait   → transparent (not a read or write, no blockInfo entry)
-  local_load   → curBlockInfo records: READ from shared [0, N)
-                  isIntersected sees: async_copy WRITE vs local_load READ
-                  → RAW overlap → barrier inserted before local_load
-                  (which is after async_wait — correct position)
+  async_wait   → transparent (no memory effects, passes through)
+  local_load   → isIntersected sees: async_copy WRITE vs local_load READ
+                 → RAW overlap → barrier
 ```
 
-The dependency tracking already captures the right relationship. The
-unconditional handler was a conservative shortcut — "we know a barrier
-is needed somewhere around here, just put it right after the wait."
-But `isIntersected` between the actual writer and reader achieves the
-same thing more precisely.
+On **current `main`** this would produce a barrier — but only because
+membar's allocation tracking treats all buffer slots as aliasing (same
+`bufferId`, same interval). The barrier fires at `local_load` instead
+of at `async_wait`, but is functionally equivalent.
 
-### Proposed Solution: Safe Incremental Refactoring
+However, the original authors chose the unconditional handler for good
+reasons:
 
-The practical challenge is that we don't know what effect removing the
-unconditional barrier has on non-AMD backends (NVIDIA, etc.). The safe
-strategy is to refactor in two steps:
+**1. Simplicity and robustness.** The rule "wait → barrier, always" is
+trivially correct. It doesn't depend on `async_copy` write tracking
+surviving across loop iterations, fixed-point convergence dynamics, or
+interval aliasing behavior. The barrier is placed at the semantically
+correct point — immediately after DMA completion.
 
-**Step 1: Refactor to use `isIntersected` (behavior-preserving).**
-Remove the early-return handler so `async_wait` passes through and
-the `async_copy` write stays in `blockInfo`. When `local_load` arrives,
-`isIntersected` runs normally. Without a `MembarFilterFn`, overlapping
-slices always produce a barrier — **duplicating the current behavior**:
+**2. The behavioral equivalence is fragile.** The `isIntersected` path
+only produces the same barrier because membar currently **cannot**
+distinguish buffer slots (all slots alias to the same allocation
+interval). Our Problem 1 work (`BufferIndexExpr`, Presburger) aims to
+change exactly this — once membar can prove slot disjointness, the
+`async_copy` write to slot C and `local_load` read from slot A would
+have non-overlapping intervals, and `isIntersected` would see **no
+conflict** → **no barrier** → **wrong**.
+
+**3. Interaction with `MemAsyncWriteOpTrait`.** On the `membar_async`
+branch, `MemAsyncWriteOpTrait` intentionally clears async DMA writes
+from `blockInfo` before `join()` — because between `async_copy` and
+`async_wait`, a CTA barrier cannot make in-flight DMA data visible,
+so the write shouldn't trigger false RAW barriers with intervening
+reads. With async writes cleared, `isIntersected` at `local_load`
+would see **nothing** in `blockInfo` → **no barrier at all**. The
+unconditional handler becomes the **sole** barrier source.
+
+The two mechanisms work together by design:
+
+```
+  MemAsyncWriteOpTrait:
+    Prevents false barriers BEFORE async_wait
+    (DMA is in-flight, CTA barrier can't make it visible)
+
+  MemWaitOpTrait unconditional handler:
+    Provides the real barrier AFTER async_wait
+    (DMA is complete, cross-warp visibility needed)
+```
+
+### Implications for Refactoring
+
+The naive "Step 1: just pass through" approach is **not** behavior-
+preserving in all scenarios:
+
+| Scenario | Remove unconditional handler? | Barrier outcome |
+|----------|------|---------|
+| Current `main` (no slot distinction, no `MemAsyncWriteOpTrait`) | Barrier at `local_load` (intervals alias → overlap → barrier) | Equivalent |
+| After Problem 1 fix (slot distinction via `BufferIndexExpr`) | `async_copy` write to slot C, `local_load` read from slot A → no overlap → **no barrier** | **Wrong** |
+| With `MemAsyncWriteOpTrait` (async writes cleared) | `blockInfo` empty at `local_load` → **no barrier** | **Wrong** |
+
+A correct refactoring needs to address these interactions. Several
+approaches are possible:
+
+**Option A: Keep unconditional handler, add filter override.**
+Keep the handler but allow `MembarFilterFn` to suppress it:
 
 ```cpp
 if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
     !containsLocalBarrier(op->getNextNode())) {
-    // Don't insert barrier or sync() here.
-    // Let the pending writes stay in blockInfo.
-    // isIntersected will see the RAW hazard between
-    // async_copy and local_load, and insert a barrier.
+    // Check if the filter says we can skip the barrier.
+    // This requires building a curBlockInfo that represents
+    // "all pending async writes" and calling isIntersected.
+    if (!canFilterMemWaitBarrier(op, blockInfo, filter)) {
+        builder->setInsertionPointAfter(op);
+        insertBarrier(op, builder);
+    }
+    blockInfo->sync();
+    return;
 }
 ```
 
-Without a filter, the flow produces the same barrier:
+This preserves the handler's role as the barrier decision point while
+giving the filter a chance to suppress it. The `sync()` always runs
+(clearing tracked state regardless of barrier insertion).
 
-```
-  async_copy  → blockInfo records shared write
-  async_wait  → pass through (transparent)
-  local_load  → isIntersected: async_copy WRITE vs local_load READ
-                overlap → no filter → barrier inserted  ← SAME AS BEFORE
-```
+**Option B: Tag async writes for deferred barrier.**
+Instead of clearing async writes from `blockInfo` (MemAsyncWriteOpTrait)
+or letting them trigger premature barriers, tag them so that:
+- They don't trigger barriers before `async_wait` (DMA in-flight)
+- They DO trigger barriers after `async_wait` (DMA complete)
+- The filter can suppress those barriers when warp-local
 
-This is safe for all backends because it **preserves the existing
-barrier** — it just moves the decision point from `async_wait` to
-`local_load`. The barrier ends up in the same position (after
-`async_wait`, before `local_load`).
+This requires richer state tracking in `blockInfo` — knowing which
+writes are "async-pending" vs "async-completed."
 
-**Step 2: Add filter for AMD (new optimization).**
-With the refactored flow, the AMD `MembarFilterFn` can now suppress the
-barrier when `warpsPerCTA` matches:
+**Option C: Separate async write tracking.**
+Track async writes in a dedicated `asyncWriteSlices` map that
+`isIntersected` ignores. At `async_wait`, move them into regular
+`syncWriteSlices`. Then the normal RAW path handles the rest, and
+the filter can suppress as needed.
 
-```
-  async_copy  → blockInfo records shared write
-  async_wait  → pass through
-  local_load  → isIntersected: overlap detected
-                MembarFilterFn: warpsPerCTA match → suppress barrier ✓
-```
-
-This step only affects AMD (or any backend that provides a filter).
-Backends without a filter get the barrier unconditionally — identical
-to today.
-
-### Edge Case: Cross-Block Dependencies
-
-One subtlety to verify during implementation: if `async_copy` happens
-in a **previous basic block** (not the current one), its write may not
-be in the current `blockInfo`. The existing unconditional handler
-catches this by always inserting a barrier at `async_wait` regardless
-of what's in `blockInfo`. The refactored flow would need to ensure
-cross-block write tracking covers this case — but this is a CFG edge
-case that can be addressed with existing membar infrastructure
-(`blockInfo` merging at block boundaries).
+Each option has trade-offs in complexity and intrusiveness. The choice
+depends on how much refactoring of `Membar.cpp` we're willing to do
+and whether we want to keep the change AMD-specific or make it generic.
 
 ## Applicability
 
@@ -773,12 +806,13 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
 
 ### Problem 2-2: `MemWaitOpTrait` Unconditional Barrier
 
-| Aspect | Before | Step 1: Refactor | Step 2: AMD Filter |
-|--------|--------|------------------|-------------------|
-| **`MemWaitOpTrait` handler** | Unconditional barrier + `sync()` + early return | Pass through (no barrier, no sync) | Same as Step 1 |
-| **Barrier decision** | At `async_wait` (always) | At `local_load` via `isIntersected` (RAW: `async_copy` vs `local_load`) | Same, but filter can suppress |
-| **Behavior change** | N/A | None — same barrier, different decision point | AMD only: barrier suppressed when `warpsPerCTA` matches |
-| **Non-AMD backends** | Barrier always | Barrier always (no filter → overlap → barrier) | Unchanged |
+| Aspect | Current |
+|--------|---------|
+| **`MemWaitOpTrait` handler** | Unconditional barrier + `sync()` + early return |
+| **Barrier decision** | At `async_wait` (always) — filter never consulted |
+| **Why not just remove it** | Equivalence with `isIntersected` is fragile: breaks with slot distinction (Problem 1) or `MemAsyncWriteOpTrait` |
+| **Refactoring options** | (A) Keep handler + add filter override; (B) Tag async writes for deferred barrier; (C) Separate async write tracking |
+| **Goal** | Allow `warpsPerCTA` filter to suppress post-wait barrier for warp-local cases |
 
 ---
 

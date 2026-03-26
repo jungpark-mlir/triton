@@ -171,10 +171,14 @@ extends naturally to `AsyncCopyGlobalToLocalOp` → `local_load` and
 
 **Problem 2-2: `MemWaitOpTrait` unconditional barrier** — A separate
 codepath in membar unconditionally inserts a CTA barrier after
-`async_wait`, bypassing `isIntersected`. `async_wait` is not a read or
-write — the real dependency is a RAW hazard between `async_copy` and
-`local_load`. Proposed two-step fix: (1) refactor to let `isIntersected`
-handle the RAW dependency (behavior-preserving), then (2) add AMD filter.
+`async_wait`, bypassing `isIntersected` and the filter entirely.
+Simply removing this handler and relying on `isIntersected` is **not**
+behavior-preserving — the equivalence breaks when buffer slots become
+distinguishable (Problem 1 fix) or when `MemAsyncWriteOpTrait` clears
+async writes from `blockInfo`. Refactoring options include: (A) keeping
+the handler but adding a filter override, (B) tagging async writes for
+deferred barrier, or (C) separate async write tracking that merges into
+`syncWriteSlices` at wait time.
 
 See [membar-warp-local-access.md](membar-warp-local-access.md) for full
 design, comparison with `isCvtDimSync`, and details on both sub-problems.

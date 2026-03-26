@@ -102,12 +102,15 @@ sub-problems:
 
 - **Problem 2-2: `MemWaitOpTrait` unconditional barrier.** A separate
   codepath in membar unconditionally inserts a CTA barrier after
-  `async_wait`, bypassing `isIntersected` entirely. `async_wait` is not
-  a read or write — the real dependency is a RAW hazard between
-  `async_copy` (writer) and `local_load` (reader). Proposed two-step
-  fix: (1) refactor to let `isIntersected` handle the RAW dependency
-  (behavior-preserving for all backends), then (2) add AMD filter to
-  suppress when `warpsPerCTA` matches.
+  `async_wait`, bypassing `isIntersected` and the filter entirely.
+  Simply removing the handler and relying on `isIntersected` is **not**
+  safe — the behavioral equivalence is fragile, breaking when buffer
+  slots become distinguishable (Problem 1 fix) or when
+  `MemAsyncWriteOpTrait` clears async writes from `blockInfo`.
+  Refactoring options: (A) keep handler + add filter override,
+  (B) tag async writes for deferred barrier, (C) separate async
+  write tracking merged at wait time. Goal: let `warpsPerCTA`
+  filter suppress the post-wait barrier for warp-local cases.
 
 The originally proposed GF(2) linear independence test is documented as a
 design alternative but was not implemented — the `warpsPerCTA` comparison is
