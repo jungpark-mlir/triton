@@ -102,10 +102,12 @@ sub-problems:
 
 - **Problem 2-2: `MemWaitOpTrait` unconditional barrier.** A separate
   codepath in membar unconditionally inserts a CTA barrier after
-  `async_wait`, bypassing `isIntersected` entirely. Proposed fix: remove
-  the unconditional barrier and let `isIntersected` decide — a common
-  solution for all backends, with the `warpsPerCTA` filter as an optional
-  further optimization.
+  `async_wait`, bypassing `isIntersected` entirely. `async_wait` is not
+  a read or write — the real dependency is a RAW hazard between
+  `async_copy` (writer) and `local_load` (reader). Proposed two-step
+  fix: (1) refactor to let `isIntersected` handle the RAW dependency
+  (behavior-preserving for all backends), then (2) add AMD filter to
+  suppress when `warpsPerCTA` matches.
 
 The originally proposed GF(2) linear independence test is documented as a
 design alternative but was not implemented — the `warpsPerCTA` comparison is

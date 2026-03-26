@@ -573,37 +573,42 @@ normalize([4, 1]) = [4]
 <div class="slide" id="s12">
   <div class="section-tag s2">Section 2 &mdash; Warp-Local Access</div>
   <h2>Problem 2-2: <span class="hl2">MemWaitOpTrait</span> Unconditional Barrier</h2>
-  <p style="font-size:17px">Separate from the write/read pair problem &mdash; the membar analysis has a codepath that <strong>unconditionally</strong> inserts a CTA barrier after <span class="code2">async_wait</span>, bypassing <span class="code2">isIntersected</span> entirely:</p>
-  <pre class="s2 sm">
-// Membar.cpp -- unconditional, early-return
-if (op-&gt;hasTrait&lt;MemWaitOpTrait&gt;() &amp;&amp; !containsLocalBarrier(op-&gt;getNextNode())) {
-    insertBarrier(op, builder);   // CTA-wide barrier -- always
-    blockInfo-&gt;sync();            // clears ALL tracked dependencies
-    return;                       // early return -- isIntersected never called
-}</pre>
+  <p style="font-size:16px"><span class="code2">async_wait</span> is <strong>not a read or write</strong> &mdash; it's transparent to membar. The real dependency is a RAW hazard: <span class="code2">async_copy</span> (write) &rarr; <span class="code2">local_load</span> (read). But the current handler short-circuits before <span class="code2">isIntersected</span> can see this.</p>
   <div class="grid2">
     <div class="card no">
-      <h3>Current Flow</h3>
+      <h3>Current: Unconditional Handler</h3>
       <pre style="border:none;padding:8px 0;background:transparent;font-size:12px;line-height:1.5">
-async_copy --> blockInfo records write
-async_wait --> barrier inserted, sync()
-              ^ UNCONDITIONAL, early return
-local_load --> blockInfo clean, nothing to check</pre>
-      <p style="font-size:15px">The handler short-circuits before <span class="code2">isIntersected</span> can run.</p>
+async_copy --> blockInfo: WRITE [0,N)
+async_wait --> barrier + sync() + return
+              ^ short-circuits everything
+local_load --> blockInfo clean, nothing left</pre>
+      <p style="font-size:14px">Barrier always inserted at <span class="code2">async_wait</span>. Filter never consulted. Works, but no way to suppress.</p>
     </div>
     <div class="card yes">
-      <h3>Proposed: Let isIntersected Decide</h3>
+      <h3>Step 1: Refactor (Behavior-Preserving)</h3>
       <pre style="border:none;padding:8px 0;background:transparent;font-size:12px;line-height:1.5">
-async_copy --> blockInfo records write
-async_wait --> pass through, writes stay
-local_load --> isIntersected() decides:
-  overlap?            --> barrier (correct)
-  no overlap?         --> no barrier
-  overlap + filter?   --> filter decides</pre>
-      <p style="font-size:15px">Common solution, works for all backends. <span class="code2">warpsPerCTA</span> filter is optional on top.</p>
+async_copy --> blockInfo: WRITE [0,N)
+async_wait --> pass through (transparent)
+local_load --> isIntersected:
+  WRITE vs READ --> overlap --> barrier
+  (no filter --> same barrier as before)</pre>
+      <p style="font-size:14px">Same barrier, just decided by <span class="code2">isIntersected</span>. Safe for all backends &mdash; duplicates current behavior.</p>
     </div>
   </div>
-  <div class="key-point s2" style="font-size:15px">The core fix is removing the unconditional barrier and letting <span class="code2">isIntersected</span> in <span class="code2">Membar.cpp</span> do its job. The <span class="code2">warpsPerCTA</span> filter adds a further optimization: suppress barrier even when slices overlap, if warps are disjoint.</div>
+  <div class="grid2" style="margin-top:12px">
+    <div class="card info2">
+      <h3>Step 2: Add AMD Filter (New Optimization)</h3>
+      <p style="font-size:14px">With refactored flow, AMD's <span class="code2">MembarFilterFn</span> can now suppress:</p>
+      <pre style="border:none;padding:4px 0;background:transparent;font-size:12px;line-height:1.4">
+local_load --> isIntersected: overlap
+  filter: warpsPerCTA match --> suppress</pre>
+      <p style="font-size:14px">Only AMD affected. Other backends: no filter &rarr; barrier as before.</p>
+    </div>
+    <div class="card info">
+      <h3>Why This Works</h3>
+      <p style="font-size:14px"><span class="code2">async_wait</span> has no memory effect &mdash; membar never records it. The RAW dependency between <span class="code2">async_copy</span> and <span class="code2">local_load</span> is already tracked. The barrier ends up after <span class="code2">async_wait</span> and before <span class="code2">local_load</span> &mdash; same position as today.</p>
+    </div>
+  </div>
   <div class="slide-num">12 / 13</div>
 </div>
 

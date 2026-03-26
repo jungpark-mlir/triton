@@ -599,45 +599,90 @@ In a warp-disjoint pipeline:
   local_load  → blockInfo is clean, no barrier needed
 ```
 
-The CTA barrier after `async_wait` is unnecessary in many cases. The
-existing `isIntersected` mechanism already knows how to decide whether
-a barrier is needed between two ops — it just never gets the chance
-because the `MemWaitOpTrait` handler short-circuits the flow.
+### Why `isIntersected` Can Handle This
 
-**Proposed solution**: remove the unconditional barrier from the
-`MemWaitOpTrait` handler and let the normal `isIntersected` path
-decide. Instead of inserting a barrier at `async_wait`, let the
-pending writes stay in `blockInfo`. When the next read op arrives,
-`isIntersected` checks whether the write and read slices actually
-overlap:
+`async_wait` is neither a read nor a write — it has no memory effect
+that membar tracks. It is a synchronization point that makes prior DMA
+writes visible, but membar never records it in `blockInfo`. The actual
+dependency is a **RAW hazard between `async_copy` (writer) and
+`local_load` (reader)** — `async_wait` is transparent in between:
+
+```
+  async_copy   → blockInfo records: WRITE to shared [0, N)
+  async_wait   → transparent (not a read or write, no blockInfo entry)
+  local_load   → curBlockInfo records: READ from shared [0, N)
+                  isIntersected sees: async_copy WRITE vs local_load READ
+                  → RAW overlap → barrier inserted before local_load
+                  (which is after async_wait — correct position)
+```
+
+The dependency tracking already captures the right relationship. The
+unconditional handler was a conservative shortcut — "we know a barrier
+is needed somewhere around here, just put it right after the wait."
+But `isIntersected` between the actual writer and reader achieves the
+same thing more precisely.
+
+### Proposed Solution: Safe Incremental Refactoring
+
+The practical challenge is that we don't know what effect removing the
+unconditional barrier has on non-AMD backends (NVIDIA, etc.). The safe
+strategy is to refactor in two steps:
+
+**Step 1: Refactor to use `isIntersected` (behavior-preserving).**
+Remove the early-return handler so `async_wait` passes through and
+the `async_copy` write stays in `blockInfo`. When `local_load` arrives,
+`isIntersected` runs normally. Without a `MembarFilterFn`, overlapping
+slices always produce a barrier — **duplicating the current behavior**:
 
 ```cpp
 if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
     !containsLocalBarrier(op->getNextNode())) {
-    // Don't insert barrier here. Let the pending writes stay in
-    // blockInfo. The normal isIntersected path will decide when
-    // the read op arrives.
+    // Don't insert barrier or sync() here.
+    // Let the pending writes stay in blockInfo.
+    // isIntersected will see the RAW hazard between
+    // async_copy and local_load, and insert a barrier.
 }
 ```
 
-The resulting flow:
+Without a filter, the flow produces the same barrier:
 
 ```
   async_copy  → blockInfo records shared write
-  async_wait  → pass through (no barrier, no sync)
-  local_load  → curBlockInfo records shared read
-               isIntersected checks overlap:
-               1. slices don't overlap → no barrier (e.g., different buffer slots)
-               2. slices overlap, no filter → barrier inserted (conservative, correct)
-               3. slices overlap, filter present → MembarFilterFn decides
-                  warpsPerCTA match → barrier suppressed
+  async_wait  → pass through (transparent)
+  local_load  → isIntersected: async_copy WRITE vs local_load READ
+                overlap → no filter → barrier inserted  ← SAME AS BEFORE
 ```
 
-This is a **common solution** in `Membar.cpp` that works for all
-backends, with or without a `MembarFilterFn`. The `warpsPerCTA`
-filter is an optional further optimization: even when slices overlap,
-suppress the barrier if warps are disjoint. But the core fix is
-simply letting `isIntersected` do its job instead of short-circuiting.
+This is safe for all backends because it **preserves the existing
+barrier** — it just moves the decision point from `async_wait` to
+`local_load`. The barrier ends up in the same position (after
+`async_wait`, before `local_load`).
+
+**Step 2: Add filter for AMD (new optimization).**
+With the refactored flow, the AMD `MembarFilterFn` can now suppress the
+barrier when `warpsPerCTA` matches:
+
+```
+  async_copy  → blockInfo records shared write
+  async_wait  → pass through
+  local_load  → isIntersected: overlap detected
+                MembarFilterFn: warpsPerCTA match → suppress barrier ✓
+```
+
+This step only affects AMD (or any backend that provides a filter).
+Backends without a filter get the barrier unconditionally — identical
+to today.
+
+### Edge Case: Cross-Block Dependencies
+
+One subtlety to verify during implementation: if `async_copy` happens
+in a **previous basic block** (not the current one), its write may not
+be in the current `blockInfo`. The existing unconditional handler
+catches this by always inserting a barrier at `async_wait` regardless
+of what's in `blockInfo`. The refactored flow would need to ensure
+cross-block write tracking covers this case — but this is a CFG edge
+case that can be addressed with existing membar infrastructure
+(`blockInfo` merging at block boundaries).
 
 ## Applicability
 
@@ -728,11 +773,12 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
 
 ### Problem 2-2: `MemWaitOpTrait` Unconditional Barrier
 
-| Aspect | Before | Proposed |
-|--------|--------|----------|
-| **`MemWaitOpTrait`** | Unconditional CTA barrier after `async_wait` | Remove unconditional barrier, let `isIntersected` decide (common solution) |
-| **Affected ops** | `async_wait`, `async_tdm_wait`, `async_tma_store_wait` | Same ops, but barrier decision deferred to normal membar path |
-| **Backend scope** | All backends (hardcoded in `Membar.cpp`) | Common fix in `Membar.cpp`, `warpsPerCTA` filter optional on top |
+| Aspect | Before | Step 1: Refactor | Step 2: AMD Filter |
+|--------|--------|------------------|-------------------|
+| **`MemWaitOpTrait` handler** | Unconditional barrier + `sync()` + early return | Pass through (no barrier, no sync) | Same as Step 1 |
+| **Barrier decision** | At `async_wait` (always) | At `local_load` via `isIntersected` (RAW: `async_copy` vs `local_load`) | Same, but filter can suppress |
+| **Behavior change** | N/A | None — same barrier, different decision point | AMD only: barrier suppressed when `warpsPerCTA` matches |
+| **Non-AMD backends** | Barrier always | Barrier always (no filter → overlap → barrier) | Unchanged |
 
 ---
 
