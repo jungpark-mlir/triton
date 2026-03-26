@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Membar Analysis: Buffer Disjointness & Warp-Local Access</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0c0c0f;
+  --surface: #16161a;
+  --surface2: #1e1e24;
+  --accent: #e8c547;
+  --accent2: #47c5e8;
+  --red: #e85a47;
+  --green: #47e88c;
+  --text: #e0ddd5;
+  --text-dim: #8a8780;
+  --mono: 'Space Mono', monospace;
+  --sans: 'DM Sans', sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: var(--sans); overflow: hidden; height: 100vh; }
+
+.slide {
+  display: none;
+  width: 100vw;
+  height: 100vh;
+  padding: 60px 80px;
+  position: relative;
+  flex-direction: column;
+  justify-content: center;
+}
+.slide.active { display: flex; }
+
+.slide-num {
+  position: absolute;
+  bottom: 30px;
+  right: 40px;
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--text-dim);
+}
+.section-tag {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--accent);
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  margin-bottom: 20px;
+}
+.section-tag.s2 { color: var(--accent2); }
+h1 {
+  font-family: var(--sans);
+  font-size: 52px;
+  font-weight: 700;
+  line-height: 1.15;
+  margin-bottom: 24px;
+}
+h1 .hl { color: var(--accent); }
+h1 .hl2 { color: var(--accent2); }
+h2 {
+  font-family: var(--sans);
+  font-size: 36px;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-bottom: 20px;
+}
+h2 .hl { color: var(--accent); }
+h2 .hl2 { color: var(--accent2); }
+p, li {
+  font-size: 20px;
+  line-height: 1.6;
+  color: var(--text);
+}
+li { margin-bottom: 8px; }
+ul { padding-left: 24px; }
+.subtitle {
+  font-size: 22px;
+  color: var(--text-dim);
+  margin-bottom: 40px;
+}
+pre {
+  background: var(--surface);
+  border-left: 3px solid var(--accent);
+  padding: 20px 24px;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 15px;
+  line-height: 1.6;
+  overflow-x: auto;
+  margin: 16px 0;
+  color: var(--text);
+}
+pre.s2 { border-left-color: var(--accent2); }
+.code { font-family: var(--mono); color: var(--accent); font-size: 0.9em; }
+.code2 { font-family: var(--mono); color: var(--accent2); font-size: 0.9em; }
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 40px;
+  margin-top: 20px;
+}
+.card {
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 28px;
+}
+.card h3 {
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+.card.yes { border-top: 3px solid var(--green); }
+.card.yes h3 { color: var(--green); }
+.card.no { border-top: 3px solid var(--red); }
+.card.no h3 { color: var(--red); }
+.card.info { border-top: 3px solid var(--accent); }
+.card.info h3 { color: var(--accent); }
+.card.info2 { border-top: 3px solid var(--accent2); }
+.card.info2 h3 { color: var(--accent2); }
+.pill {
+  display: inline-block;
+  padding: 4px 14px;
+  border-radius: 20px;
+  font-family: var(--mono);
+  font-size: 13px;
+  margin: 2px 4px;
+}
+.pill-y { background: #47e88c22; color: var(--green); }
+.pill-n { background: #e85a4722; color: var(--red); }
+.pill-a { background: #e8c54722; color: var(--accent); }
+.key-point {
+  background: var(--surface2);
+  border-left: 4px solid var(--accent);
+  padding: 20px 28px;
+  border-radius: 0 8px 8px 0;
+  margin: 20px 0;
+  font-size: 20px;
+}
+.key-point.s2 { border-left-color: var(--accent2); }
+
+.nav {
+  position: fixed;
+  bottom: 30px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  z-index: 100;
+}
+.nav button {
+  background: var(--surface2);
+  color: var(--text-dim);
+  border: none;
+  padding: 8px 18px;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.nav button:hover { background: var(--accent); color: var(--bg); }
+
+.progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 3px;
+  background: var(--accent);
+  transition: width 0.3s;
+  z-index: 100;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 17px;
+}
+th {
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 2px solid var(--accent);
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--accent);
+}
+td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--surface2);
+}
+</style>
+</head>
+<body>
+<div class="progress" id="progress"></div>
+
+<!-- SLIDE 1: Title -->
+<div class="slide active" id="s1">
+  <div class="section-tag">Triton Compiler Internals</div>
+  <h1>Membar Analysis:<br><span class="hl">Buffer Disjointness</span> &amp;<br><span class="hl2">Warp-Local Access</span></h1>
+  <p class="subtitle">Eliminating false-positive CTA barriers in pipelined GPU kernels</p>
+  <div style="margin-top:40px;display:flex;gap:20px">
+    <span class="pill pill-a">Section 1: Buffer Index Disjointness</span>
+    <span class="pill" style="background:#47c5e822;color:var(--accent2)">Section 2: Warp-Local Access</span>
+  </div>
+  <div class="slide-num">1 / 13</div>
+</div>
+
+<!-- SLIDE 2: The Problem -->
+<div class="slide" id="s2">
+  <div class="section-tag">Section 1 — Buffer Disjointness</div>
+  <h2>The Problem: <span class="hl">False-Positive Barriers</span> in Pipelines</h2>
+  <p>In multi-buffered pipelines, producer and consumer access <strong>different slots</strong> of the same shared memory allocation via a dynamic phase counter.</p>
+  <pre>
+memdesc&lt;3×128×128×f16&gt; allocation
+┌──────────┬──────────┬──────────┐
+│  Slot 0  │  Slot 1  │  Slot 2  │
+└──────────┴──────────┴──────────┘
+    ↑ consumer               ↑ producer
+    phase % 3          (phase+2) % 3
+
+→ Always different slots, but membar can't tell</pre>
+  <div class="key-point">Membar inserts <span class="code">__syncthreads()</span> / <span class="code">s_barrier</span> between every producer/consumer pair because it cannot prove the dynamic indices point to different slots.</div>
+  <div class="slide-num">2 / 13</div>
+</div>
+
+<!-- SLIDE 3: Why Membar Can't Distinguish -->
+<div class="slide" id="s3">
+  <div class="section-tag">Section 1 — Buffer Disjointness</div>
+  <h2>Why Membar <span class="hl">Cannot Distinguish</span> Slots</h2>
+  <div class="grid2">
+    <div>
+      <p>Membar tracks <span class="code">AllocationSlice</span> — byte intervals in shared memory. The <span class="code">MemDescIndexOp</span> selects a slot via a dynamic SSA value.</p>
+      <pre>
+TDM write  → memdesc_index %alloc[%idx_a]
+local_load → memdesc_index %alloc[%idx_b]
+
+%idx_a = (phase + 2) % 3
+%idx_b =  phase      % 3
+
+Both alias to the same base allocation.
+getAllBufferIdsWithAliases() → overlapping
+isIntersected() → true → barrier inserted</pre>
+    </div>
+    <div>
+      <p><strong>The gap:</strong> Membar reasons about which <em>bytes</em> are touched, but has no reasoning about the <em>values</em> of dynamic indices.</p>
+      <br>
+      <p>It sees two ops touching the same allocation and conservatively assumes they might access the same slot.</p>
+      <br>
+      <p>This is correct for safety but produces false positives when the indices are provably different.</p>
+      <br>
+      <p style="color:var(--red)">Cost: unnecessary <span class="code">s_barrier</span> on every pipeline iteration — stalling all warps.</p>
+    </div>
+  </div>
+  <div class="slide-num">3 / 13</div>
+</div>
+
+<!-- SLIDE 4: BufferIndexExpr -->
+<div class="slide" id="s4">
+  <div class="section-tag">Section 1 — Buffer Disjointness</div>
+  <h2><span class="hl">BufferIndexExpr</span>: Symbolic Index Analysis</h2>
+  <p>Pattern-match the index arithmetic to prove <span class="code">idx_a ≠ idx_b</span> symbolically.</p>
+  <div class="grid2">
+    <div>
+      <pre>
+// Decompose each index into:
+struct BufferIndexExpr {
+  Value base;    // loop-carried phase
+  int offset;    // constant offset
+  int modulus;   // modulus from remsi
+};
+
+// Producer: (phase + 2) % 3
+//   → {base=phase, offset=2, mod=3}
+// Consumer: phase % 3
+//   → {base=phase, offset=0, mod=3}
+
+// Same base, same mod,
+// offset 2 ≠ 0 → DISJOINT ✓</pre>
+    </div>
+    <div>
+      <h3 style="color:var(--accent)">Recognized Patterns</h3>
+      <ul>
+        <li><span class="code">arith.remsi %v, C</span> — modular wrapping</li>
+        <li><span class="code">arith.addi %v, C</span> — constant offset</li>
+        <li><span class="code">select(cmpi sge %v, C), sub, %v</span> — conditional wrap (equivalent to rem)</li>
+      </ul>
+      <br>
+      <h3 style="color:var(--green)">Properties</h3>
+      <ul>
+        <li>Works in core membar — all backends</li>
+        <li>No annotations or attributes needed</li>
+        <li>Covers what the Gluon pipeliner produces</li>
+        <li>O(1) per index comparison</li>
+      </ul>
+    </div>
+  </div>
+  <div class="slide-num">4 / 13</div>
+</div>
+
+<!-- SLIDE 5: Range vs Relational -->
+<div class="slide" id="s5">
+  <div class="section-tag">Section 1 — Buffer Disjointness</div>
+  <h2>Range Analysis <span class="hl">vs</span> Relational Analysis</h2>
+  <div class="grid2">
+    <div class="card no">
+      <h3>Integer Range Analysis (Non-Relational)</h3>
+      <p>Triton has <span class="code">TritonIntegerRangeAnalysis</span>. It tracks per-value intervals: <span class="code">[lo, hi]</span></p>
+      <pre style="border:none;background:transparent;padding:12px 0">
+idx_a = phase % 3      → [0, 2]
+idx_b = (phase+2) % 3  → [0, 2]
+
+Intervals overlap!
+Cannot express: "a ≠ b"</pre>
+      <p>Fundamental limitation: <strong>non-relational</strong> domains track each variable independently. They cannot express relationships between two variables.</p>
+    </div>
+    <div class="card yes">
+      <h3>Relational Analysis (What We Need)</h3>
+      <p>We need to reason about the <em>relationship</em> between <span class="code">idx_a</span> and <span class="code">idx_b</span>.</p>
+      <pre style="border:none;background:transparent;padding:12px 0">
+Given:  idx_a = base % 3
+        idx_b = (base + 2) % 3
+Prove:  idx_a ≠ idx_b
+
+For any base:
+  (base%3) ≠ ((base+2)%3)
+  because 2 ≢ 0 (mod 3)   ✓</pre>
+      <p><span class="code">BufferIndexExpr</span> is a lightweight relational analysis — it tracks the <em>shared base</em> and compares constant offsets mod N.</p>
+    </div>
+  </div>
+  <div class="slide-num">5 / 13</div>
+</div>
+
+<!-- SLIDE 6: Presburger Intro -->
+<div class="slide" id="s6">
+  <div class="section-tag">Section 1 — Buffer Disjointness</div>
+  <h2>Presburger Arithmetic: <span class="hl">What MLIR Offers</span></h2>
+  <div class="grid2">
+    <div>
+      <h3 style="color:var(--accent);margin-bottom:16px">What is Presburger Arithmetic?</h3>
+      <p>First-order logic over integers with <span class="code">+</span>, <span class="code">&lt;</span>, <span class="code">∃</span>, <span class="code">∀</span>, <span class="code">mod</span>.</p>
+      <p><strong>No multiplication of variables</strong> — but that's fine for index arithmetic.</p>
+      <br>
+      <p>Key property: <strong>decidable</strong> — every statement can be mechanically proved or disproved.</p>
+      <br>
+      <h3 style="color:var(--accent);margin-bottom:16px">MLIR's Standalone Library</h3>
+      <p><span class="code">mlir/Analysis/Presburger/</span></p>
+      <ul>
+        <li><span class="code">IntegerRelation</span> — systems of linear constraints</li>
+        <li><span class="code">PresburgerSet</span> — unions of polyhedra with mod</li>
+        <li>GCD test, Simplex solver, Fourier-Motzkin</li>
+        <li>Already used by Affine dialect for dependence analysis</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="color:var(--accent);margin-bottom:16px">Expressing Buffer Disjointness</h3>
+      <pre>
+// As Presburger constraints:
+
+// Producer index:
+∃ q₁: idx_a = phase + 2 - 3·q₁
+       0 ≤ idx_a ≤ 2
+
+// Consumer index:
+∃ q₂: idx_b = phase - 3·q₂
+       0 ≤ idx_b ≤ 2
+
+// Question: is idx_a = idx_b
+// satisfiable for any phase?
+
+// Presburger solver: NO
+// → provably disjoint ✓</pre>
+      <p style="margin-top:16px;color:var(--text-dim)">The solver handles this mechanically — no hand-crafted patterns needed.</p>
+    </div>
+  </div>
+  <div class="slide-num">6 / 13</div>
+</div>
+
+<!-- SLIDE 7: Presburger for Membar -->
+<div class="slide" id="s7">
+  <div class="section-tag">Section 1 — Buffer Disjointness</div>
+  <h2>Presburger as <span class="hl">Future Generalization</span></h2>
+  <p>Presburger generalizes <span class="code">BufferIndexExpr</span> — handles patterns it can't:</p>
+  <div class="grid2">
+    <div>
+      <table>
+        <tr><th>Pattern</th><th>BufferIndexExpr</th><th>Presburger</th></tr>
+        <tr><td><span class="code">remsi / addi</span></td><td><span class="pill pill-y">✓</span></td><td><span class="pill pill-y">✓</span></td></tr>
+        <tr><td><span class="code">select+cmpi</span> wrap</td><td><span class="pill pill-y">✓</span></td><td><span class="pill pill-y">✓</span></td></tr>
+        <tr><td>Power-of-2 <span class="code">andi</span> masking</td><td><span class="pill pill-n">✗</span></td><td><span class="pill pill-y">✓</span></td></tr>
+        <tr><td>Multi-level indexing</td><td><span class="pill pill-n">✗</span></td><td><span class="pill pill-y">✓</span></td></tr>
+        <tr><td>Nested modulo</td><td><span class="pill pill-n">✗</span></td><td><span class="pill pill-y">✓</span></td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="card info">
+        <h3>Incremental Strategy</h3>
+        <ul>
+          <li><strong>Today</strong>: <span class="code">BufferIndexExpr</span> — lightweight, covers current patterns</li>
+          <li><strong>Future</strong>: Presburger — more powerful, handles edge cases</li>
+          <li>Start simple, graduate when patterns outgrow pattern matching</li>
+        </ul>
+      </div>
+      <br>
+      <div class="card info">
+        <h3>Beyond Buffer Indices</h3>
+        <p style="font-size:17px">Presburger can also prove multi-dimensional subslice overlap, warp-specialized partitioning, and pipeliner stage verification.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">7 / 13</div>
+</div>
+
+<!-- SLIDE 8: Section 2 Title -->
+<div class="slide" id="s8">
+  <div class="section-tag s2">Section 2</div>
+  <h1><span class="hl2">Warp-Local</span><br>Shared Memory Access</h1>
+  <p class="subtitle">Eliminating CTA barriers when warps access disjoint partitions</p>
+  <div class="slide-num">8 / 13</div>
+</div>
+
+<!-- SLIDE 9: Warp-Local Problem -->
+<div class="slide" id="s9">
+  <div class="section-tag s2">Section 2 — Warp-Local Access</div>
+  <h2>The Problem: <span class="hl2">Unnecessary CTA Barriers</span></h2>
+  <p>When shared memory is partitioned by warp — each warp accesses its own row range — no cross-warp data dependency exists. But membar doesn't know this.</p>
+  <div class="grid2">
+    <div>
+      <pre class="s2">
+Shared Memory (one tile, warpsPerCTA = [4, 1])
+┌──────────────────────────────────┐
+│  Warp 0: rows  0-15              │
+├──────────────────────────────────┤
+│  Warp 1: rows 16-31              │
+├──────────────────────────────────┤
+│  Warp 2: rows 32-47              │
+├──────────────────────────────────┤
+│  Warp 3: rows 48-63              │
+└──────────────────────────────────┘
+Each warp's region is disjoint
+→ no cross-warp dependency
+→ CTA barrier is unnecessary</pre>
+    </div>
+    <div>
+      <div class="card no">
+        <h3>What membar sees</h3>
+        <ul>
+          <li>TDM write → shared allocation [0, N)</li>
+          <li>local_load ← shared allocation [0, N)</li>
+          <li>Same allocation? <span class="pill pill-n">Yes</span></li>
+          <li>→ Insert CTA barrier</li>
+        </ul>
+      </div>
+      <br>
+      <div class="card yes">
+        <h3>Reality</h3>
+        <ul>
+          <li>Warp k writes rows [k·16, (k+1)·16) in slot X</li>
+          <li>Warp k reads rows [k·16, (k+1)·16) in slot Y</li>
+          <li>Warp j (j≠k) never touches warp k's row range in <em>any</em> slot</li>
+          <li>→ Barrier is a false positive</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">9 / 13</div>
+</div>
+
+<!-- SLIDE 10: FA MQA Example -->
+<div class="slide" id="s10">
+  <div class="section-tag s2">Section 2 — Warp-Local Access</div>
+  <h2>Example: <span class="hl2">FA MQA Decode</span> with Split-K</h2>
+  <p>4 warps, triple-buffered pipeline. Each warp runs an independent batched WMMA on its own slice.</p>
+  <pre class="s2">
+TDM load: [4 × BLOCK_N, HEAD_SZ]        Batched WMMA view: [4, BLOCK_N, HEAD_SZ]
+┌──────────────────────────┐
+│ W0: rows [0,    BN)      │  ──→  W0: independent MMA on its own slice
+├──────────────────────────┤
+│ W1: rows [BN,  2·BN)     │  ──→  W1: independent MMA on its own slice
+├──────────────────────────┤
+│ W2: rows [2·BN, 3·BN)    │  ──→  W2: independent MMA on its own slice
+├──────────────────────────┤
+│ W3: rows [3·BN, 4·BN)    │  ──→  W3: independent MMA on its own slice
+└──────────────────────────┘</pre>
+  <pre class="s2">
+Pipeline (triple-buffered):                       a = i%3,  c = (i+2)%3
+
+  async_wait(6)
+  TDM_write(buf=c)           ← writes slot 2     warpsPerCTA = [4, 1]
+  # ← barrier inserted here (FALSE POSITIVE)
+  local_load(buf=a)          ← reads slot 0      warpsPerCTA = [4, 1]
+
+Slots are different, AND warps access disjoint row ranges in both slots.</pre>
+  <div class="slide-num">10 / 13</div>
+</div>
+
+<!-- SLIDE 11: The Solution -->
+<div class="slide" id="s11">
+  <div class="section-tag s2">Section 2 — Warp-Local Access</div>
+  <h2>Solution: <span class="hl2">warpsPerCTA</span> Comparison</h2>
+  <div class="grid2">
+    <div>
+      <h3 style="color:var(--accent2);margin-bottom:16px">The Check</h3>
+      <p>Compare <span class="code2">warpsPerCTA</span> from writer and reader. If they match, every warp accesses the <strong>same row-range partition</strong> on both sides.</p>
+      <pre class="s2">
+Writer: tdmGetWarpDistribution → [4, 1]
+Reader: encoding.warpsPerCTA   → [4, 1]
+
+normalize([4, 1]) = [4]
+normalize([4, 1]) = [4]
+[4] == [4] → MATCH → barrier suppressed ✓</pre>
+      <h3 style="color:var(--accent2);margin-bottom:16px;margin-top:24px">Why This Is Safe</h3>
+      <p>All shared memory encodings give every tensor element a <strong>unique byte address</strong> (one-to-one mapping). If warps own disjoint element sets → they access disjoint address ranges — regardless of encoding (padded, swizzled, linear).</p>
+    </div>
+    <div>
+      <pre class="s2">
+Tensor elements        Encoding         Byte addresses
+(warpsPerCTA=[4,1])    (one-to-one)
+
+┌──────────────┐                    ┌──────────────┐
+│ W0: rows 0-15│ → unique addrs →  │ W0: 1024 addr│
+├──────────────┤   each element     ├──────────────┤
+│ W1: rows16-31│ → gets its own  →  │ W1: 1024 addr│
+├──────────────┤   address          ├──────────────┤
+│ W2: rows32-47│ → (never shared) → │ W2: 1024 addr│
+├──────────────┤                    ├──────────────┤
+│ W3: rows48-63│ → unique addrs →  │ W3: 1024 addr│
+└──────────────┘                    └──────────────┘
+Disjoint elements → disjoint addresses</pre>
+      <div class="key-point s2" style="margin-top:16px">The encoding rearranges <em>where</em> elements go (padding adds gaps, swizzling shuffles), but <strong>never puts two elements at the same byte</strong>.</div>
+    </div>
+  </div>
+  <div class="slide-num">11 / 13</div>
+</div>
+
+<!-- SLIDE 12: MemWaitOpTrait -->
+<div class="slide" id="s12">
+  <div class="section-tag s2">Section 2 — Warp-Local Access</div>
+  <h2>Challenge: <span class="hl2">MemWaitOpTrait</span> Barrier</h2>
+  <p>The <span class="code2">warpsPerCTA</span> check runs in the <span class="code2">MembarFilterFn</span> callback. But there's a separate codepath that the filter <strong>cannot reach</strong>:</p>
+  <pre class="s2">
+// Membar.cpp — unconditional, early-return, filter NEVER consulted
+if (op->hasTrait&lt;MemWaitOpTrait&gt;() &amp;&amp;
+    !containsLocalBarrier(op->getNextNode())) {
+    insertBarrier(op, builder);   // CTA-wide barrier — always
+    blockInfo->sync();            // clears ALL tracked dependencies
+    return;                       // early return — filter bypassed
+}</pre>
+  <div class="grid2">
+    <div class="card no">
+      <h3>Current Flow (Conservative)</h3>
+      <pre style="border:none;padding:10px;background:transparent;font-size:14px">
+async_copy → blockInfo records write
+async_wait → barrier inserted, sync()
+             ↑ UNCONDITIONAL — filter never called
+local_load → blockInfo is clean, no conflict</pre>
+      <p>Even with matching <span class="code2">warpsPerCTA</span>, the barrier is always emitted after <span class="code2">async_wait</span>.</p>
+    </div>
+    <div class="card yes">
+      <h3>Proposed: Defer to Filter</h3>
+      <pre style="border:none;padding:10px;background:transparent;font-size:14px">
+async_copy → blockInfo records write
+async_wait → filter present? don't barrier
+             pending writes stay in blockInfo
+local_load → isIntersected() → filter called
+             warpsPerCTA match → suppressed ✓</pre>
+      <p>When a <span class="code2">MembarFilterFn</span> is provided, let the filter decide at the read op instead.</p>
+    </div>
+  </div>
+  <div class="key-point s2">This requires refactoring the <span class="code2">MemWaitOpTrait</span> handler in common <span class="code2">Membar.cpp</span> — not just adding a backend filter clause. The filter is never consulted today because the handler returns early.</div>
+  <div class="slide-num">12 / 13</div>
+</div>
+
+<!-- SLIDE 13: Summary -->
+<div class="slide" id="s13">
+  <div class="section-tag">Summary</div>
+  <h2>Two <span class="hl">Orthogonal</span> Optimizations</h2>
+  <div class="grid2">
+    <div class="card info">
+      <h3>Buffer Disjointness (Problem 1)</h3>
+      <ul>
+        <li><strong>Problem</strong>: dynamic buffer slot indices look aliased</li>
+        <li><strong>Solution</strong>: <span class="code">BufferIndexExpr</span> — symbolic pattern matching on index arithmetic</li>
+        <li><strong>Why not range analysis</strong>: non-relational, can't express a ≠ b</li>
+        <li><strong>Future</strong>: Presburger arithmetic for complex patterns (MLIR library ready)</li>
+      </ul>
+    </div>
+    <div class="card info2">
+      <h3>Warp-Local Access (Problem 2)</h3>
+      <ul>
+        <li><strong>Problem</strong>: per-warp partitions treated as aliasing</li>
+        <li><strong>Solution</strong>: <span class="code2">warpsPerCTA</span> comparison + one-to-one address mapping</li>
+        <li><strong>Extends to</strong>: <span class="code2">async_copy</span>, <span class="code2">local_store/load</span></li>
+        <li><strong>Challenge</strong>: <span class="code2">MemWaitOpTrait</span> handler needs refactoring</li>
+      </ul>
+    </div>
+  </div>
+  <br>
+  <div class="key-point">These compose naturally: <span class="code">BufferIndexExpr</span> proves slot disjointness across buffer slots, <span class="code2">warpsPerCTA</span> proves warp disjointness within each slot. Together they eliminate all false-positive barriers in pipelined FA MQA decode.</div>
+  <div class="slide-num">13 / 13</div>
+</div>
+
+<div class="nav">
+  <button onclick="prev()">← Prev</button>
+  <button onclick="next()">Next →</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+let current = 0;
+
+function show(n) {
+  slides[current].classList.remove('active');
+  current = Math.max(0, Math.min(n, slides.length - 1));
+  slides[current].classList.add('active');
+  document.getElementById('progress').style.width = ((current + 1) / slides.length * 100) + '%';
+}
+function next() { show(current + 1); }
+function prev() { show(current - 1); }
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
+});
+
+show(0);
+</script>
+</body>
+</html>
