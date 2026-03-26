@@ -364,7 +364,7 @@ For any base:
   <div class="grid2">
     <div>
       <h3 style="color:var(--accent);margin-bottom:12px">What is Presburger Arithmetic?</h3>
-      <p>First-order logic over integers with <span class="code">+</span>, <span class="code">&lt;</span>, <span class="code">exists</span>, <span class="code">forall</span>, <span class="code">mod</span>. <strong>No multiplication of variables</strong> &mdash; but fine for index arithmetic.</p>
+      <p>First-order logic over integers with <span class="code">+</span>, <span class="code">&lt;</span>, <span class="code">exists</span>, <span class="code">forall</span>, and multiplication by <strong>constants</strong> (not variables). Can express <span class="code">mod</span> via <span class="code">exists q: x = n*q + r</span>.</p>
       <p style="margin-top:8px">Key property: <strong>decidable</strong> &mdash; every statement can be mechanically proved or disproved.</p>
       <br>
       <h3 style="color:var(--accent);margin-bottom:12px">MLIR's Standalone Library</h3>

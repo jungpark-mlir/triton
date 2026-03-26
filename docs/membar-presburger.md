@@ -3,18 +3,20 @@
 ## 1. What is Presburger Arithmetic?
 
 Presburger arithmetic is the first-order theory of the natural numbers with
-addition (but not multiplication). It is **decidable**: any statement of the
-form "does there exist an integer satisfying these linear constraints?" has
-an algorithmic answer. This makes it the mathematical foundation for
-reasoning about array subscripts, loop bounds, and modular index arithmetic
-in compilers.
+addition, comparison, quantifiers (`∃`, `∀`), and multiplication by
+**constants** (not variables — that would be Peano arithmetic, which is
+undecidable). It is **decidable**: any statement of the form "does there
+exist an integer satisfying these linear constraints?" has an algorithmic
+answer. This makes it the mathematical foundation for reasoning about
+array subscripts, loop bounds, and modular index arithmetic in compilers.
 
 A Presburger formula can express:
 
-- Linear equalities: `a*x + b*y = c`
+- Linear equalities: `a*x + b*y = c` (coefficients `a`, `b`, `c` are constants)
 - Linear inequalities: `a*x + b*y >= c`
 - Integer divisibility: `N | (a*x + b)` (via existential variables)
-- Modular arithmetic: `x mod N = r` (via floor division encoding)
+- Modular arithmetic: `x mod N = r` — not a primitive, but expressible via
+  `∃q: x = N*q + r, 0 ≤ r < N` (where `N*q` is multiplication by a constant)
 - Existential quantification: "there exists an integer q such that..."
 
 ```
@@ -143,6 +145,51 @@ bool empty = poly.isIntegerEmpty();
 // Uses GCD test → Simplex → Fourier-Motzkin elimination
 // Returns true if no integer point satisfies all constraints
 ```
+
+### What the Library Does vs. What We Build
+
+The Presburger library is a **pure decision engine** — it operates on
+coefficient matrices and knows nothing about MLIR IR, SSA values, or
+dialect ops. Using it for membar analysis requires two distinct pieces:
+
+```
+  Responsibility split:
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  We build: Constraint Encoder (IR → constraints)               │
+  │                                                                 │
+  │  Walk arith SSA def-use chain from MemDescIndexOp index value. │
+  │  For each op, emit constraints into IntegerPolyhedron:         │
+  │                                                                 │
+  │    arith.addi %x, 2   →  addEquality: result = x + 2          │
+  │    arith.remsi %x, 3  →  addLocalModulo: result = x mod 3     │
+  │    arith.muli %x, 4   →  addEquality: result = 4*x            │
+  │    block argument      →  unconstrained SetDim variable        │
+  │    (unrecognized op)   →  unconstrained SetDim variable        │
+  │                                                                 │
+  │  Then add query: idx_a = idx_b                                 │
+  ├─────────────────────────────────────────────────────────────────┤
+  │  Library provides: Decision Procedure (constraints → yes/no)   │
+  │                                                                 │
+  │  isIntegerEmpty()  — GCD test, Simplex, Fourier-Motzkin        │
+  │  No knowledge of IR, ops, or SSA.                              │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+**Why not use the existing Affine dialect bridge?** MLIR's Affine dialect
+has `FlatAffineValueConstraints` — a subclass of `IntegerRelation` that
+can associate MLIR `Value`s with constraint dimensions and translate
+`AffineExpr` (affine maps, `affine.apply`) into constraints
+automatically. However, membar deals with `arith` dialect ops
+(`arith.remsi`, `arith.addi`, `arith.cmpi`), not affine dialect ops.
+There is no existing bridge from `arith` ops to Presburger constraints —
+we write the per-op translation rules ourselves.
+
+The engineering effort is primarily in the encoder (~200-300 LOC), not
+the solver. Each `arith` op needs one translation rule (a few lines),
+and unrecognized ops fall back to unconstrained variables (conservative
+but safe). The implementation sketch in Section 3.1 shows the full
+encoder structure.
 
 ### Algorithms
 
