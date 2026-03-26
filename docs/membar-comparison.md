@@ -168,4 +168,5 @@ CTA-wide barrier is needed. Currently scoped to
 `AsyncCopyGlobalToLocalOp` and `local_store`/`local_load`. See
 [membar-warp-local-access.md](membar-warp-local-access.md) for full
 design, comparison with `isCvtDimSync`, and a proposed `MemWaitOpTrait`
-handler change.
+handler refactoring (remove unconditional barrier, let `isIntersected`
+decide).

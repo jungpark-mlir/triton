@@ -97,9 +97,10 @@ if both writer and reader distribute warps identically, and every tensor
 element gets a unique address (one-to-one mapping), the byte-address
 partitions are disjoint. Currently scoped to `AsyncTDMCopyGlobalToLocalOp`
 pairs; extends naturally to `AsyncCopyGlobalToLocalOp` and
-`local_store`/`local_load`. Also documents a proposed change to the
-`MemWaitOpTrait` handler to allow the `MembarFilterFn` to suppress the
-unconditional CTA barrier after `async_wait` in warp-disjoint pipelines.
+`local_store`/`local_load`. Also documents a proposed refactoring of the `MemWaitOpTrait` handler:
+remove its unconditional CTA barrier and let the normal `isIntersected`
+path decide — a common solution that works for all backends, with the
+`warpsPerCTA` filter as an optional further optimization.
 The originally proposed GF(2) linear independence test is documented as a
 design alternative but was not implemented — the `warpsPerCTA` comparison is
 simpler, handles padded layouts, and covers all practical cases.
