@@ -446,8 +446,8 @@ exists q2: idx_b = phase - 3*q2
 <!-- SLIDE 9: Warp-Local Problem -->
 <div class="slide" id="s9">
   <div class="section-tag s2">Section 2 &mdash; Warp-Local Access</div>
-  <h2>The Problem: <span class="hl2">Unnecessary CTA Barriers</span></h2>
-  <p>When shared memory is partitioned by warp &mdash; each warp accesses its own row range &mdash; no cross-warp data dependency exists.</p>
+  <h2>Problem 2-1: <span class="hl2">Unnecessary CTA Barriers</span> Between Write/Read Pairs</h2>
+  <p>When shared memory is partitioned by warp, no cross-warp data dependency exists between the <strong>writer</strong> (TDM copy / async_copy) and the <strong>reader</strong> (local_load).</p>
   <div class="grid2">
     <div>
       <p style="margin-bottom:8px;font-size:15px;color:var(--text-dim)">Shared memory tile, warpsPerCTA = [4, 1]:</p>
@@ -457,14 +457,19 @@ exists q2: idx_b = phase - 3*q2
         <div class="warp-row w2">W2: rows 32-47 &nbsp;&mdash; writes &amp; reads here only</div>
         <div class="warp-row w3">W3: rows 48-63 &nbsp;&mdash; writes &amp; reads here only</div>
       </div>
-      <p style="margin-top:10px">Each warp's region is disjoint. No cross-warp dependency. CTA barrier is unnecessary.</p>
+      <p style="margin-top:10px">Target op pairs for barrier suppression:</p>
+      <ul style="font-size:15px;margin-top:4px">
+        <li><span class="code2">TDM copy</span> &rarr; <span class="code2">local_load</span> &nbsp;<span class="pill pill-y">implemented</span></li>
+        <li><span class="code2">async_copy</span> &rarr; <span class="code2">local_load</span> &nbsp;<span class="pill pill-a">extensible</span></li>
+        <li><span class="code2">local_store</span> &rarr; <span class="code2">local_load</span> &nbsp;<span class="pill pill-a">extensible</span></li>
+      </ul>
     </div>
     <div>
       <div class="card no">
         <h3>What membar sees</h3>
         <ul>
-          <li>TDM write &rarr; shared allocation [0, N)</li>
-          <li>local_load &larr; shared allocation [0, N)</li>
+          <li>Writer &rarr; shared allocation [0, N)</li>
+          <li>Reader &larr; shared allocation [0, N)</li>
           <li>Same allocation? <span class="pill pill-n">Yes</span></li>
           <li>&rarr; Insert CTA barrier</li>
         </ul>
@@ -567,8 +572,8 @@ normalize([4, 1]) = [4]
 <!-- SLIDE 12: MemWaitOpTrait -->
 <div class="slide" id="s12">
   <div class="section-tag s2">Section 2 &mdash; Warp-Local Access</div>
-  <h2>Challenge: <span class="hl2">MemWaitOpTrait</span> Barrier</h2>
-  <p style="font-size:17px">The membar analysis has a separate codepath that <strong>unconditionally</strong> inserts a CTA barrier after <span class="code2">async_wait</span>, bypassing the normal <span class="code2">isIntersected</span> check entirely:</p>
+  <h2>Problem 2-2: <span class="hl2">MemWaitOpTrait</span> Unconditional Barrier</h2>
+  <p style="font-size:17px">Separate from the write/read pair problem &mdash; the membar analysis has a codepath that <strong>unconditionally</strong> inserts a CTA barrier after <span class="code2">async_wait</span>, bypassing <span class="code2">isIntersected</span> entirely:</p>
   <pre class="s2 sm">
 // Membar.cpp -- unconditional, early-return
 if (op-&gt;hasTrait&lt;MemWaitOpTrait&gt;() &amp;&amp; !containsLocalBarrier(op-&gt;getNextNode())) {
@@ -619,10 +624,9 @@ local_load --> isIntersected() decides:
     <div class="card info2">
       <h3>Warp-Local Access (Problem 2)</h3>
       <ul>
-        <li><strong>Problem</strong>: per-warp partitions treated as aliasing</li>
-        <li><strong>Solution</strong>: <span class="code2">warpsPerCTA</span> comparison + one-to-one mapping</li>
-        <li><strong>Extends to</strong>: <span class="code2">async_copy</span>, <span class="code2">local_store/load</span></li>
-        <li><strong>Challenge</strong>: <span class="code2">MemWaitOpTrait</span> &mdash; let <span class="code2">isIntersected</span> decide</li>
+        <li><strong>2-1</strong>: write/read pairs &mdash; <span class="code2">warpsPerCTA</span> comparison + one-to-one mapping</li>
+        <li>Implemented for <span class="code2">TDM</span> &rarr; <span class="code2">local_load</span>; extends to <span class="code2">async_copy</span>, <span class="code2">local_store/load</span></li>
+        <li><strong>2-2</strong>: <span class="code2">MemWaitOpTrait</span> unconditional barrier &mdash; let <span class="code2">isIntersected</span> decide</li>
       </ul>
     </div>
   </div>

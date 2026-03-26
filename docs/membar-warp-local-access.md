@@ -1,12 +1,21 @@
 # Membar: Warp-Local Shared Memory Access
 
-## Problem
+## Problem 2-1: Unnecessary Barriers Between Write/Read Op Pairs
 
 Triton's membar analysis treats shared memory as a flat address space shared by
-all threads in a CTA. When two operations touch the same allocation, membar
-inserts a CTA-wide barrier (`__syncthreads()` / `s_barrier`) even if the
-layout guarantees that each warp only accesses its own partition. In such
-cases, the barrier is unnecessary — there is no cross-warp data dependency.
+all threads in a CTA. When a **writer** (TDM copy, async_copy, or local_store)
+and a **reader** (local_load) touch the same allocation, membar inserts a
+CTA-wide barrier (`__syncthreads()` / `s_barrier`) even if the layout
+guarantees that each warp only accesses its own partition. In such cases, the
+barrier is unnecessary — there is no cross-warp data dependency.
+
+**Target op pairs** for barrier suppression:
+
+| Writer | Reader | Status |
+|--------|--------|--------|
+| `AsyncTDMCopyGlobalToLocalOp` | `local_load` | **Implemented** (commit [`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe)) |
+| `AsyncCopyGlobalToLocalOp` | `local_load` | Extensible (same `warpsPerCTA` check) |
+| `local_store` | `local_load` | Extensible (same `warpsPerCTA` check) |
 
 ```
   Shared Memory (one buffer slot)
@@ -20,10 +29,8 @@ cases, the barrier is unnecessary — there is no cross-warp data dependency.
         ↑ no cross-warp overlap → barrier unnecessary
 ```
 
-## Solution: warpsPerCTA Comparison
+## Solution (2-1): warpsPerCTA Comparison
 
-**Implemented** in commit
-[`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe).
 The check compares `warpsPerCTA` distributions from the writer and reader.
 If they match, each warp owns the same tensor-element partition on both
 sides, and since shared memory encodings never let two different elements
@@ -558,13 +565,14 @@ This makes the `warpsPerCTA` check a strong candidate for common membar
 analysis code (not AMD-specific), since `async_copy` is used by both
 NVIDIA and AMD backends.
 
-### `MemWaitOpTrait`: Unconditional Barrier Problem
+## Problem 2-2: `MemWaitOpTrait` Unconditional Barrier
 
-The `warpsPerCTA` check in the `MembarFilterFn` cannot suppress all
-unnecessary barriers in async pipelines. The membar analysis has a
-separate, earlier codepath that inserts a CTA-wide barrier
-unconditionally after any op with `MemWaitOpTrait` (`async_wait`,
-`async_tdm_wait`, `async_tma_store_wait`):
+This is a **separate problem** from the write/read pair barrier (Problem
+2-1). Even if the `warpsPerCTA` check successfully suppresses barriers
+between writer and reader, the membar analysis has an independent
+codepath that inserts a CTA-wide barrier unconditionally after any op
+with `MemWaitOpTrait` (`async_wait`, `async_tdm_wait`,
+`async_tma_store_wait`):
 
 ```cpp
 // Membar.cpp — MembarAnalysis::update()
@@ -704,18 +712,27 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
 
 ## Summary
 
+### Problem 2-1: Write/Read Op Pair Barriers
+
 | Aspect | Before | Implemented / Proposed |
 |--------|--------|-------------|
+| **Target op pairs** | None | TDM → `local_load` (implemented); `async_copy` → `local_load`, `local_store` → `local_load` (extensible) |
 | **Warp awareness** | `ConvertLayoutOp` scratch only (`isCvtDimSync`) | General shared memory ops via `warpsPerCTA` comparison + one-to-one address mapping |
 | **Detection** | Trivial-over-warp check | `warpsPerCTA` comparison with trailing-1 normalization |
 | **Async/TDM** | Not considered | TDM `warpsPerCTA` via `tdmGetWarpDistribution`; consumer `warpsPerCTA` from distributed encoding |
 | **`async_copy`** | Not considered | Extensible: writer `warpsPerCTA` from source encoding, reader from `local_load` encoding |
 | **MMA operands** | Assumed cross-warp | Checkable; batched MMA with matching distributions detected |
 | **Batched MMA** | Not distinguished from standard MMA | Detected: warps across batch dimension → matching `warpsPerCTA` → barrier suppressed |
-| **`MemWaitOpTrait`** | Unconditional CTA barrier after `async_wait` | Proposed: remove unconditional barrier, let `isIntersected` decide (common solution) |
 | **Padded layouts** | Not considered | Handled natively (encoding-agnostic: each element always gets a unique address) |
 | **Swizzled layouts** | Not considered | Handled natively (swizzle shuffles addresses but never puts two elements at the same address) |
-| **Scope** | Situational | TDM op pairs implemented; `async_copy`, `local_store`/`local_load`, `MemWaitOpTrait` extensible |
+
+### Problem 2-2: `MemWaitOpTrait` Unconditional Barrier
+
+| Aspect | Before | Proposed |
+|--------|--------|----------|
+| **`MemWaitOpTrait`** | Unconditional CTA barrier after `async_wait` | Remove unconditional barrier, let `isIntersected` decide (common solution) |
+| **Affected ops** | `async_wait`, `async_tdm_wait`, `async_tma_store_wait` | Same ops, but barrier decision deferred to normal membar path |
+| **Backend scope** | All backends (hardcoded in `Membar.cpp`) | Common fix in `Membar.cpp`, `warpsPerCTA` filter optional on top |
 
 ---
 

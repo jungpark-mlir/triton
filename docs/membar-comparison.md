@@ -155,18 +155,25 @@ Buffer coloring remains a viable complement if we encounter index patterns that 
 
 Both share the same prerequisite: the AMD pipeliner must create separate `MemDescIndexOp`s for producer and consumer stages. On AMD, either approach replaces the existing `syncedViaAsyncWait` annotation pass and `filterAsyncWriteDependencies` filter (which cover the CTA-wide barrier for async-wait visibility). NVIDIA's token-based `cp.async.wait_group` provides its own fine-grained ordering and is a separate mechanism.
 
-## Warp-Local Access (Problem 2) — Implemented
+## Warp-Local Access (Problem 2)
 
-The warp-local shared memory access problem (Problem 2) has been
-implemented via a `warpsPerCTA` comparison in the AMD `membarFilter`
-(commit [`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe)).
-If both the writer and reader distribute warps identically across tensor
-dimensions, and every tensor element gets a unique shared memory address
-(one-to-one mapping), the byte-address partitions are disjoint — no
-CTA-wide barrier is needed. Currently scoped to
-`AsyncTDMCopyGlobalToLocalOp` pairs; extends naturally to
-`AsyncCopyGlobalToLocalOp` and `local_store`/`local_load`. See
-[membar-warp-local-access.md](membar-warp-local-access.md) for full
-design, comparison with `isCvtDimSync`, and a proposed `MemWaitOpTrait`
-handler refactoring (remove unconditional barrier, let `isIntersected`
-decide).
+The warp-local shared memory access problem covers two sub-problems:
+
+**Problem 2-1: Write/read op pair barriers** — **Implemented** via
+`warpsPerCTA` comparison in the AMD `membarFilter` (commit
+[`df6d5be`](https://github.com/triton-lang/triton/commit/df6d5be2206ec6f32cf47116d23f3b6235873bfe)).
+If both the writer and reader distribute warps identically, and every
+tensor element gets a unique shared memory address (one-to-one mapping),
+the byte-address partitions are disjoint — no CTA-wide barrier is needed.
+Currently scoped to `AsyncTDMCopyGlobalToLocalOp` → `local_load`;
+extends naturally to `AsyncCopyGlobalToLocalOp` → `local_load` and
+`local_store` → `local_load`.
+
+**Problem 2-2: `MemWaitOpTrait` unconditional barrier** — A separate
+codepath in membar unconditionally inserts a CTA barrier after
+`async_wait`, bypassing `isIntersected`. Proposed fix: remove the
+unconditional barrier and let `isIntersected` decide (a common solution
+for all backends).
+
+See [membar-warp-local-access.md](membar-warp-local-access.md) for full
+design, comparison with `isCvtDimSync`, and details on both sub-problems.
