@@ -553,22 +553,24 @@ if (op->hasTrait&lt;MemWaitOpTrait&gt;() &amp;&amp;
       <pre style="border:none;padding:10px;background:transparent;font-size:14px">
 async_copy → blockInfo records write
 async_wait → barrier inserted, sync()
-             ↑ UNCONDITIONAL — filter never called
-local_load → blockInfo is clean, no conflict</pre>
-      <p>Even with matching <span class="code2">warpsPerCTA</span>, the barrier is always emitted after <span class="code2">async_wait</span>.</p>
+             ↑ UNCONDITIONAL — early return
+local_load → blockInfo is clean, no check</pre>
+      <p>The <span class="code2">MemWaitOpTrait</span> handler short-circuits the entire normal flow. <span class="code2">isIntersected</span> is never called.</p>
     </div>
     <div class="card yes">
-      <h3>Proposed: Defer to Filter</h3>
+      <h3>Proposed: Let isIntersected Decide</h3>
       <pre style="border:none;padding:10px;background:transparent;font-size:14px">
 async_copy → blockInfo records write
-async_wait → filter present? don't barrier
+async_wait → pass through (no special handling)
              pending writes stay in blockInfo
-local_load → isIntersected() → filter called
-             warpsPerCTA match → suppressed ✓</pre>
-      <p>When a <span class="code2">MembarFilterFn</span> is provided, let the filter decide at the read op instead.</p>
+local_load → isIntersected() decides:
+             overlap? → barrier (correct)
+             no overlap? → no barrier ✓
+             overlap + filter? → filter decides ✓</pre>
+      <p>The existing <span class="code2">isIntersected</span> mechanism handles all cases correctly — as a <strong>common solution</strong>, no filter required.</p>
     </div>
   </div>
-  <div class="key-point s2">This requires refactoring the <span class="code2">MemWaitOpTrait</span> handler in common <span class="code2">Membar.cpp</span> — not just adding a backend filter clause. The filter is never consulted today because the handler returns early.</div>
+  <div class="key-point s2">The <span class="code2">warpsPerCTA</span> filter is an <strong>optional further optimization</strong> on top: even when slices overlap, suppress the barrier if warps are disjoint. But the core fix is simply removing the unconditional barrier and letting <span class="code2">isIntersected</span> in <span class="code2">Membar.cpp</span> do its job.</div>
   <div class="slide-num">12 / 13</div>
 </div>
 

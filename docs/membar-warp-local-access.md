@@ -591,29 +591,24 @@ In a warp-disjoint pipeline:
   local_load  → blockInfo is clean, no barrier needed
 ```
 
-The CTA barrier after `async_wait` is unnecessary when warps are disjoint:
-`async_wait` ensures the data has arrived, and matching `warpsPerCTA`
-ensures each warp reads only what it wrote. No cross-warp synchronization
-is needed.
+The CTA barrier after `async_wait` is unnecessary in many cases. The
+existing `isIntersected` mechanism already knows how to decide whether
+a barrier is needed between two ops — it just never gets the chance
+because the `MemWaitOpTrait` handler short-circuits the flow.
 
-**Proposed solution**: make the `MemWaitOpTrait` handler defer to the
-normal inter-op flow when a `MembarFilterFn` is provided. Instead of
-unconditionally inserting a barrier, let the pending writes stay in
-`blockInfo`. When the next read op arrives, `isIntersected` checks
-overlap and the filter decides based on `warpsPerCTA`:
+**Proposed solution**: remove the unconditional barrier from the
+`MemWaitOpTrait` handler and let the normal `isIntersected` path
+decide. Instead of inserting a barrier at `async_wait`, let the
+pending writes stay in `blockInfo`. When the next read op arrives,
+`isIntersected` checks whether the write and read slices actually
+overlap:
 
 ```cpp
 if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
     !containsLocalBarrier(op->getNextNode())) {
-    if (!filter) {
-        // No filter → conservative: insert barrier now
-        builder->setInsertionPointAfter(op);
-        insertBarrier(op, builder);
-        blockInfo->sync();
-        return;
-    }
-    // With a filter: don't insert barrier here.
-    // Let the filter decide when the read op arrives.
+    // Don't insert barrier here. Let the pending writes stay in
+    // blockInfo. The normal isIntersected path will decide when
+    // the read op arrives.
 }
 ```
 
@@ -621,17 +616,20 @@ The resulting flow:
 
 ```
   async_copy  → blockInfo records shared write
-  async_wait  → filter present, no barrier inserted, pending writes stay
+  async_wait  → pass through (no barrier, no sync)
   local_load  → curBlockInfo records shared read
-               isIntersected checks overlap
-               → MembarFilterFn(async_copy, local_load, ...)
-                 warpsPerCTA match → filter returns true → barrier suppressed
+               isIntersected checks overlap:
+               1. slices don't overlap → no barrier (e.g., different buffer slots)
+               2. slices overlap, no filter → barrier inserted (conservative, correct)
+               3. slices overlap, filter present → MembarFilterFn decides
+                  warpsPerCTA match → barrier suppressed
 ```
 
-When `warpsPerCTA` does NOT match, the filter returns false, and
-`isIntersected` returns true, causing the normal CTA barrier to be
-inserted before the read op — same net effect as today, just at the
-read op instead of at `async_wait`.
+This is a **common solution** in `Membar.cpp` that works for all
+backends, with or without a `MembarFilterFn`. The `warpsPerCTA`
+filter is an optional further optimization: even when slices overlap,
+suppress the barrier if warps are disjoint. But the core fix is
+simply letting `isIntersected` do its job instead of short-circuiting.
 
 ## Applicability
 
@@ -714,7 +712,7 @@ Warp-disjointness and buffer slot disjointness (`BufferIndexExpr`) are
 | **`async_copy`** | Not considered | Extensible: writer `warpsPerCTA` from source encoding, reader from `local_load` encoding |
 | **MMA operands** | Assumed cross-warp | Checkable; batched MMA with matching distributions detected |
 | **Batched MMA** | Not distinguished from standard MMA | Detected: warps across batch dimension → matching `warpsPerCTA` → barrier suppressed |
-| **`MemWaitOpTrait`** | Unconditional CTA barrier after `async_wait` | Proposed: defer to `MembarFilterFn` when filter is present |
+| **`MemWaitOpTrait`** | Unconditional CTA barrier after `async_wait` | Proposed: remove unconditional barrier, let `isIntersected` decide (common solution) |
 | **Padded layouts** | Not considered | Handled natively (encoding-agnostic: each element always gets a unique address) |
 | **Swizzled layouts** | Not considered | Handled natively (swizzle shuffles addresses but never puts two elements at the same address) |
 | **Scope** | Situational | TDM op pairs implemented; `async_copy`, `local_store`/`local_load`, `MemWaitOpTrait` extensible |
