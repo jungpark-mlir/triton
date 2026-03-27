@@ -672,50 +672,17 @@ preserving in all scenarios:
 | After Problem 1 fix (slot distinction via `BufferIndexExpr`) | `async_copy` write to slot C, `local_load` read from slot A → no overlap → **no barrier** | **Wrong** |
 | With `MemAsyncWriteOpTrait` (async writes cleared) | `blockInfo` empty at `local_load` → **no barrier** | **Wrong** |
 
-A correct refactoring needs to address these interactions. Several
-approaches are possible:
+A correct refactoring requires separating async DMA writes from
+synchronous writes in the membar tracking. The proposed approach —
+**async write tracking** — adds a dedicated `asyncWriteSlices` map
+to `BlockInfo` that is invisible to `isIntersected` and survives
+`sync()`. At `async_wait`, writes are promoted to `syncWriteSlices`,
+where `isIntersected` + the filter handle the barrier decision.
 
-**Option A: Keep unconditional handler, add filter override.**
-Keep the handler but allow `MembarFilterFn` to suppress it:
-
-```cpp
-if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
-    !containsLocalBarrier(op->getNextNode())) {
-    // Check if the filter says we can skip the barrier.
-    // This requires building a curBlockInfo that represents
-    // "all pending async writes" and calling isIntersected.
-    if (!canFilterMemWaitBarrier(op, blockInfo, filter)) {
-        builder->setInsertionPointAfter(op);
-        insertBarrier(op, builder);
-    }
-    blockInfo->sync();
-    return;
-}
-```
-
-This preserves the handler's role as the barrier decision point while
-giving the filter a chance to suppress it. The `sync()` always runs
-(clearing tracked state regardless of barrier insertion).
-
-**Option B: Tag async writes for deferred barrier.**
-Instead of clearing async writes from `blockInfo` (MemAsyncWriteOpTrait)
-or letting them trigger premature barriers, tag them so that:
-- They don't trigger barriers before `async_wait` (DMA in-flight)
-- They DO trigger barriers after `async_wait` (DMA complete)
-- The filter can suppress those barriers when warp-local
-
-This requires richer state tracking in `blockInfo` — knowing which
-writes are "async-pending" vs "async-completed."
-
-**Option C: Separate async write tracking.**
-Track async writes in a dedicated `asyncWriteSlices` map that
-`isIntersected` ignores. At `async_wait`, move them into regular
-`syncWriteSlices`. Then the normal RAW path handles the rest, and
-the filter can suppress as needed.
-
-Each option has trade-offs in complexity and intrusiveness. The choice
-depends on how much refactoring of `Membar.cpp` we're willing to do
-and whether we want to keep the change AMD-specific or make it generic.
+See [membar-async-write-tracking.md](membar-async-write-tracking.md)
+for the full design, implementation details, behavior-preserving
+verification steps, and coverage of tricky cases (interleaved reads,
+ConvertLayoutOp with scratch, multiple async copies, manual barriers).
 
 ## Applicability
 

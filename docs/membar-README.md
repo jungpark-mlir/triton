@@ -103,14 +103,15 @@ sub-problems:
 - **Problem 2-2: `MemWaitOpTrait` unconditional barrier.** A separate
   codepath in membar unconditionally inserts a CTA barrier after
   `async_wait`, bypassing `isIntersected` and the filter entirely.
-  Simply removing the handler and relying on `isIntersected` is **not**
-  safe — the behavioral equivalence is fragile, breaking when buffer
-  slots become distinguishable (Problem 1 fix) or when
-  `MemAsyncWriteOpTrait` clears async writes from `blockInfo`.
-  Refactoring options: (A) keep handler + add filter override,
-  (B) tag async writes for deferred barrier, (C) separate async
-  write tracking merged at wait time. Goal: let `warpsPerCTA`
-  filter suppress the post-wait barrier for warp-local cases.
+  Simply removing the handler is **not** safe — when shared memory
+  reads are interleaved with in-flight DMA, the intervening barrier's
+  `sync()` clears the async write from tracking, leaving no barrier
+  after the wait. The proposed solution is **async write tracking**:
+  a dedicated `asyncWriteSlices` map in `BlockInfo` that is invisible
+  to `isIntersected` and survives `sync()`. At `async_wait`, writes
+  are promoted to `syncWriteSlices`, and the normal `isIntersected` +
+  filter path handles barrier decisions. See
+  [membar-async-write-tracking.md](membar-async-write-tracking.md).
 
 The originally proposed GF(2) linear independence test is documented as a
 design alternative but was not implemented — the `warpsPerCTA` comparison is
@@ -146,6 +147,9 @@ simpler, handles padded layouts, and covers all practical cases.
 **To understand the warp-local barrier elimination (implemented):**
 → [membar-warp-local-access.md](membar-warp-local-access.md)
 
+**To understand the async write tracking proposal (Problem 2-2):**
+→ [membar-async-write-tracking.md](membar-async-write-tracking.md)
+
 ---
 
 ## Relationship Between Documents
@@ -173,6 +177,9 @@ simpler, handles padded layouts, and covers all practical cases.
          │                                                 │
          └── Problem 2: Warp-Local Access ─────────────────┘
                  │
-                 └── membar-warp-local-access.md  ← IMPLEMENTED
-                     (warpsPerCTA comparison + one-to-one address mapping)
+                 ├── membar-warp-local-access.md  ← IMPLEMENTED
+                 │   (warpsPerCTA comparison + one-to-one address mapping)
+                 │
+                 └── membar-async-write-tracking.md  ← PROPOSED
+                     (separate async DMA write tracking in BlockInfo)
 ```

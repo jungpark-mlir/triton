@@ -173,12 +173,16 @@ extends naturally to `AsyncCopyGlobalToLocalOp` → `local_load` and
 codepath in membar unconditionally inserts a CTA barrier after
 `async_wait`, bypassing `isIntersected` and the filter entirely.
 Simply removing this handler and relying on `isIntersected` is **not**
-behavior-preserving — the equivalence breaks when buffer slots become
-distinguishable (Problem 1 fix) or when `MemAsyncWriteOpTrait` clears
-async writes from `blockInfo`. Refactoring options include: (A) keeping
-the handler but adding a filter override, (B) tagging async writes for
-deferred barrier, or (C) separate async write tracking that merges into
-`syncWriteSlices` at wait time.
+behavior-preserving — the equivalence breaks when shared memory reads
+are interleaved with in-flight DMA (the intervening barrier's `sync()`
+clears the async write from tracking). The proposed solution is
+**async write tracking**: a dedicated `asyncWriteSlices` map in
+`BlockInfo` that is invisible to `isIntersected` and survives `sync()`.
+At `async_wait`, writes are promoted to `syncWriteSlices`, and the
+normal `isIntersected` + filter path handles barrier decisions.
 
-See [membar-warp-local-access.md](membar-warp-local-access.md) for full
-design, comparison with `isCvtDimSync`, and details on both sub-problems.
+See [membar-warp-local-access.md](membar-warp-local-access.md) for
+Problem 2-1 design, and
+[membar-async-write-tracking.md](membar-async-write-tracking.md) for
+the full Problem 2-2 design, implementation, tricky cases, and
+migration path to common logic.
