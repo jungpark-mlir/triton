@@ -183,17 +183,17 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-M", type=int, default=256, help='problem M size')
-    parser.add_argument("-N", type=int, default=256, help='problem N size')
-    parser.add_argument("-K", type=int, default=1024, help='problem K size')
-    parser.add_argument("--num-buffers", type=int, choices=[2, 3, 4], default=3, help='num shared memory buffers')
+    parser.add_argument("-M", type=int, default=16, help='problem M size')
+    parser.add_argument("-N", type=int, default=16, help='problem N size')
+    parser.add_argument("-K", type=int, default=64, help='problem K size')
+    parser.add_argument("--num-buffers", type=int, choices=[2, 3, 4], default=2, help='num shared memory buffers')
     parser.add_argument("--tdmstore", action="store_true", help="Use TDM store instead of global store")
     parser.add_argument("--tdmswizzled", action="store_true", help="Use swizzled shared layout for TDM store (default: padded)")
     parser.add_argument("--dump", action="store_true", help="Print out result/golden tensors")
     args = parser.parse_args()
 
     M, N, K = args.M, args.N, args.K
-    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+    BLOCK_M, BLOCK_N, BLOCK_K = 16, 16, 32
     NUM_BUFFERS = args.num_buffers
     NUM_WARPS = 8
     TRANSPOSE_B = True

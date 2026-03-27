@@ -597,6 +597,9 @@ void fillTDMDescriptor(
     Value cmp = b.icmp_ult(tensorShape[numDims - 1], originalTileDim0);
     tensorShape[numDims - 1] =
         b.select(cmp, tensorShape[numDims - 1], originalTileDim0);
+
+    // Clear pad_enable (bit 20), pad_interval (bits 22-24), pad_amount (bits 25-31)
+    group1[0] = b.and_(group1[0], b.i32_val(0x000FFFFF));
   }
 
   // Update group0 with addresses
