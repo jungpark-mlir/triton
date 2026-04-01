@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TDM Warp Specialization</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #242836;
+  --accent: #5b8def;
+  --accent2: #43d9ad;
+  --warn: #e5a63e;
+  --err: #e55a5a;
+  --text: #e0e4ef;
+  --text2: #8b91a5;
+  --mono: 'JetBrains Mono', monospace;
+  --sans: 'DM Sans', sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  height: 100vh;
+}
+
+.deck { position: relative; height: 100vh; width: 100vw; }
+
+.slide {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  padding: 56px 72px;
+  overflow-y: auto;
+}
+.slide.active { display: flex; }
+
+.slide h1 {
+  font-size: 44px;
+  font-weight: 700;
+  margin-bottom: 12px;
+  letter-spacing: -0.5px;
+}
+.slide h2 {
+  font-size: 32px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  color: var(--accent);
+}
+.slide h3 {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--accent2);
+  margin: 20px 0 8px;
+}
+.slide p, .slide li {
+  font-size: 20px;
+  line-height: 1.55;
+  color: var(--text);
+}
+.slide ul { list-style: none; padding-left: 0; }
+.slide ul li {
+  position: relative;
+  padding-left: 24px;
+  margin-bottom: 10px;
+}
+.slide ul li::before {
+  content: '▸';
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+  font-weight: 700;
+}
+.slide .subtitle {
+  font-size: 22px;
+  color: var(--text2);
+  margin-bottom: 32px;
+}
+
+pre {
+  background: var(--surface);
+  border: 1px solid var(--surface2);
+  border-radius: 8px;
+  padding: 18px 22px;
+  font-family: var(--mono);
+  font-size: 15px;
+  line-height: 1.55;
+  overflow-x: auto;
+  margin: 14px 0;
+  color: var(--text);
+}
+code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  background: var(--surface);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.cols { display: flex; gap: 40px; flex: 1; align-items: flex-start; }
+.cols > * { flex: 1; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 14px 0;
+  font-size: 17px;
+}
+th {
+  text-align: left;
+  padding: 10px 14px;
+  background: var(--surface);
+  color: var(--accent);
+  font-weight: 600;
+  border-bottom: 2px solid var(--accent);
+}
+td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--surface2);
+  vertical-align: top;
+}
+tr:last-child td { border-bottom: none; }
+
+.badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
+.badge-green { background: #1a3a2a; color: var(--accent2); border: 1px solid var(--accent2); }
+.badge-red { background: #3a1a1a; color: var(--err); border: 1px solid var(--err); }
+.badge-yellow { background: #3a2e1a; color: var(--warn); border: 1px solid var(--warn); }
+.badge-blue { background: #1a2a3a; color: var(--accent); border: 1px solid var(--accent); }
+
+.highlight { color: var(--accent); font-weight: 600; }
+.highlight2 { color: var(--accent2); font-weight: 600; }
+.dim { color: var(--text2); }
+
+.box {
+  background: var(--surface);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 16px 20px;
+  margin: 14px 0;
+}
+.box-warn {
+  border-left-color: var(--warn);
+}
+.box-green {
+  border-left-color: var(--accent2);
+}
+
+.progress {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+  z-index: 100;
+}
+
+.slide-num {
+  position: fixed;
+  bottom: 16px;
+  right: 28px;
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--text2);
+  z-index: 100;
+}
+
+.nav-hint {
+  position: fixed;
+  bottom: 16px;
+  left: 28px;
+  font-size: 13px;
+  color: var(--text2);
+  z-index: 100;
+  opacity: 0.6;
+}
+
+/* title slide */
+.title-slide {
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}
+.title-slide h1 { font-size: 56px; margin-bottom: 16px; }
+.title-slide .subtitle { font-size: 24px; }
+.title-slide .meta { font-size: 16px; color: var(--text2); margin-top: 28px; }
+
+.diagram {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
+  margin: 20px 0;
+  flex-wrap: wrap;
+}
+.diagram .block {
+  padding: 12px 20px;
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 15px;
+  text-align: center;
+  min-width: 120px;
+}
+.diagram .arrow {
+  font-size: 24px;
+  color: var(--text2);
+}
+.block-active { background: #1a3a2a; border: 2px solid var(--accent2); color: var(--accent2); }
+.block-inactive { background: var(--surface2); border: 2px solid var(--text2); color: var(--text2); }
+.block-accent { background: #1a2a3a; border: 2px solid var(--accent); color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+
+<!-- Slide 0: Title -->
+<div class="slide title-slide active">
+  <h1>TDM Warp Specialization</h1>
+  <p class="subtitle">Narrowed warp mapping for TDM copies in Triton AMDGPU</p>
+  <p class="meta">
+    Jungwook Park<br>
+    Early design exploration
+  </p>
+</div>
+
+<!-- Slide 1: Motivation -->
+<div class="slide">
+  <h2>Motivation</h2>
+  <p style="margin-bottom:20px">In warp-pipelined kernels on gfx1250, <strong>all 8 warps</strong> issue identical TDM copies. But global memory latency is the same regardless of how many warps request it.</p>
+  <div class="box">
+    <p><strong>Key observation:</strong> If only the <span class="highlight2">upper warp group</span> (warps 0–3, one stage ahead) issues TDM copies, the memory request is invoked <strong>earlier</strong> relative to when the lower group needs the data.</p>
+  </div>
+  <ul style="margin-top:20px">
+    <li>The phase shift provides natural latency tolerance</li>
+    <li>By the time the lower group needs data, it's already in LDS</li>
+    <li>Goal: improve latency hiding <em>without</em> changing the programming model</li>
+  </ul>
+</div>
+
+<!-- Slide 2: Background - Group Split -->
+<div class="slide">
+  <h2>Background: Warp-Pipeline Groups</h2>
+  <div class="cols">
+    <div>
+      <p>8 warps split into two groups by <code>threadIdx.x</code>:</p>
+      <pre>warpIDX = threadIdx.x / (warpSize × 4)
+warpLow  = (warpIDX == 0) → warps {0,1,2,3}
+warpHigh = (warpIDX != 0) → warps {4,5,6,7}</pre>
+      <p style="margin-top:16px">Round-robin SIMD assignment → each group has <strong>one warp per SIMD</strong>.</p>
+      <p style="margin-top:8px" class="dim">warpLow enters the loop first (one stage ahead).</p>
+    </div>
+    <div>
+      <table>
+        <tr><th>SIMD</th><th>warpLow</th><th>warpHigh</th></tr>
+        <tr><td>0</td><td>warp 0</td><td>warp 4</td></tr>
+        <tr><td>1</td><td>warp 1</td><td>warp 5</td></tr>
+        <tr><td>2</td><td>warp 2</td><td>warp 6</td></tr>
+        <tr><td>3</td><td>warp 3</td><td>warp 7</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 3: Background - Coupling -->
+<div class="slide">
+  <h2>Background: TDM Copy ↔ async_wait</h2>
+  <div class="cols">
+    <div>
+      <h3>Hardware coupling</h3>
+      <ul>
+        <li><code>tdm_copy</code> — async global→LDS transfer for <em>this warp's</em> sub-tile</li>
+        <li><code>async_wait(N)</code> — stall until ≤N of <em>this warp's</em> copies remain</li>
+        <li>Warp 0 <strong>cannot</strong> wait on warp 4's copies</li>
+      </ul>
+      <h3>Count-based, not handle-based</h3>
+      <ul>
+        <li>No token or tag to bind a wait to a specific copy</li>
+        <li>Association is implicit via FIFO ordering</li>
+      </ul>
+    </div>
+    <div>
+<pre>tdm_copy(A)      # outstanding = 1
+tdm_copy(B)      # outstanding = 2
+tdm_copy(scaleA) # outstanding = 3
+tdm_copy(scaleB) # outstanding = 4
+
+async_wait(2)    # ≤2 remain → A,B done
+... use A, B ...
+
+async_wait(0)    # 0 remain → all done
+... use scaleA, scaleB ...</pre>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 4: Challenges -->
+<div class="slide">
+  <h2>Three Challenges</h2>
+  <p class="dim" style="margin-bottom:24px">These hazards prevented simpler alternatives and shaped the final design.</p>
+
+  <div class="box" style="margin-bottom:16px">
+    <h3 style="margin-top:0">Challenge 1: Co-predication</h3>
+    <p><code>tdm_copy</code> and <code>async_wait</code> must run on the <strong>same warps</strong>. But <code>async_wait</code> sits <em>between</em> stages — it can't inherit a stage's annotation.</p>
+  </div>
+
+  <div class="box box-warn" style="margin-bottom:16px">
+    <h3 style="margin-top:0">Challenge 2: Count-based copy-to-wait association</h3>
+    <p>Multiple copies + multiple waits → compiler can't match them individually. Splitting copies across warp groups breaks wait counts.</p>
+    <p style="margin-top:6px"><span class="badge badge-green">Resolved</span> Epoch-based all-or-nothing analysis using <code>async_wait(0)</code> boundaries.</p>
+  </div>
+
+  <div class="box" style="margin-bottom:16px">
+    <h3 style="margin-top:0">Challenge 3: Descriptor construction separation</h3>
+    <p><code>make_tensor_desc</code> and <code>tdm_copy</code> are separate ops. Annotating the copy doesn't change the descriptor's sub-tile layout.</p>
+    <p style="margin-top:6px"><span class="badge badge-green">Resolved</span> Place <code>tdm_specialize=True</code> on the descriptor, not the copy.</p>
+  </div>
+</div>
+
+<!-- Slide 5: Solution -->
+<div class="slide">
+  <h2>Solution: Narrowed Warp Mapping</h2>
+  <p style="margin-bottom:20px">Only the first 4 warps are active for TDM. The block is remapped so they cover the full tile.</p>
+  <div class="cols">
+    <div>
+      <h3>Default (8 warps)</h3>
+      <div class="diagram" style="flex-direction:column;align-items:stretch">
+        <div class="block block-active" style="min-width:0">warp 0 → [32, 64]</div>
+        <div class="block block-active" style="min-width:0">warp 1 → [32, 64]</div>
+        <div class="block block-active" style="min-width:0">warp 2 → [32, 64]</div>
+        <div class="block block-active" style="min-width:0">warp 3 → [32, 64]</div>
+        <div class="block block-active" style="min-width:0">warp 4 → [32, 64]</div>
+        <div class="block block-active" style="min-width:0">warp 5 → [32, 64]</div>
+        <div class="block block-active" style="min-width:0">warp 6 → [32, 64]</div>
+        <div class="block block-active" style="min-width:0">warp 7 → [32, 64]</div>
+      </div>
+    </div>
+    <div>
+      <h3>Specialized (4 warps)</h3>
+      <div class="diagram" style="flex-direction:column;align-items:stretch">
+        <div class="block block-accent" style="min-width:0">warp 0 → [64, 64] ✓</div>
+        <div class="block block-accent" style="min-width:0">warp 1 → [64, 64] ✓</div>
+        <div class="block block-accent" style="min-width:0">warp 2 → [64, 64] ✓</div>
+        <div class="block block-accent" style="min-width:0">warp 3 → [64, 64] ✓</div>
+        <div class="block block-inactive" style="min-width:0">warp 4 → inactive</div>
+        <div class="block block-inactive" style="min-width:0">warp 5 → inactive</div>
+        <div class="block block-inactive" style="min-width:0">warp 6 → inactive</div>
+        <div class="block block-inactive" style="min-width:0">warp 7 → inactive</div>
+      </div>
+    </div>
+  </div>
+  <p class="dim" style="margin-top:12px;text-align:center">Full block [256, 64] copied to LDS. Content identical. Only work distribution changes.</p>
+</div>
+
+<!-- Slide 6: Constraint + Compiler Actions -->
+<div class="slide">
+  <h2>Constraint &amp; Compiler Actions</h2>
+  <div class="box box-warn" style="margin-bottom:24px">
+    <h3 style="margin-top:0">Hard constraint: no mixing within an epoch</h3>
+    <p>Specialized and non-specialized TDM copies <strong>cannot coexist</strong> between two <code>async_wait(0)</code> boundaries. Mixing breaks FIFO count semantics — the compiler emits an error.</p>
+  </div>
+  <h3>Compiler actions</h3>
+  <table>
+    <tr><th>#</th><th>Action</th></tr>
+    <tr><td>1</td><td>Build TDM descriptor with <code>numWarps=4</code></td></tr>
+    <tr><td>2</td><td>Predicate <code>tdm_copy</code> — only warps 0–3 execute</td></tr>
+    <tr><td>3</td><td>Predicate <code>async_wait</code> — only warps 0–3 wait</td></tr>
+    <tr><td>4</td><td>Insert barrier after wait — warps 4–7 see updated LDS</td></tr>
+    <tr><td>5</td><td>Verify no mixing within any epoch</td></tr>
+  </table>
+  <p style="margin-top:16px"><strong>Wait counts unchanged</strong> — each active warp issues the same number of copies, just with larger sub-tiles.</p>
+</div>
+
+<!-- Slide 7: Triggering -->
+<div class="slide">
+  <h2>Triggering: <code>tdm_specialize</code> on Descriptor</h2>
+  <p style="margin-bottom:16px">Boolean on <code>make_tensor_desc</code>. Explicit, self-contained, not tied to warp-pipelining.</p>
+  <div class="cols">
+    <div>
+      <h3>Gluon API</h3>
+<pre>desc_a = tdm.make_tensor_desc(
+    ..., tdm_specialize=True)
+desc_b = tdm.make_tensor_desc(
+    ..., tdm_specialize=True)
+
+for k in range(0, K, BLOCK_K):
+    tdm.async_wait(N)        # predicated
+    with warp_pipeline_stage("memory"):
+        tdm.copy(desc_a, buf_a) # predicated
+        tdm.copy(desc_b, buf_b) # predicated
+    with warp_pipeline_stage("compute"):
+        acc = wmma(a, b, acc)   # all warps</pre>
+    </div>
+    <div>
+      <h3>IR</h3>
+<pre>module attributes {
+  ttg.num-warps = 8
+}
+
+%desc_a = tt.make_tensor_desc ...
+           { tdm.specialize = true }
+
+%desc_b = tt.make_tensor_desc ...
+           // no attr → default</pre>
+      <h3>Also works standalone</h3>
+      <p>Without warp-pipelining, compiler predicates with <code>warp_id &lt; 4</code> and inserts <code>s_barrier</code>.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 8: Epoch Analysis -->
+<div class="slide">
+  <h2>Epoch-Based Analysis</h2>
+  <p style="margin-bottom:16px"><code>async_wait(0)</code> = full FIFO drain → natural epoch boundary for local reasoning.</p>
+<pre>       ┌─── epoch 1 ──────────────────────┐
+       │ tdm_copy(desc_spec_A) ← specialize│
+       │ tdm_copy(desc_spec_B) ← specialize│
+       │ async_wait(2)         ← predicate │
+       │ ... use A ...                     │
+       │ async_wait(0)  ──── DRAIN ────────┘  ← boundary
+       │
+       ├─── epoch 2 ──────────────────────┐
+       │ tdm_copy(desc_full_C) ← full     │
+       │ async_wait(0)  ──── DRAIN ────────┘  ← leave alone
+       │
+       ├─── epoch 3 ──────────────────────┐
+       │ tdm_copy(desc_spec_D) ← specialize│
+       │ async_wait(0)  ──── DRAIN ────────┘  ← predicate</pre>
+  <div class="cols" style="margin-top:16px">
+    <div class="box box-green"><strong>All specialized?</strong> → Predicate entire epoch.</div>
+    <div class="box"><strong>None specialized?</strong> → Leave untouched.</div>
+    <div class="box box-warn"><strong>Mixed?</strong> → Error.</div>
+  </div>
+</div>
+
+<!-- Slide 9: Phase Shift Synergy -->
+<div class="slide">
+  <h2>Phase-Shift Synergy</h2>
+  <p style="margin-bottom:20px">The warp-pipeline phase shift is what makes this optimization most effective.</p>
+<pre>Phase 0:  Upper(warpLow) → tdm_copy(tile[1])          Lower(warpHigh) → (deferred)
+Phase 1:  Upper           → async_wait; mfma(tile[0])   Lower → mfma(tile[0])
+Phase 2:  Upper           → tdm_copy(tile[2])          Lower → mfma(tile[1])</pre>
+  <div class="box box-green" style="margin-top:20px">
+    <p><strong>Data flow for tile[1]:</strong></p>
+    <ul>
+      <li>Upper issues <code>tdm_copy(tile[1])</code> at Phase 0</li>
+      <li>Upper does <code>async_wait</code> at Phase 1 — data is in LDS</li>
+      <li>Lower needs tile[1] at Phase 2 — <span class="highlight2">one full phase after data is ready</span></li>
+    </ul>
+  </div>
+  <table style="margin-top:20px">
+    <tr><th></th><th>Upper group</th><th>Lower group</th></tr>
+    <tr><td><strong>Current</strong></td><td><code>async_wait</code> between stages</td><td><code>async_wait</code> between stages</td></tr>
+    <tr><td><strong>Specialized</strong></td><td><code>async_wait</code> between stages</td><td><strong>nothing</strong> — CondBarrier covers it</td></tr>
+  </table>
+</div>
+
+<!-- Slide 10: Alternatives -->
+<div class="slide">
+  <h2>Alternative Triggering Mechanisms</h2>
+  <p class="dim" style="margin-bottom:20px">All share the same challenges. Epoch analysis resolves Challenge 2 for all. The differentiator is descriptor construction (Challenge 3) and API design.</p>
+  <table>
+    <tr><th>Option</th><th>Approach</th><th>Verdict</th></tr>
+    <tr>
+      <td><strong>A</strong></td>
+      <td>Stage attribute + paired copies (each warp covers partner's sub-tile)</td>
+      <td><span class="badge badge-yellow">Viable</span> but doubles FIFO, adjusts wait counts, tied to pipelining</td>
+    </tr>
+    <tr>
+      <td><strong>B</strong></td>
+      <td><code>(stride, count)</code> on <code>tdm_copy</code> ops</td>
+      <td><span class="badge badge-red">Insufficient</span> doesn't affect descriptor (Challenge 3)</td>
+    </tr>
+    <tr>
+      <td><strong>C</strong></td>
+      <td><code>warpsPerCTA</code> on TDM ops</td>
+      <td><span class="badge badge-red">Insufficient</span> conflates layout vs module concepts + Challenge 3</td>
+    </tr>
+    <tr>
+      <td><strong>D</strong></td>
+      <td>Per-loop attribute (<code>tdm_warp_specialize()</code> directive)</td>
+      <td><span class="badge badge-yellow">Viable</span> but compiler must still rebuild descriptors internally (Challenge 3)</td>
+    </tr>
+    <tr>
+      <td><strong>E</strong></td>
+      <td>Compiler flag only</td>
+      <td><span class="badge badge-blue">Escape hatch</span> too coarse alone, good supplement</td>
+    </tr>
+    <tr>
+      <td><strong>F</strong></td>
+      <td>Auto-detection from IR patterns</td>
+      <td><span class="badge badge-yellow">Supplement</span> can't determine profitability</td>
+    </tr>
+    <tr>
+      <td><strong>G</strong></td>
+      <td>Warp-level programming (<code>warp_group</code> context manager)</td>
+      <td><span class="badge badge-red">Undesirable</span> breaks block-level SPMD model</td>
+    </tr>
+  </table>
+</div>
+
+<!-- Slide 11: Summary -->
+<div class="slide">
+  <h2>Summary</h2>
+  <table>
+    <tr><th>Aspect</th><th>Design</th></tr>
+    <tr><td><strong>Signal</strong></td><td><code>tdm_specialize=True</code> on <code>make_tensor_desc</code></td></tr>
+    <tr><td><strong>API</strong></td><td>Boolean — simple, no warp count math</td></tr>
+    <tr><td><strong>IR</strong></td><td><code>tdm.specialize = true</code> attribute on descriptor op</td></tr>
+    <tr><td><strong>Descriptor</strong></td><td>Built with <code>numWarps=4</code> (first 4 warps)</td></tr>
+    <tr><td><strong>Analysis</strong></td><td>Epoch-based: split at <code>async_wait(0)</code>, all-or-nothing per epoch</td></tr>
+    <tr><td><strong>Predication</strong></td><td><code>warpLow</code> (pipelined) or <code>warp_id &lt; 4</code> (standalone)</td></tr>
+    <tr><td><strong>Wait counts</strong></td><td>Unchanged — same FIFO per active warp</td></tr>
+    <tr><td><strong>Phase synergy</strong></td><td>Lower group gets free latency hiding from deferral</td></tr>
+    <tr><td><strong>Scope</strong></td><td>Not tied to warp-pipelining — works standalone</td></tr>
+    <tr><td><strong>Escape hatch</strong></td><td><code>-amdgpu-tdm-warp-specialize={off|on|auto}</code></td></tr>
+  </table>
+</div>
+
+</div><!-- /deck -->
+
+<div class="progress" id="progress"></div>
+<div class="slide-num" id="slideNum"></div>
+<div class="nav-hint">← → arrow keys &nbsp;|&nbsp; click to advance</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+let current = 0;
+const total = slides.length;
+
+function show(n) {
+  slides[current].classList.remove('active');
+  current = Math.max(0, Math.min(n, total - 1));
+  slides[current].classList.add('active');
+  document.getElementById('progress').style.width = ((current / (total - 1)) * 100) + '%';
+  document.getElementById('slideNum').textContent = (current + 1) + ' / ' + total;
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); show(current + 1); }
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); show(current - 1); }
+  if (e.key === 'Home') { e.preventDefault(); show(0); }
+  if (e.key === 'End') { e.preventDefault(); show(total - 1); }
+});
+
+document.addEventListener('click', e => {
+  if (e.clientX > window.innerWidth / 2) show(current + 1);
+  else show(current - 1);
+});
+
+show(0);
+</script>
+</body>
+</html>
