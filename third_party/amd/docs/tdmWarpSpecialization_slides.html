@@ -512,7 +512,50 @@ Phase 2:  Upper           → tdm_copy(tile[2])          Lower → mfma(tile[1])
   </table>
 </div>
 
-<!-- Slide 11: Summary -->
+<!-- Slide 11: Viable Alternatives Detail -->
+<div class="slide">
+  <h2>Viable Alternatives: A Closer Look</h2>
+  <div class="cols">
+    <div>
+      <h3>Option A: Stage attribute + paired copies</h3>
+<pre>with warp_pipeline_stage("memory",
+                         tdm_specialize=True):
+    tdm.copy(desc_a, buf_a)
+    tdm.copy(desc_b, buf_b)</pre>
+      <ul>
+        <li>Descriptor built for <strong>8 warps</strong> (unchanged)</li>
+        <li>Each active warp copies its own <em>and</em> its partner's sub-tile<br>
+            <span class="dim">warp 0 → sub-tile 0 + sub-tile 4</span></li>
+        <li><span class="badge badge-yellow">Trade-off</span> FIFO depth doubles (2× copies per warp)</li>
+        <li><span class="badge badge-yellow">Trade-off</span> Wait counts must be adjusted (×2)</li>
+        <li><span class="badge badge-red">Limitation</span> Tied to warp-pipelining — no standalone use</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Option D: Per-loop attribute</h3>
+<pre># Gluon
+gl.amd.tdm_warp_specialize()
+for k in range(0, K, BLOCK_K):
+    tdm.copy(desc_a, buf_a)
+    ...</pre>
+<pre># IR
+scf.for ... { tdm.specialize = true } {
+  ...
+}</pre>
+      <ul>
+        <li>All TDM copies in the loop are specialized</li>
+        <li>Per-loop granularity (useful for multi-loop kernels)</li>
+        <li><span class="badge badge-yellow">Trade-off</span> Compiler must find and rebuild <code>make_tensor_desc</code> ops feeding the loop</li>
+        <li><span class="badge badge-yellow">Trade-off</span> No per-descriptor control</li>
+      </ul>
+    </div>
+  </div>
+  <div class="box box-green" style="margin-top:16px">
+    <p><strong>Chosen approach</strong> (<code>tdm_specialize=True</code> on descriptor) avoids both issues: descriptor is built correctly at the source, and each descriptor can be independently controlled.</p>
+  </div>
+</div>
+
+<!-- Slide 12: Summary -->
 <div class="slide">
   <h2>Summary</h2>
   <table>
