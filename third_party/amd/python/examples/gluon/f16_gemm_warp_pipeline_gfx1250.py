@@ -46,7 +46,8 @@ def gemm_tdm_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
                                              TRANSPOSE_B: ttgl.constexpr,  #
                                              WARP_BASES: ttgl.constexpr,  #
                                              USE_TDM_STORE: ttgl.constexpr,  #
-                                             TDM_SWIZZLED: ttgl.constexpr):
+                                             TDM_SWIZZLED: ttgl.constexpr,  #
+                                             OUT_FP16: ttgl.constexpr):
     a_dtype: ttgl.constexpr = a_ptr.type.element_ty
     b_dtype: ttgl.constexpr = b_ptr.type.element_ty
     ttgl.static_assert(a_dtype.is_fp16() or a_dtype.is_bf16(), "Only fp16/bf16 supported for A")
@@ -74,7 +75,7 @@ def gemm_tdm_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
 
     producer = 0
     consumer = 0
-    accumulator = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=c_ptr.type.element_ty, layout=WMMA_LAYOUT)
+    accumulator = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
 
     # Triple buffering
     # prefetch 2, the other one is overlapped.
@@ -100,12 +101,16 @@ def gemm_tdm_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
         consumer, accumulator = issue_wmma(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B,
                                            accumulator, (NUM_BUFFERS - 2 - i) * 2, NUM_BUFFERS, TRANSPOSE_B)
 
+    if OUT_FP16:
+        accumulator = accumulator.to(ttgl.float16)
+
     if USE_TDM_STORE:
+        out_dtype: ttgl.constexpr = ttgl.float16 if OUT_FP16 else c_ptr.type.element_ty
         if TDM_SWIZZLED:
             C_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])
         else:
             C_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_N, 4]], [BLOCK_M, BLOCK_N], [1, 0])
-        c_shared = ttgl.allocate_shared_memory(c_ptr.type.element_ty, shape=[BLOCK_M, BLOCK_N], layout=C_SHARED_LAYOUT)
+        c_shared = ttgl.allocate_shared_memory(out_dtype, shape=[BLOCK_M, BLOCK_N], layout=C_SHARED_LAYOUT)
         c_shared.store(accumulator)
         c_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
@@ -127,8 +132,9 @@ def gemm_tdm_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
 @pytest.mark.parametrize("M,N,K", [(2048, 2048, 2048)])
 @pytest.mark.parametrize("USE_TDM_STORE", [False])
 @pytest.mark.parametrize("TDM_SWIZZLED", [False])
+@pytest.mark.parametrize("OUT_FP16", [False])
 @pytest.mark.parametrize("DUMP", [False])
-def test_runtime_gemm_tdm_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, USE_TDM_STORE, TDM_SWIZZLED, DUMP):
+def test_runtime_gemm_tdm_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, USE_TDM_STORE, TDM_SWIZZLED, OUT_FP16, DUMP):
     if triton.cdiv(K, BLOCK_K) < NUM_BUFFERS:
         pytest.skip("Skip tests where K/BLOCK_K < NUM_BUFFERS")
 
@@ -138,7 +144,7 @@ def test_runtime_gemm_tdm_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRAN
     b = torch.randn((K, N), dtype=torch.float16)
     if TRANSPOSE_B:
         b = b.T.contiguous()
-    c = torch.zeros((M, N), dtype=torch.float32)
+    c = torch.zeros((M, N), dtype=torch.float16 if OUT_FP16 else torch.float32)
     stride_am, stride_ak = a.stride(0), a.stride(1)
     stride_bk, stride_bn = (b.stride(0), b.stride(1)) if not TRANSPOSE_B else (b.stride(1), b.stride(0))
     stride_cm, stride_cn = c.stride(0), c.stride(1)
@@ -161,16 +167,15 @@ def test_runtime_gemm_tdm_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRAN
         stride_cm, stride_cn,  #
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,  #
         NUM_BUFFERS=NUM_BUFFERS, TRANSPOSE_B=TRANSPOSE_B, WARP_BASES=warp_bases,  #
-        USE_TDM_STORE=USE_TDM_STORE, TDM_SWIZZLED=TDM_SWIZZLED,  #
+        USE_TDM_STORE=USE_TDM_STORE, TDM_SWIZZLED=TDM_SWIZZLED, OUT_FP16=OUT_FP16,  #
         num_warps=num_warps, waves_per_eu=num_warps // 4)
     static_profile(kernel)
 
     c_triton = c_device.cpu()
     c_torch = a.to(torch.float32) @ (b.to(torch.float32) if not TRANSPOSE_B else b.T.to(torch.float32))
+    if OUT_FP16:
+        c_torch = c_torch.to(torch.float16)
     torch.testing.assert_close(c_triton, c_torch, rtol=1e-4, atol=1e-4)
-    #torch.set_printoptions(threshold=float('inf'))
-    #mask = ~torch.isclose(c_triton, c_torch, rtol=1e-4, atol=1e-4)
-    #print("Failing indices:", mask.nonzero())
     if DUMP:
         print("triton")
         print(c_triton)
@@ -189,6 +194,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-buffers", type=int, choices=[2, 3, 4], default=3, help='num shared memory buffers')
     parser.add_argument("--tdmstore", action="store_true", help="Use TDM store instead of global store")
     parser.add_argument("--tdmswizzled", action="store_true", help="Use swizzled shared layout for TDM store (default: padded)")
+    parser.add_argument("--out16", action="store_true", help="Downcast accumulator to fp16 before store")
     parser.add_argument("--dump", action="store_true", help="Print out result/golden tensors")
     args = parser.parse_args()
 
@@ -199,7 +205,8 @@ if __name__ == "__main__":
     TRANSPOSE_B = True
     USE_TDM_STORE = args.tdmstore
     TDM_SWIZZLED = args.tdmswizzled
+    OUT_FP16 = args.out16
     DUMP = args.dump
-    print(f"({M=}, {N=}, {K=}), ({BLOCK_M=}, {BLOCK_N=}, {BLOCK_K=}), {TRANSPOSE_B=}, {NUM_WARPS=}, {NUM_BUFFERS=}, {USE_TDM_STORE=}, {TDM_SWIZZLED=}")
+    print(f"({M=}, {N=}, {K=}), ({BLOCK_M=}, {BLOCK_N=}, {BLOCK_K=}), {TRANSPOSE_B=}, {NUM_WARPS=}, {NUM_BUFFERS=}, {USE_TDM_STORE=}, {TDM_SWIZZLED=}, {OUT_FP16=}")
 
-    test_runtime_gemm_tdm_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, USE_TDM_STORE, TDM_SWIZZLED, DUMP)
+    test_runtime_gemm_tdm_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, USE_TDM_STORE, TDM_SWIZZLED, OUT_FP16, DUMP)

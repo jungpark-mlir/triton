@@ -585,19 +585,6 @@ void fillTDMDescriptor(
   // preserving the original tensor shape if smaller. Note that the pre
   // conditions are checked in the verifier already
   bool adjustedBlockShape = false;
-  if (isStore && padInterval > 0 && padAmount > 0) {
-    adjustedBlockShape = true;
-    Value originalTileDim0 = decodedBlockShape[numDims - 1];
-
-    // Adjust block shape (tile dimension) to include padding
-    decodedBlockShape[numDims - 1] =
-        b.add(originalTileDim0, b.i32_val(padAmount));
-
-    // Adjust tensor dimension to be min(tensor_dim0, original_tile_dim0)
-    Value cmp = b.icmp_ult(tensorShape[numDims - 1], originalTileDim0);
-    tensorShape[numDims - 1] =
-        b.select(cmp, tensorShape[numDims - 1], originalTileDim0);
-  }
 
   // Update group0 with addresses
   Value globalAddr = b.ptrtoint(i64_ty, srcPtr);

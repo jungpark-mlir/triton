@@ -614,6 +614,61 @@ private:
   const AMD::TargetInfo &targetInfo;
 };
 
+struct AMDLocalStoreOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::LocalStoreOp> {
+  AMDLocalStoreOpConversion(const LLVMTypeConverter &converter,
+                            const AMD::TargetInfo &targetInfo,
+                            PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::gpu::LocalStoreOp>(converter, benefit),
+        targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::LocalStoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    Value regVal = op.getSrc();
+    auto typeConverter = getTypeConverter();
+    auto memDescTy = cast<MemDescType>(op.getDst().getType());
+    auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getDst(),
+                                                         llvmElemTy, rewriter);
+    auto inVals = mlir::unpackLLElements(loc, adaptor.getSrc(), rewriter);
+
+    auto regTy = cast<RankedTensorType>(regVal.getType());
+    auto regLayout = triton::gpu::toLinearLayout(regTy);
+    auto sharedLayout =
+        triton::gpu::isPaddedEncoding(memDescTy.getEncoding())
+            ? triton::gpu::paddedLinearLayout(memDescTy)
+            : triton::gpu::toLinearLayout(memDescTy);
+    auto cvt = regLayout.invertAndCompose(sharedLayout);
+    if (!cvt.isTrivialOver({str_attr("block")}))
+      return failure();
+
+    unsigned elemBits = mlir::getIntOrFloatOrPtrBitWidth(llvmElemTy);
+    int64_t totalElems = 1;
+    for (auto dim : memDescTy.getShape())
+      totalElems *= dim;
+    int64_t totalBytes = totalElems * elemBits / 8;
+
+    bool needSchedBarrier = totalBytes > 65536;
+    if (needSchedBarrier)
+      ROCDL::SchedBarrier::create(rewriter, loc, 0);
+
+    mlir::lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
+                         rewriter, targetInfo);
+
+    if (needSchedBarrier)
+      ROCDL::SchedBarrier::create(rewriter, loc, 0);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  const AMD::TargetInfo &targetInfo;
+};
+
 } // namespace
 
 void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
@@ -626,6 +681,8 @@ void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
                                            transBenefit);
   patterns.add<LocalLoadPackedTransposedOpConversion>(typeConverter, targetInfo,
                                                       benefit);
+  patterns.add<AMDLocalStoreOpConversion>(typeConverter, targetInfo,
+                                          transBenefit);
   patterns.add<BarrierOpConversion, MemoryCounterWaitOpConversion>(
       typeConverter, targetInfo, barrierBenefit);
 }
