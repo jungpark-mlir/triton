@@ -346,6 +346,104 @@ public:
   }
 };
 
+// Check if the wrap-around cluster barrier of a converted pipelined loop
+// includes a local memory fence (ttg.barrier local).  The wrap-around barrier
+// is the last cluster barrier emitted just before the scf.yield terminator:
+//   [s_setprio]  sched_barrier  ttg.barrier_local|s_barrier  sched_barrier  yield
+static bool hasLocalFenceAtWrapAround(scf::ForOp forOp) {
+  auto *yieldOp = forOp.getBody()->getTerminator();
+  if (!yieldOp)
+    return false;
+  Operation *op = yieldOp->getPrevNode();
+  if (!op || !isa<ROCDL::SchedBarrier>(op))
+    return false;
+  op = op->getPrevNode();
+  if (!op)
+    return false;
+  if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
+    return barrier.hasLocal();
+  return false;
+}
+
+// Eliminate redundant conditional barriers between consecutive warp-pipelined
+// loops.  When loop 1's wrap-around barrier already includes a local fence,
+// the phase shift naturally carries over into loop 2: the post-loop
+// reconverge and pre-loop phase shift cancel, and the intervening pre-barrier
+// is redundant because membar will not need to insert a barrier (the
+// wrap-around fence already resolved all pending LDS writes).
+//
+// Before:                              After:
+//   scf.for { loop 1 }                  scf.for { loop 1 }
+//   [s_setprio 0]                       [s_setprio 0]
+//   cond_barrier(warpLow)   ← erase    <thread ID arith> (dead, cleaned later)
+//   ttg.barrier local       ← erase    [s_setprio P]
+//   <thread ID arith>                   scf.for { loop 2 }
+//   cond_barrier(warpHigh)  ← erase
+//   [s_setprio P]
+//   scf.for { loop 2 }
+//
+static void eliminateRedundantCondBarriers(ModuleOp m) {
+  SmallVector<Operation *> toErase;
+
+  m.walk([&](triton::FuncOp funcOp) {
+    for (Block &block : funcOp.getBody()) {
+      SmallVector<triton::amdgpu::CondBarrierOp> condBarriers;
+      for (auto &op : block)
+        if (auto cb = dyn_cast<triton::amdgpu::CondBarrierOp>(&op))
+          condBarriers.push_back(cb);
+
+      for (size_t i = 0; i + 1 < condBarriers.size(); i++) {
+        auto postLoopCB = condBarriers[i];
+        auto preLoopCB = condBarriers[i + 1];
+
+        // The post-loop cond_barrier must be preceded by a scf.for
+        // (possibly with an intervening s_setprio reset).
+        Operation *prev = postLoopCB->getPrevNode();
+        if (prev && isa<ROCDL::SetPrioOp>(prev))
+          prev = prev->getPrevNode();
+        auto prevFor = dyn_cast_or_null<scf::ForOp>(prev);
+        if (!prevFor)
+          continue;
+
+        // The pre-loop cond_barrier must be followed by a scf.for
+        // (possibly with an intervening s_setprio).
+        Operation *next = preLoopCB->getNextNode();
+        if (next && isa<ROCDL::SetPrioOp>(next))
+          next = next->getNextNode();
+        if (!dyn_cast_or_null<scf::ForOp>(next))
+          continue;
+
+        if (!hasLocalFenceAtWrapAround(prevFor))
+          continue;
+
+        // Find the ttg.barrier local (pre-barrier) between the two
+        // cond_barriers.
+        triton::gpu::BarrierOp preBarrier = nullptr;
+        for (Operation *op = postLoopCB->getNextNode();
+             op && op != preLoopCB; op = op->getNextNode()) {
+          if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op)) {
+            if (barrier.hasLocal()) {
+              preBarrier = barrier;
+              break;
+            }
+          }
+        }
+        if (!preBarrier)
+          continue;
+
+        LDBG("eliminating redundant barriers between back-to-back loops");
+        toErase.push_back(postLoopCB);
+        toErase.push_back(preBarrier);
+        toErase.push_back(preLoopCB);
+        i++;
+      }
+    }
+  });
+
+  for (auto *op : llvm::reverse(toErase))
+    op->erase();
+}
+
 struct ConvertWarpPipeline
     : public mlir::triton::impl::ConvertWarpPipelineBase<ConvertWarpPipeline> {
 
@@ -381,6 +479,12 @@ public:
 
     if (failed(applyPatternsGreedily(m, std::move(patternFor))))
       signalPassFailure();
+
+    // Must run after patternFor (all loops converted, barriers inserted) but
+    // before patternInline (inlining execute_regions would flatten the IR and
+    // obscure the scf.for ↔ cond_barrier adjacency we rely on).
+    eliminateRedundantCondBarriers(m);
+
     if (failed(applyPatternsGreedily(m, std::move(patternInline))))
       signalPassFailure();
   }

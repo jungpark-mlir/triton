@@ -445,3 +445,94 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK: rocdl.sched.barrier
 // CHECK: amdg.cond_barrier
 // CHECK: tt.return
+
+// -----
+
+// ---- Back-to-back pipelined loops: redundant cond_barriers eliminated ----
+//
+// Both loops have local_load (read) in stage0 and local_store (write) in
+// stage1, creating a wrap-around ttg.barrier local.  The post-loop
+// cond_barrier of loop 1, the pre-barrier of loop 2, and the pre-loop
+// cond_barrier of loop 2 should all be eliminated because loop 1's
+// wrap-around barrier already includes a local fence.
+//
+// Expected:
+//   ttg.barrier local          (pre-barrier for loop 1)
+//   amdg.cond_barrier          (#1 phase shift for loop 1)
+//   scf.for { loop 1 }
+//   NO amdg.cond_barrier       (#2 eliminated)
+//   NO ttg.barrier local       (pre-barrier eliminated)
+//   NO amdg.cond_barrier       (#3 eliminated)
+//   scf.for { loop 2 }
+//   amdg.cond_barrier          (#4 reconverge for loop 2)
+
+#b2b_blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+#b2b_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 4], instrShape = [16, 16, 16], isTransposed = true}>
+#b2b_shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 16, order = [1, 0]}>
+#b2b_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @back_to_back_elimination(
+      %lb: i32, %ub: i32, %step: i32,
+      %acc: tensor<256x256xf32, #b2b_mma>,
+      %ptr: tensor<256x64x!tt.ptr<f16>, #b2b_blocked>) {
+
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
+
+    // Loop 1: stage0 reads LDS, stage1 writes LDS → wrap-around is ttg.barrier local
+    %r1:2 = scf.for %i = %lb to %ub step %step
+        iter_args(%a1 = %acc, %s1 = %smem)
+        -> (tensor<256x256xf32, #b2b_mma>, !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>) : i32 {
+      %ld1 = scf.execute_region -> tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2b_mma, kWidth = 4}>> no_inline {
+        %sub = ttg.memdesc_subslice %s1[0, 0] : !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable> -> !ttg.memdesc<256x16xf16, #b2b_shared, #b2b_smem, mutable, 256x64>
+        %v = ttg.local_load %sub : !ttg.memdesc<256x16xf16, #b2b_shared, #b2b_smem, mutable, 256x64> -> tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2b_mma, kWidth = 4}>>
+        scf.yield %v : tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2b_mma, kWidth = 4}>>
+      } {triton.warp_pipeline.stage = "lds_load"}
+
+      %st1 = scf.execute_region -> !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable> no_inline {
+        %data = tt.load %ptr : tensor<256x64x!tt.ptr<f16>, #b2b_blocked>
+        ttg.local_store %data, %s1 : tensor<256x64xf16, #b2b_blocked> -> !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
+        scf.yield %s1 : !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
+      } {triton.warp_pipeline.stage = "global_load_and_store"}
+
+      scf.yield %a1, %st1 : tensor<256x256xf32, #b2b_mma>, !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
+    } {triton.warp_pipeline.pipelined_for}
+
+    // Loop 2: same structure (read + write LDS) so it is not optimized away
+    %r2:2 = scf.for %j = %lb to %ub step %step
+        iter_args(%a2 = %r1#0, %s2 = %r1#1)
+        -> (tensor<256x256xf32, #b2b_mma>, !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>) : i32 {
+      %ld2 = scf.execute_region -> tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2b_mma, kWidth = 4}>> no_inline {
+        %sub2 = ttg.memdesc_subslice %s2[0, 0] : !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable> -> !ttg.memdesc<256x16xf16, #b2b_shared, #b2b_smem, mutable, 256x64>
+        %v2 = ttg.local_load %sub2 : !ttg.memdesc<256x16xf16, #b2b_shared, #b2b_smem, mutable, 256x64> -> tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2b_mma, kWidth = 4}>>
+        scf.yield %v2 : tensor<256x16xf16, #ttg.dot_op<{opIdx = 0, parent = #b2b_mma, kWidth = 4}>>
+      } {triton.warp_pipeline.stage = "epilogue_lds_load"}
+
+      %st2 = scf.execute_region -> !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable> no_inline {
+        %data2 = tt.load %ptr : tensor<256x64x!tt.ptr<f16>, #b2b_blocked>
+        ttg.local_store %data2, %s2 : tensor<256x64xf16, #b2b_blocked> -> !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
+        scf.yield %s2 : !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
+      } {triton.warp_pipeline.stage = "epilogue_global_load_and_store"}
+
+      scf.yield %a2, %st2 : tensor<256x256xf32, #b2b_mma>, !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
+    } {triton.warp_pipeline.pipelined_for}
+
+    ttg.local_dealloc %smem : !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @back_to_back_elimination
+// Pre-barrier and phase shift for loop 1 are kept.
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: scf.for
+// Wrap-around barrier inside loop 1 (local fence from LDS dependency).
+// CHECK: ttg.barrier local
+// CHECK: scf.yield
+// Between the two loops: no cond_barriers, no ttg.barrier local.
+// CHECK-NOT: amdg.cond_barrier
+// CHECK-NOT: ttg.barrier local
+// CHECK: scf.for
+// Post-loop reconverge for loop 2 is kept.
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return

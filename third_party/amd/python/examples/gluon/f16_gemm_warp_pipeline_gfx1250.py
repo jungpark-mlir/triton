@@ -92,11 +92,13 @@ def gemm_tdm_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
                                    TRANSPOSE_B)
             accumulator = issue_wmma_compute(a, b, accumulator)
 
-    for i in ttgl.static_range(NUM_BUFFERS - 1):
-        # Warp-pipeline ended, wait for the ones to be consumed here.
+    for i in range(NUM_BUFFERS - 1):
+        with ttgl.amd.warp_pipeline_stage("stage0_epilogue", priority=1):
+            consumer, a, b = lds_load(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B, NUM_BUFFERS,
+                                      TRANSPOSE_B)
         ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1 - i) * 2)
-        consumer, accumulator = issue_wmma(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B,
-                                           accumulator, (NUM_BUFFERS - 2 - i) * 2, NUM_BUFFERS, TRANSPOSE_B)
+        with ttgl.amd.warp_pipeline_stage("stage1_epilogue", priority=0):
+            accumulator = issue_wmma_compute(a, b, accumulator)
 
     offs_cm = pid_m * BLOCK_M + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
     offs_cn = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
