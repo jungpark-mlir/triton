@@ -101,6 +101,35 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
   }
 }
 
+// Emit pre-barrier, thread-ID partitioning, and phase-shift cond_barrier.
+// Returns warpLow (for reconverge) and warpHigh (consumed by phase shift).
+static std::pair<Value, Value>
+emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup) {
+  mlir::triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
+
+  auto i32ty = b.getIntegerType(32);
+  auto workIDX = ROCDL::ThreadIdXOp::create(b, loc, i32ty);
+  auto constZero = arith::ConstantIntOp::create(b, loc, 0, 32);
+  auto constWarpSize =
+      arith::ConstantIntOp::create(b, loc, threadsPerPipelineGroup, 32);
+  auto warpIDX = arith::DivSIOp::create(b, loc, workIDX, constWarpSize);
+  auto warpLow = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
+                                       warpIDX, constZero);
+  auto warpHigh = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
+                                        warpIDX, constZero);
+  mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpHigh);
+
+  return {warpLow, warpHigh};
+}
+
+// Emit priority reset and reconverge cond_barrier after a pipeline.
+static void emitPipelinePostlude(OpBuilder &b, Location loc,
+                                 bool anyHasPriority, Value warpLow) {
+  if (anyHasPriority)
+    ROCDL::SetPrioOp::create(b, loc, 0);
+  mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
+}
+
 class ConvertPipelinedForPattern : public OpRewritePattern<scf::ForOp> {
 public:
   ConvertPipelinedForPattern(MLIRContext *ctx, ModuleAllocation &moduleAlloc,
@@ -133,28 +162,10 @@ private:
   LogicalResult emitPipelinedFor(PatternRewriter &b, Location loc,
                                  scf::ForOp forOp, Allocation *allocation,
                                  int threadsPerPipelineGroup) const {
-    // 1. Insert conditional branch first,
+    // 1. Pre-barrier, thread partitioning, and phase shift.
     b.setInsertionPoint(forOp);
-    // Set barrier before starting the loop. This resolves any outstanding
-    // synchronization before beginning the specialized asymmetric
-    // synchronization.
-    auto preBarrier = mlir::triton::gpu::BarrierOp::create(
-        b, loc, triton::gpu::AddrSpace::Local);
-
-    // Insert condbarrier::second_half before starting the loop
-    // FIXME : correctly calculate numbers per the arch
-    auto i32ty = b.getIntegerType(32);
-    auto workIDX = ROCDL::ThreadIdXOp::create(b, loc, i32ty);
-    auto constZero = arith::ConstantIntOp::create(b, loc, 0, 32);
-    auto constWarpSize =
-        arith::ConstantIntOp::create(b, loc, threadsPerPipelineGroup, 32);
-    auto warpIDX = arith::DivSIOp::create(b, loc, workIDX, constWarpSize);
-    auto warpLow = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
-                                         warpIDX, constZero);
-    auto warpHigh = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
-                                          warpIDX, constZero);
-
-    mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpHigh);
+    auto [warpLow, warpHigh] =
+        emitPipelinePrelude(b, loc, threadsPerPipelineGroup);
 
     // 2. Collect existing barrier information.
     // Scanning the loop body and classifying each consecutive block of
@@ -296,11 +307,9 @@ private:
       }
     }
 
-    // Insert condbarrier and priority reset after the loop.
+    // Post-loop priority reset and reconverge.
     b.setInsertionPointAfter(forOp);
-    if (anyHasPriority)
-      ROCDL::SetPrioOp::create(b, loc, 0);
-    mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
+    emitPipelinePostlude(b, loc, anyHasPriority, warpLow);
     return success();
   }
 
@@ -371,21 +380,8 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
 
   // 1. Pre-barrier and phase shift before the first execute_region.
   b.setInsertionPoint(clusterOps.front());
-
-  mlir::triton::gpu::BarrierOp::create(b, loc,
-                                       triton::gpu::AddrSpace::Local);
-
-  auto i32ty = b.getIntegerType(32);
-  auto workIDX = ROCDL::ThreadIdXOp::create(b, loc, i32ty);
-  auto constZero = arith::ConstantIntOp::create(b, loc, 0, 32);
-  auto constWarpSize =
-      arith::ConstantIntOp::create(b, loc, threadsPerPipelineGroup, 32);
-  auto warpIDX = arith::DivSIOp::create(b, loc, workIDX, constWarpSize);
-  auto warpLow = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
-                                       warpIDX, constZero);
-  auto warpHigh = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
-                                        warpIDX, constZero);
-  mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpHigh);
+  auto [warpLow, warpHigh] =
+      emitPipelinePrelude(b, loc, threadsPerPipelineGroup);
 
   // 2. Dependency analysis — linear, no wrap-around.
   SmallVector<Block *> clusterBlocks;
@@ -445,9 +441,7 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
 
   // 4. Post-sequence reconverge.
   b.setInsertionPointAfter(clusterOps.back());
-  if (anyHasPriority)
-    ROCDL::SetPrioOp::create(b, loc, 0);
-  mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
+  emitPipelinePostlude(b, loc, anyHasPriority, warpLow);
 }
 
 // Walk the module for flat warp-pipeline execute_region sequences
