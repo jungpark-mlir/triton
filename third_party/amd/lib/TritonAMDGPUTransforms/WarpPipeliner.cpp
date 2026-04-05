@@ -223,8 +223,7 @@ static LogicalResult createFlatPipeline(OpBuilder &b, Block &block) {
   // stage.  Stop at control-flow boundaries (scf.for, cond_barrier) or
   // ignorable ops that logically belong to a previous pipeline.
   Operation *regionStart = firstBorder;
-  for (Operation *op = firstBorder->getPrevNode(); op;
-       op = op->getPrevNode()) {
+  for (Operation *op = firstBorder->getPrevNode(); op; op = op->getPrevNode()) {
     if (isa<scf::ForOp>(op) || isa<tt::amdgpu::CondBarrierOp>(op))
       break;
     if (isIgnorable(op))
@@ -252,8 +251,7 @@ static LogicalResult createFlatPipeline(OpBuilder &b, Block &block) {
       if (cluster.empty()) {
         b.setInsertionPoint(op);
         auto dummyOp = ROCDL::SchedBarrier::create(b, loc, 0);
-        dummyOp->setAttr("triton.warp_pipeline.empty_cluster",
-                         b.getUnitAttr());
+        dummyOp->setAttr("triton.warp_pipeline.empty_cluster", b.getUnitAttr());
         cluster.push_back(dummyOp);
       }
       clusters.push_back(std::move(cluster));

@@ -89,8 +89,7 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
 // When false (flat pipelines), indices are strictly linear.
 static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
                                         SmallVectorImpl<bool> &bars,
-                                        Allocation *allocation,
-                                        bool circular) {
+                                        Allocation *allocation, bool circular) {
   int numClusters = clusterInfo.size();
   for (int offset = 0; offset < numClusters; offset++) {
     for (int src = 0; src < numClusters; src++) {
@@ -135,8 +134,7 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
   }
 }
 
-static void emitClusterBarrier(OpBuilder &r, Location loc,
-                               bool needLocal) {
+static void emitClusterBarrier(OpBuilder &r, Location loc, bool needLocal) {
   ROCDL::SchedBarrier::create(r, loc, 0);
   if (needLocal)
     mlir::triton::gpu::BarrierOp::create(r, loc, triton::gpu::AddrSpace::Local);
@@ -413,11 +411,9 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
   for (auto *cb : clusterBlocks)
     clusterInfo.push_back(buildBlockInfoFromBlock(cb, allocation));
 
-  bool anyHasPriority = llvm::any_of(
-      clusterOps,
-      [](scf::ExecuteRegionOp op) {
-        return op->hasAttr("triton.warp_pipeline.priority");
-      });
+  bool anyHasPriority = llvm::any_of(clusterOps, [](scf::ExecuteRegionOp op) {
+    return op->hasAttr("triton.warp_pipeline.priority");
+  });
 
   // Linear dependency analysis (no wrap-around for flat pipelines).
   analyzePipelineDependencies(clusterInfo, bars, allocation,
@@ -493,7 +489,8 @@ static void processUnrolledPipelineRegions(ModuleOp m,
 // Check if the wrap-around cluster barrier of a converted pipelined loop
 // includes a local memory fence (ttg.barrier local).  The wrap-around barrier
 // is the last cluster barrier emitted just before the scf.yield terminator:
-//   [s_setprio]  sched_barrier  ttg.barrier_local|s_barrier  sched_barrier  yield
+//   [s_setprio]  sched_barrier  ttg.barrier_local|s_barrier  sched_barrier
+//   yield
 static bool hasLocalFenceAtWrapAround(scf::ForOp forOp) {
   auto *yieldOp = forOp.getBody()->getTerminator();
   if (!yieldOp)
@@ -558,10 +555,9 @@ static void eliminateRedundantCondBarriers(ModuleOp m) {
         Operation *next = preLoopCB->getNextNode();
         if (next && isa<ROCDL::SetPrioOp>(next))
           next = next->getNextNode();
-        bool nextIsPipeline =
-            isa_and_nonnull<scf::ForOp>(next) ||
-            (isa_and_nonnull<scf::ExecuteRegionOp>(next) &&
-             next->hasAttr("triton.warp_pipeline.stage"));
+        bool nextIsPipeline = isa_and_nonnull<scf::ForOp>(next) ||
+                              (isa_and_nonnull<scf::ExecuteRegionOp>(next) &&
+                               next->hasAttr("triton.warp_pipeline.stage"));
         if (!nextIsPipeline)
           continue;
 
@@ -571,8 +567,8 @@ static void eliminateRedundantCondBarriers(ModuleOp m) {
         // Find the ttg.barrier local (pre-barrier) between the two
         // cond_barriers.
         triton::gpu::BarrierOp preBarrier = nullptr;
-        for (Operation *op = postLoopCB->getNextNode();
-             op && op != preLoopCB; op = op->getNextNode()) {
+        for (Operation *op = postLoopCB->getNextNode(); op && op != preLoopCB;
+             op = op->getNextNode()) {
           if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op)) {
             if (barrier.hasLocal()) {
               preBarrier = barrier;
@@ -635,7 +631,7 @@ public:
     // Flat (unrolled) pipeline regions are still wrapped in execute_regions
     // with no_inline=true from WarpPipeliner.  Process them before inlining.
     processUnrolledPipelineRegions(m, moduleAllocation,
-                                  threadsPerPipelineGroup);
+                                   threadsPerPipelineGroup);
 
     // Must run after patternFor and flat processing (all regions converted,
     // barriers inserted) but before patternInline (inlining execute_regions

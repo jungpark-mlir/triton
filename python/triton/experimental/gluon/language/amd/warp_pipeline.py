@@ -71,9 +71,8 @@ class warp_pipeline_stage:
         # inside a for loop (range or static_range).  Allowing stages outside
         # a loop would produce border markers with no well-defined iteration
         # structure, breaking the phase-shift/reconvergence contract.
-        assert getattr(self._semantic, 'for_loop_depth', 0) > 0, (
-            "warp_pipeline_stage must be used inside a for loop "
-            "(range or static_range)")
+        assert getattr(self._semantic, 'for_loop_depth', 0) > 0, ("warp_pipeline_stage must be used inside a for loop "
+                                                                  "(range or static_range)")
         marker = self.label if self.label is not None else "cluster"
         prio = self.priority if self.priority is not None else -1
         self._semantic.builder.create_warp_pipeline_border(marker, prio)
