@@ -103,6 +103,10 @@ class GluonSemantic(TritonSemantic[TensorTy]):
 
     def __init__(self, builder: GluonOpBuilder):
         self.builder = builder
+        # Tracks Python-level for-loop nesting depth (both scf.for and
+        # static_range).  Used by warp_pipeline_stage to enforce that
+        # pipeline stages are only declared inside a loop.
+        self.for_loop_depth = 0
 
     def _wrap_handle_infer_layout(self, handle, scalar_ty, shape):
         if shape == []:

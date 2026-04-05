@@ -80,7 +80,7 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
   return info;
 }
 
-static void emitClusterBarrier(PatternRewriter &r, Location loc,
+static void emitClusterBarrier(OpBuilder &r, Location loc,
                                bool needLocal) {
   ROCDL::SchedBarrier::create(r, loc, 0);
   if (needLocal)
@@ -90,7 +90,7 @@ static void emitClusterBarrier(PatternRewriter &r, Location loc,
   ROCDL::SchedBarrier::create(r, loc, 0);
 }
 
-static void emitClusterPriority(PatternRewriter &r, Location loc,
+static void emitClusterPriority(OpBuilder &r, Location loc,
                                 Operation *clusterOp, bool anyHasPriority) {
   if (auto intAttr = clusterOp->getAttrOfType<IntegerAttr>(
           "triton.warp_pipeline.priority")) {
@@ -346,6 +346,161 @@ public:
   }
 };
 
+// Process a flat (non-loop) sequence of warp-pipeline execute_regions.
+// Unlike the loop case there is no wrap-around: dependencies are strictly
+// linear from the first stage to the last.
+//
+// Emitted IR:
+//   ttg.barrier local               (pre-barrier)
+//   <thread ID arith>
+//   cond_barrier(warpHigh)           (phase shift)
+//   [s_setprio P0]
+//   execute_region { stage 0 }
+//   [s_setprio P1]  sched+barrier    (cluster barrier)
+//   execute_region { stage 1 }
+//   ...
+//   [s_setprio 0]
+//   cond_barrier(warpLow)            (reconverge)
+//
+static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
+                              Allocation *allocation,
+                              int threadsPerPipelineGroup) {
+  Location loc = clusterOps.front().getLoc();
+  OpBuilder b(clusterOps.front().getContext());
+  int numClusters = clusterOps.size();
+
+  // 1. Pre-barrier and phase shift before the first execute_region.
+  b.setInsertionPoint(clusterOps.front());
+
+  mlir::triton::gpu::BarrierOp::create(b, loc,
+                                       triton::gpu::AddrSpace::Local);
+
+  auto i32ty = b.getIntegerType(32);
+  auto workIDX = ROCDL::ThreadIdXOp::create(b, loc, i32ty);
+  auto constZero = arith::ConstantIntOp::create(b, loc, 0, 32);
+  auto constWarpSize =
+      arith::ConstantIntOp::create(b, loc, threadsPerPipelineGroup, 32);
+  auto warpIDX = arith::DivSIOp::create(b, loc, workIDX, constWarpSize);
+  auto warpLow = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
+                                       warpIDX, constZero);
+  auto warpHigh = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
+                                        warpIDX, constZero);
+  mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpHigh);
+
+  // 2. Dependency analysis — linear, no wrap-around.
+  SmallVector<Block *> clusterBlocks;
+  SmallVector<bool> bars(numClusters, false);
+
+  for (auto exec : clusterOps) {
+    exec.setNoInline(false);
+    clusterBlocks.push_back(&exec->getRegion(0).front());
+  }
+
+  SmallVector<BlockInfo> clusterInfo;
+  for (auto *cb : clusterBlocks)
+    clusterInfo.push_back(buildBlockInfoFromBlock(cb, allocation));
+
+  bool anyHasPriority = llvm::any_of(
+      clusterOps,
+      [](scf::ExecuteRegionOp op) {
+        return op->hasAttr("triton.warp_pipeline.priority");
+      });
+
+  for (int offset = 0; offset < numClusters; offset++) {
+    for (int src = 0; src < numClusters; src++) {
+      const int next = src + 2 + offset;
+      const int barrierLoc = src + 1 + offset;
+      if (next >= numClusters || barrierLoc >= numClusters)
+        continue;
+
+      auto isSynced = [&]() -> bool {
+        for (int idx = src + 1; idx <= barrierLoc; idx++)
+          if (bars[idx])
+            return true;
+        return false;
+      };
+      if (isSynced())
+        continue;
+
+      const bool needFence = clusterInfo[src].isIntersected(
+          clusterInfo[next], mlir::triton::AMD::membarFilter, allocation);
+      if (needFence) {
+        bars[barrierLoc] = true;
+        LDBG("flat cluster " << src << " need fence to " << next
+                             << " placing barrier at " << barrierLoc);
+      }
+    }
+  }
+
+  // 3. Materialize cluster barriers.
+  //    Cluster 0 gets only its priority (inserted after cond_barrier above).
+  //    Clusters 1..N get priority + cluster barrier.
+  emitClusterPriority(b, loc, clusterOps[0], anyHasPriority);
+
+  for (int i = 1; i < numClusters; i++) {
+    b.setInsertionPoint(clusterOps[i]);
+    emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+    emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
+  }
+
+  // 4. Post-sequence reconverge.
+  b.setInsertionPointAfter(clusterOps.back());
+  if (anyHasPriority)
+    ROCDL::SetPrioOp::create(b, loc, 0);
+  mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
+}
+
+// Walk the module for flat warp-pipeline execute_region sequences
+// (produced by WarpPipeliner::createFlatPipeline) and emit phase-shift
+// barriers around them.
+static void processUnrolledPipelineRegions(ModuleOp m,
+                                           ModuleAllocation &moduleAllocation,
+                                           int threadsPerPipelineGroup) {
+  auto isIgnorable = [](Operation *op) {
+    return isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::AsyncWaitOp,
+               triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait,
+               triton::amdgpu::AsyncTDMIntrinsicWait>(op);
+  };
+
+  m.walk([&](triton::FuncOp funcOp) {
+    Allocation *allocation = moduleAllocation.getFuncData(funcOp);
+    if (!allocation)
+      return;
+
+    for (Block &block : funcOp.getBody()) {
+      // Collect contiguous sequences of flat warp-pipeline execute_regions,
+      // splitting at any non-ignorable, non-pipeline op.
+      SmallVector<SmallVector<scf::ExecuteRegionOp>> sequences;
+      SmallVector<scf::ExecuteRegionOp> current;
+
+      for (auto &op : block) {
+        if (auto exec = dyn_cast<scf::ExecuteRegionOp>(&op)) {
+          if (exec->hasAttr("triton.warp_pipeline.stage") &&
+              !isa<scf::ForOp>(exec->getParentOp())) {
+            current.push_back(exec);
+            continue;
+          }
+        }
+        if (isIgnorable(&op))
+          continue;
+        if (!current.empty()) {
+          sequences.push_back(std::move(current));
+          current.clear();
+        }
+      }
+      if (!current.empty())
+        sequences.push_back(std::move(current));
+
+      for (auto &seq : sequences) {
+        if (seq.size() < 2)
+          continue;
+        LDBG("processing flat pipeline with " << seq.size() << " stages");
+        emitPipelinedFlat(seq, allocation, threadsPerPipelineGroup);
+      }
+    }
+  });
+}
+
 // Check if the wrap-around cluster barrier of a converted pipelined loop
 // includes a local memory fence (ttg.barrier local).  The wrap-around barrier
 // is the last cluster barrier emitted just before the scf.yield terminator:
@@ -366,21 +521,24 @@ static bool hasLocalFenceAtWrapAround(scf::ForOp forOp) {
 }
 
 // Eliminate redundant conditional barriers between consecutive warp-pipelined
-// loops.  When loop 1's wrap-around barrier already includes a local fence,
-// the phase shift naturally carries over into loop 2: the post-loop
-// reconverge and pre-loop phase shift cancel, and the intervening pre-barrier
-// is redundant because membar will not need to insert a barrier (the
-// wrap-around fence already resolved all pending LDS writes).
+// regions.  When loop 1's wrap-around barrier already includes a local fence,
+// the phase shift naturally carries over into the next pipeline: the post-loop
+// reconverge and pre-pipeline phase shift cancel, and the intervening
+// pre-barrier is redundant because membar will not need to insert a barrier
+// (the wrap-around fence already resolved all pending LDS writes).
+//
+// The "next pipeline" can be either another scf.for or a flat (unrolled)
+// pipeline represented as a sequence of scf.execute_region ops.
 //
 // Before:                              After:
 //   scf.for { loop 1 }                  scf.for { loop 1 }
 //   [s_setprio 0]                       [s_setprio 0]
 //   cond_barrier(warpLow)   ← erase    <thread ID arith> (dead, cleaned later)
 //   ttg.barrier local       ← erase    [s_setprio P]
-//   <thread ID arith>                   scf.for { loop 2 }
+//   <thread ID arith>                   scf.for / execute_region { pipeline 2 }
 //   cond_barrier(warpHigh)  ← erase
 //   [s_setprio P]
-//   scf.for { loop 2 }
+//   scf.for / execute_region { pipeline 2 }
 //
 static void eliminateRedundantCondBarriers(ModuleOp m) {
   SmallVector<Operation *> toErase;
@@ -405,12 +563,17 @@ static void eliminateRedundantCondBarriers(ModuleOp m) {
         if (!prevFor)
           continue;
 
-        // The pre-loop cond_barrier must be followed by a scf.for
-        // (possibly with an intervening s_setprio).
+        // The pre-loop cond_barrier must be followed by a warp-pipelined
+        // scf.for or a flat pipeline execute_region (possibly with an
+        // intervening s_setprio).
         Operation *next = preLoopCB->getNextNode();
         if (next && isa<ROCDL::SetPrioOp>(next))
           next = next->getNextNode();
-        if (!dyn_cast_or_null<scf::ForOp>(next))
+        bool nextIsPipeline =
+            isa_and_nonnull<scf::ForOp>(next) ||
+            (isa_and_nonnull<scf::ExecuteRegionOp>(next) &&
+             next->hasAttr("triton.warp_pipeline.stage"));
+        if (!nextIsPipeline)
           continue;
 
         if (!hasLocalFenceAtWrapAround(prevFor))
@@ -480,9 +643,14 @@ public:
     if (failed(applyPatternsGreedily(m, std::move(patternFor))))
       signalPassFailure();
 
-    // Must run after patternFor (all loops converted, barriers inserted) but
-    // before patternInline (inlining execute_regions would flatten the IR and
-    // obscure the scf.for ↔ cond_barrier adjacency we rely on).
+    // Flat (unrolled) pipeline regions are still wrapped in execute_regions
+    // with no_inline=true from WarpPipeliner.  Process them before inlining.
+    processUnrolledPipelineRegions(m, moduleAllocation,
+                                  threadsPerPipelineGroup);
+
+    // Must run after patternFor and flat processing (all regions converted,
+    // barriers inserted) but before patternInline (inlining execute_regions
+    // would flatten the IR and obscure the cond_barrier adjacency we rely on).
     eliminateRedundantCondBarriers(m);
 
     if (failed(applyPatternsGreedily(m, std::move(patternInline))))

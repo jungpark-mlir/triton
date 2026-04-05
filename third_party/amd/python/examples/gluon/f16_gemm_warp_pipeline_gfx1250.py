@@ -92,7 +92,7 @@ def gemm_tdm_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
                                    TRANSPOSE_B)
             accumulator = issue_wmma_compute(a, b, accumulator)
 
-    for i in range(NUM_BUFFERS - 1):
+    for i in ttgl.static_range(NUM_BUFFERS - 1):
         with ttgl.amd.warp_pipeline_stage("stage0_epilogue", priority=1):
             consumer, a, b = lds_load(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B, NUM_BUFFERS,
                                       TRANSPOSE_B)
