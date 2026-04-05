@@ -80,6 +80,61 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
   return info;
 }
 
+// Pairwise dependency analysis between pipeline clusters.
+// For each src → next pair, checks whether their memory intervals overlap.
+// If so, marks `bars[barrierLoc] = true` to indicate a fence is needed.
+//
+// When `circular` is true (loop pipelines), indices wrap around modulo
+// numClusters so that the last cluster feeds back to the first.
+// When false (flat pipelines), indices are strictly linear.
+static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
+                                        SmallVectorImpl<bool> &bars,
+                                        Allocation *allocation,
+                                        bool circular) {
+  int numClusters = clusterInfo.size();
+  for (int offset = 0; offset < numClusters; offset++) {
+    for (int src = 0; src < numClusters; src++) {
+      int next, barrierLoc;
+      if (circular) {
+        next = (src + 2 + offset) % numClusters;
+        barrierLoc = (src + 1 + offset) % numClusters;
+      } else {
+        next = src + 2 + offset;
+        barrierLoc = src + 1 + offset;
+        if (next >= numClusters || barrierLoc >= numClusters)
+          continue;
+      }
+
+      auto isSynced = [&]() -> bool {
+        if (circular) {
+          for (int idx = (src + 1) % numClusters; idx != src;
+               idx = (idx + 1) % numClusters) {
+            if (bars[idx])
+              return true;
+            if (idx == barrierLoc)
+              break;
+          }
+        } else {
+          for (int idx = src + 1; idx <= barrierLoc; idx++)
+            if (bars[idx])
+              return true;
+        }
+        return false;
+      };
+      if (isSynced())
+        continue;
+
+      const bool needFence = clusterInfo[src].isIntersected(
+          clusterInfo[next], mlir::triton::AMD::membarFilter, allocation);
+      if (needFence) {
+        bars[barrierLoc] = true;
+        LDBG("cluster " << src << " need fence to " << next
+                        << " placing barrier at " << barrierLoc);
+      }
+    }
+  }
+}
+
 static void emitClusterBarrier(OpBuilder &r, Location loc,
                                bool needLocal) {
   ROCDL::SchedBarrier::create(r, loc, 0);
@@ -230,47 +285,9 @@ private:
       existingBarrierMap.erase(bottomBar);
     }
 
-    // 3. Performing pairwise dependency analysis between clusters.  For each
-    // src → next pair (with wrap-around), we check whether their memory
-    // intervals overlap.  If so, a fence/barrier must be inserted at the
-    // boundary cluster (barrierLoc).  The analysis is expressed as a
-    // circular traversal so that pipeline stages form a ring.
-    // • `bars[i] = true` marks that a new cluster barrier must be inserted
-    //   before cluster i.
-    // • Existing barriers override or satisfy required fences, so we do not
-    //   insert duplicates.
-    for (int offset = 0; offset < numClusters; offset++) {
-      for (int src = 0; src < numClusters; src++) {
-        const int next = (src + 2 + offset) % numClusters;
-        const int barrierLoc = (src + 1 + offset) % numClusters;
-        LDBG("Inspecting src:" << src << " to next:" << next);
-        // Check if any existing barrier sits between src and barrierIdx
-        auto isSynced = [&]() -> bool {
-          for (int idx = (src + 1) % numClusters; idx != src;
-               idx = (idx + 1) % numClusters) {
-            if (bars[idx])
-              return true;
-            if (idx == barrierLoc)
-              break;
-          }
-          return false;
-        };
-        // Skip if dependency is already resolved.
-        if (isSynced()) {
-          LDBG("already synced");
-          continue;
-        }
-        const bool needFence = clusterInfo[src].isIntersected(
-            clusterInfo[next], mlir::triton::AMD::membarFilter, allocation);
-        // insert fence/barrier in front of this cluster
-        LDBG("need fence?: " << needFence);
-        if (needFence) {
-          bars[barrierLoc] = true;
-          LDBG("cluster " << src << " need fence to " << next
-                          << " placing barrier at " << barrierLoc);
-        }
-      }
-    }
+    // 3. Circular dependency analysis (wrap-around for loop pipelines).
+    analyzePipelineDependencies(clusterInfo, bars, allocation,
+                                /*circular=*/true);
 
     // 4. Materializing final cluster-scope barriers.  For each cluster index:
     //  • If there is a pre-existing barrier at that location, we wrap it with
@@ -402,31 +419,9 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
         return op->hasAttr("triton.warp_pipeline.priority");
       });
 
-  for (int offset = 0; offset < numClusters; offset++) {
-    for (int src = 0; src < numClusters; src++) {
-      const int next = src + 2 + offset;
-      const int barrierLoc = src + 1 + offset;
-      if (next >= numClusters || barrierLoc >= numClusters)
-        continue;
-
-      auto isSynced = [&]() -> bool {
-        for (int idx = src + 1; idx <= barrierLoc; idx++)
-          if (bars[idx])
-            return true;
-        return false;
-      };
-      if (isSynced())
-        continue;
-
-      const bool needFence = clusterInfo[src].isIntersected(
-          clusterInfo[next], mlir::triton::AMD::membarFilter, allocation);
-      if (needFence) {
-        bars[barrierLoc] = true;
-        LDBG("flat cluster " << src << " need fence to " << next
-                             << " placing barrier at " << barrierLoc);
-      }
-    }
-  }
+  // Linear dependency analysis (no wrap-around for flat pipelines).
+  analyzePipelineDependencies(clusterInfo, bars, allocation,
+                              /*circular=*/false);
 
   // 3. Materialize cluster barriers.
   //    Cluster 0 gets only its priority (inserted after cond_barrier above).
