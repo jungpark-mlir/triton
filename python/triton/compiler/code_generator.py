@@ -1162,8 +1162,6 @@ class CodeGenerator(ast.NodeVisitor):
         IteratorClass = self.visit(node.iter.func)
         iter_args = [self.visit(arg) for arg in node.iter.args]
         iter_kwargs = dict(self.visit(keyword) for keyword in node.iter.keywords)
-        if hasattr(self.semantic, 'for_loop_depth'):
-            self.semantic.for_loop_depth += 1
         if IteratorClass == language.static_range:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             static_range = range(iterator.start.value, iterator.end.value, iterator.step.value)
@@ -1172,8 +1170,6 @@ class CodeGenerator(ast.NodeVisitor):
                 self.visit_compound_statement(node.body)
                 for stmt in node.orelse:
                     ast.NodeVisitor.generic_visit(self, stmt)
-            if hasattr(self.semantic, 'for_loop_depth'):
-                self.semantic.for_loop_depth -= 1
             return
         num_stages = None
         loop_unroll_factor = None
@@ -1298,9 +1294,6 @@ class CodeGenerator(ast.NodeVisitor):
         for stmt in node.orelse:
             assert False, "Don't know what to do with else after for"
             ast.NodeVisitor.generic_visit(self, stmt)
-
-        if hasattr(self.semantic, 'for_loop_depth'):
-            self.semantic.for_loop_depth -= 1
 
     def visit_Slice(self, node):
         lower = self.visit(node.lower)
