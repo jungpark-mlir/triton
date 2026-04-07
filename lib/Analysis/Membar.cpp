@@ -1,4 +1,5 @@
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/PresburgerIndexAnalysis.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -12,7 +13,8 @@ namespace mlir {
 AllocationSlice::AllocationSlice(Value value,
                                  Interval<size_t> allocationInterval,
                                  Allocation::BufferId bufferId)
-    : allocationInterval(allocationInterval), bufferId(bufferId) {
+    : allocationInterval(allocationInterval), bufferId(bufferId),
+      sourceValue(value) {
   auto accessTy = cast<triton::gpu::MemDescType>(value.getType());
   this->accessTy = accessTy;
 
@@ -37,9 +39,29 @@ bool AllocationSlice::intersects(const AllocationSlice &other) const {
   if (!accessTy || !other.accessTy)
     return true;
 
-  // If offsets are unknown, conservatively assume overlap
-  if (subsliceOffsets.empty() || other.subsliceOffsets.empty())
+  // When subslice offsets are unknown (empty), it means the access goes
+  // through a dynamic MemDescIndexOp on a multi-buffered allocation
+  // (e.g., memdesc<2x64x256xf8, ...>) where the buffer slot index is
+  // computed at runtime (phase % num_buffers).  Static analysis cannot
+  // determine the offsets, so we fall back to Presburger arithmetic:
+  // encode each index's arith chain as integer constraints and check
+  // whether "idx1 == idx2" is satisfiable.  If unsatisfiable, the
+  // accesses target provably different buffer slots and no barrier
+  // is needed.
+  if (subsliceOffsets.empty() || other.subsliceOffsets.empty()) {
+    if (sourceValue && other.sourceValue) {
+      auto indexOp1 =
+          sourceValue.getDefiningOp<triton::gpu::MemDescIndexOp>();
+      auto indexOp2 =
+          other.sourceValue.getDefiningOp<triton::gpu::MemDescIndexOp>();
+      if (indexOp1 && indexOp2) {
+        if (triton::areIndicesProvablyDifferent(indexOp1.getIndex(),
+                                                indexOp2.getIndex()))
+          return false;
+      }
+    }
     return true;
+  }
 
   // If layouts differ, we assume intersection as we currently only work on
   // logical elements

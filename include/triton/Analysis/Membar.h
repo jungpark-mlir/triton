@@ -67,6 +67,8 @@ public:
 
   void print(raw_ostream &os) const;
 
+  Value getSourceValue() const { return sourceValue; }
+
 private:
   std::tuple<Interval<size_t>, Allocation::BufferId, const void *,
              llvm::ArrayRef<int64_t>>
@@ -82,6 +84,10 @@ private:
   triton::gpu::MemDescType accessTy;
   // Buffer id for partial sync on wait_barrier deps.
   Allocation::BufferId bufferId;
+  // Original memdesc Value used to construct this slice.
+  // Used by the Presburger index analysis to trace back to MemDescIndexOp.
+  // Not part of the comparison key (asTuple).
+  Value sourceValue;
 };
 
 struct BlockInfo {
