@@ -10,6 +10,21 @@
 
 namespace mlir {
 
+// Walk through MemDescViewTrait ops (memdesc_trans, memdesc_reshape, etc.)
+// to find the underlying MemDescIndexOp that determines the buffer slot.
+static triton::gpu::MemDescIndexOp findMemDescIndexOp(Value v) {
+  while (v) {
+    if (auto idx = v.getDefiningOp<triton::gpu::MemDescIndexOp>())
+      return idx;
+    auto *def = v.getDefiningOp();
+    if (def && def->hasTrait<OpTrait::MemDescViewTrait>())
+      v = def->getOperand(0);
+    else
+      return nullptr;
+  }
+  return nullptr;
+}
+
 AllocationSlice::AllocationSlice(Value value,
                                  Interval<size_t> allocationInterval,
                                  Allocation::BufferId bufferId)
@@ -57,10 +72,8 @@ bool AllocationSlice::intersects(const AllocationSlice &other) const {
   if (subsliceOffsets.empty() || other.subsliceOffsets.empty()) {
     if (!isLoopCarried && !other.isLoopCarried &&
         sourceValue && other.sourceValue) {
-      auto indexOp1 =
-          sourceValue.getDefiningOp<triton::gpu::MemDescIndexOp>();
-      auto indexOp2 =
-          other.sourceValue.getDefiningOp<triton::gpu::MemDescIndexOp>();
+      auto indexOp1 = findMemDescIndexOp(sourceValue);
+      auto indexOp2 = findMemDescIndexOp(other.sourceValue);
       if (indexOp1 && indexOp2) {
         if (triton::areIndicesProvablyDifferent(indexOp1.getIndex(),
                                                 indexOp2.getIndex()))

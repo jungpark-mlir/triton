@@ -9,6 +9,7 @@
 
 #AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+#shared_t = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [0, 1]}>
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
@@ -303,6 +304,52 @@ tt.func @loop_backedge_intra_iteration_disjoint(%lb : index, %ub : index) {
     %next_phase = arith.addi %phase, %c1_i32 : i32
     scf.yield %next_phase : i32
   }
+  tt.return
+}
+
+// CHECK-LABEL: memdesc_trans_sees_through_to_index
+// When a local_load reads through a memdesc_trans (transpose), the
+// Presburger analysis must walk through the MemDescViewTrait op to find
+// the underlying MemDescIndexOp.  Without this, the analysis cannot
+// recover the index and conservatively inserts a barrier.
+// Producer: slot = (phase + 2) % 3,  Consumer: slot = phase % 3 (transposed).
+tt.func @memdesc_trans_sees_through_to_index(%phase: i32) {
+  %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf16>
+  %c2_i32 = arith.constant 2 : i32
+  %c3_i32 = arith.constant 3 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable>
+  // Producer index: (phase + 2) % 3
+  %phase_plus_2 = arith.addi %phase, %c2_i32 : i32
+  %producer_idx = arith.remui %phase_plus_2, %c3_i32 : i32
+  %producer_view = ttg.memdesc_index %alloc[%producer_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  ttg.local_store %cst, %producer_view : tensor<128x128xf16> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  // Consumer index: phase % 3, then transposed
+  %consumer_idx = arith.remui %phase, %c3_i32 : i32
+  %consumer_view = ttg.memdesc_index %alloc[%consumer_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  %consumer_trans = ttg.memdesc_trans %consumer_view {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared_t, #smem, mutable>
+  // Presburger sees through memdesc_trans → no barrier needed
+  // CHECK-NOT: ttg.barrier local
+  // CHECK: ttg.local_load
+  %load = ttg.local_load %consumer_trans : !ttg.memdesc<128x128xf16, #shared_t, #smem, mutable> -> tensor<128x128xf16>
+  tt.return
+}
+
+// CHECK-LABEL: memdesc_trans_same_index_needs_barrier
+// When both producer and consumer use the same index and the consumer
+// goes through memdesc_trans, a barrier IS needed (same slot).
+tt.func @memdesc_trans_same_index_needs_barrier(%phase: i32) {
+  %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf16>
+  %c3_i32 = arith.constant 3 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable>
+  %idx = arith.remui %phase, %c3_i32 : i32
+  %write_view = ttg.memdesc_index %alloc[%idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  ttg.local_store %cst, %write_view : tensor<128x128xf16> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  %read_view = ttg.memdesc_index %alloc[%idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+  %read_trans = ttg.memdesc_trans %read_view {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared_t, #smem, mutable>
+  // Same index → barrier needed even through transpose
+  // CHECK: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  %load = ttg.local_load %read_trans : !ttg.memdesc<128x128xf16, #shared_t, #smem, mutable> -> tensor<128x128xf16>
   tt.return
 }
 
