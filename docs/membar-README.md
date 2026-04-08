@@ -24,12 +24,16 @@ inserts a barrier. Two concrete sources of false positives are addressed here:
 
 ## Document Map
 
-### Start Here: The Two Problems and Solution Comparison
+### Start Here
+
+**[membar-proposal-buffer-disjointness.md](membar-proposal-buffer-disjointness.md)**
+— **Decision document.** Presents three practical options for buffer index
+disjointness (BufferIndexExpr, Presburger, Buffer Coloring), their trade-offs,
+IR shape compatibility, and recommendation. Read this to decide.
 
 **[membar-comparison.md](membar-comparison.md)**
-— The entry point. Describes both problems, summarizes the two candidate
-solutions for dynamic index disjointness (Symbolic Index Analysis and Buffer
-Slot Coloring), and explains where things stand. Read this first.
+— Detailed comparison of the two problems and all candidate solutions.
+Background reference for the proposal.
 
 ---
 
@@ -128,7 +132,10 @@ simpler, handles padded layouts, and covers all practical cases.
 > pipeliner-side changes. See the IR Shape Compatibility section in the
 > comparison doc for details.
 
-**For a quick overview of both problems:**
+**For the decision on buffer disjointness (Problem 1):**
+→ [membar-proposal-buffer-disjointness.md](membar-proposal-buffer-disjointness.md)
+
+**For a detailed overview of both problems:**
 → [membar-comparison.md](membar-comparison.md)
 
 **To understand the implemented solution (Problem 1):**
@@ -155,25 +162,30 @@ simpler, handles padded layouts, and covers all practical cases.
 ## Relationship Between Documents
 
 ```
+  membar-proposal-buffer-disjointness.md  ← DECISION DOC (Problem 1)
+  (A: BufferIndexExpr, B: Presburger, C: Coloring)
+         │
+         │  references detailed docs:
+         │
   membar-comparison.md  ──────────────────────────────────┐
-  (entry point, both problems, solution comparison)        │
+  (both problems, solution comparison)                     │
          │                                                 │
          ├── Problem 1: Dynamic Index Disjointness         │
          │       │                                         │
-         │       ├── membar-dynamic-index-disjointness.md  │  ← implementation
-         │       │   (BufferIndexExpr — primary solution)  │
+         │       ├── membar-dynamic-index-disjointness.md  │  ← BufferIndexExpr
+         │       │   (symbolic pattern matching)           │
          │       │                                         │
-         │       ├── membar-buffer-slot-coloring.md        │  ← alternative
-         │       │   (color attribute — AMD-specific)      │
+         │       ├── membar-presburger.md                  │  ← Presburger
+         │       │   (constraint solving)                  │
+         │       │                                         │
+         │       ├── membar-buffer-slot-coloring.md        │  ← Coloring
+         │       │   (attribute-based, AMD-specific)       │
          │       │                                         │
          │       ├── membar-integer-range-analysis-        │  ← ruled out
          │       │   evaluation.md                         │
          │       │                                         │
-         │       ├── membar-disjointness-approaches.md     │  ← survey
-         │       │   (all approaches compared)             │
-         │       │                                         │
-         │       └── membar-presburger.md                  │  ← future path
-         │           (Presburger as upgrade / extension)   │
+         │       └── membar-disjointness-approaches.md     │  ← survey
+         │           (all approaches compared)             │
          │                                                 │
          └── Problem 2: Warp-Local Access ─────────────────┘
                  │

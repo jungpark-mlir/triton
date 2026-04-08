@@ -261,7 +261,7 @@ Note: this shows the **unified-counter** pattern (Gluon pipelines), where
 both indices derive from the same `%phase` SSA value. The common
 (NVIDIA-style) pipeliner generates **separate counters** (`insertIdx` /
 `extractIdx`) as distinct block arguments — that IR shape is addressed in
-Section 6 as a further extension.
+Section 7 as a further extension.
 
 **BufferIndexExpr (current approach).**
 Pattern matching decomposes index arithmetic into `{base, offset, modulus}`
@@ -578,7 +578,7 @@ This generalizes: given a shared phase counter, Presburger automatically
 determines whether a given `(numBuffers, stageDistance)` pair guarantees
 disjointness, without hard-coding the arithmetic. When the pipeliner uses
 separate counters instead of a shared phase, the loop-carried extension
-(Section 6) is needed to establish the relationship between them.
+(Section 7) is needed to establish the relationship between them.
 
 ### 3.5 Gluon: Complex Index Patterns
 
@@ -774,14 +774,179 @@ choice. If more complex index idioms emerge (power-of-2 bitwise AND,
 multi-level indexing, nested modulo), switching to Presburger avoids
 ongoing pattern-matcher maintenance.
 
-## 6. Further Extension: Loop-Carried Induction Variables
+## 6. Writing Kernels for Barrier-Free Multi-Buffering
 
-The initial Presburger design (Section 3.1) builds constraints by walking
-the arith op DAG backwards from each `MemDescIndexOp` index. This works
-when both producer and consumer indices derive from the **same SSA value**
-(e.g., a single `%phase` counter in Gluon pipelines).
+The Presburger analysis proves buffer index disjointness by walking the
+SSA def-use chain from each `MemDescIndexOp` index. For this to work,
+both the read and write indices must **trace back to the same SSA value**
+through arithmetic operations. When they share a common SSA ancestor, the
+constraint system captures the relationship between them and the solver
+can prove they never collide.
 
-The common (NVIDIA-style) pipeliner generates a different IR shape: two
+This section provides practical guidance for kernel authors writing
+multi-buffered pipelines in Gluon.
+
+### The Rule: Unified Counter
+
+Use a **single loop counter** for both producer and consumer buffer slot
+indexing. Derive the write slot from the read counter using arithmetic:
+
+```python
+# Read from phase's slot, write to (phase + distance) % NUM_BUFFERS
+read_slot  = buffer.index(phase % NUM_BUFFERS)
+write_slot = buffer.index((phase + STAGE_DISTANCE) % NUM_BUFFERS)
+```
+
+Both `memdesc_index` operations trace back to `%phase` — the same SSA
+block argument. Presburger encodes `phase % N` and `(phase + D) % N`,
+adds the query `r1 = r2`, and the GCD test resolves it:
+
+```
+  N * (q2 - q1) = D
+  gcd(N) | D?  → if not, EMPTY → provably disjoint → no barrier
+```
+
+### Anti-Pattern: Separate Counters
+
+Avoid maintaining two independent counters for producer and consumer,
+even if they always differ by a constant:
+
+```python
+# Anti-pattern: two counters as loop-carried variables
+producer = NUM_BUFFERS - 1
+consumer = 0
+for ...:
+    a_buffer.index(consumer % NUM_BUFFERS).load(...)    # read
+    async_load(..., a_buffer.index(producer % NUM_BUFFERS))  # write
+    consumer += 1
+    producer += 1
+```
+
+This generates two separate `scf.for` iter_args:
+
+```
+scf.for iter_args(%producer = %c2, %consumer = %c0) {
+    %read_slot  = arith.remsi %consumer, %c3    // SSA base: %consumer
+    %write_slot = arith.remsi %producer, %c3    // SSA base: %producer
+}
+```
+
+The Presburger encoder sees `%consumer` and `%producer` as unrelated
+unconstrained variables — the invariant `producer = consumer + 2` is
+not visible in the SSA graph. The disjointness query `v0 % 3 == v1 % 3`
+is trivially satisfiable, so a barrier is conservatively inserted.
+
+### Case Study: Gluon GEMM with TDM Async Copies
+
+The `gemm_tdm_specialized_pipelined_warp_pipelined_kernel` in
+`f16_gemm_warp_pipeline_gfx1250.py` uses triple-buffered shared memory.
+In its original form, it maintains separate `producer` and `consumer`
+counters:
+
+```python
+# Original kernel (barrier between local_load and tdm_copy)
+producer = 0
+consumer = 0
+
+for _ in ttgl.static_range(NUM_BUFFERS - 1):    # prologue
+    producer = issue_loads(producer, ...)        # producer: 0 → 1 → 2
+
+for _ in range(0, cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1)):
+    consumer, a, b = lds_load(consumer, ...)     # reads consumer % 3
+    producer = issue_loads(producer, ...)         # writes producer % 3
+    accumulator = wmma(a, b, accumulator)
+```
+
+The `lds_load` function indexes the buffer with `consumer % NUM_BUFFERS`
+and `issue_loads` indexes with `producer % NUM_BUFFERS`. Since these are
+separate loop-carried variables, the Presburger analysis cannot prove
+disjointness and a barrier is inserted between the `local_load` and the
+`tdm_copy`.
+
+**Fix:** derive the write slot from `consumer`:
+
+```python
+# Fixed kernel (no barrier between local_load and tdm_copy)
+producer = 0
+consumer = 0
+
+for _ in ttgl.static_range(NUM_BUFFERS - 1):    # prologue unchanged
+    producer = issue_loads(producer, ...)
+
+for _ in range(0, cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1)):
+    # Read from consumer's slot
+    a = a_buffer.index(consumer % NUM_BUFFERS).load(...)
+    b = b_buffer.index(consumer % NUM_BUFFERS).load(...)
+
+    # Write slot derived from consumer (same SSA base!)
+    write_phase = consumer + (NUM_BUFFERS - 1)
+    async_load(a_desc, [0, write_phase * BLOCK_K],
+               a_buffer.index(write_phase % NUM_BUFFERS))
+    async_load(b_desc, [0, write_phase * BLOCK_K],
+               b_buffer.index(write_phase % NUM_BUFFERS))
+
+    consumer += 1
+```
+
+The resulting IR has a single iter_arg. Both `memdesc_index` operations
+derive from `%consumer`:
+
+```
+scf.for iter_args(%consumer = %c0, %acc = %cst) {
+    %read_slot  = arith.remsi %consumer, %c3
+    %write_base = arith.addi %consumer, %c2
+    %write_slot = arith.remsi %write_base, %c3
+}
+```
+
+Presburger proves: `(x % 3) == ((x + 2) % 3)` → `3*(q2 - q1) = 2` →
+`gcd(3) = 3`, `3 ∤ 2` → EMPTY → no barrier needed.
+
+```
+  Before (two counters):                After (unified counter):
+
+  scf.for iter_args(                    scf.for iter_args(
+      %producer = 2,                        %consumer = 0,
+      %consumer = 0,                        %acc = ...)
+      %acc = ...)
+                                          read:  %consumer % 3
+    read:  %consumer % 3                  write: (%consumer + 2) % 3
+    write: %producer % 3                         ↑ same SSA base
+           ↑ different SSA base
+                                          Presburger: 3 ∤ 2 → disjoint
+    Presburger: v0, v1 unrelated          → no barrier ✓
+    → may alias → barrier ✗
+
+  Bonus: one fewer iter_arg (saves an SGPR)
+```
+
+### Summary of Guidelines
+
+1. **Use a single phase counter** for buffer slot indexing in the main
+   loop. Derive write slots with `(phase + distance) % NUM_BUFFERS`.
+
+2. **Keep separate counters in the prologue only** — prologue copies are
+   statically unrolled (`static_range`) and don't produce loop iter_args.
+
+3. **The K-offset for global loads can also be derived** from the same
+   counter: `k_offset = (phase + distance) * BLOCK_K`. This eliminates
+   the producer iter_arg entirely.
+
+4. **`NUM_BUFFERS` and `STAGE_DISTANCE` must be coprime** for disjointness
+   to hold. For the standard triple-buffered pipeline (`N=3`, `D=2`),
+   `gcd(3, 2) = 1 ≠ 3`, so disjointness is guaranteed. If
+   `STAGE_DISTANCE` is a multiple of `NUM_BUFFERS`, the slots alias and a
+   barrier is correctly required.
+
+
+## 7. Further Extension: Loop-Carried Induction Variables
+
+When the unified counter pattern from Section 6 is not applicable — for
+example, in auto-generated pipeliner IR where two separate counters are a
+structural artifact of the code generator — the Presburger analysis needs
+an extension to discover the relationship between them.
+
+The common (NVIDIA-style) pipeliner generates exactly this IR shape: two
 **separate loop-carried block arguments** (`%insertIdx` and `%extractIdx`)
 with no shared SSA ancestor. Since block arguments have no defining op, the
 constraint builder treats them as unrelated unconstrained variables — and
@@ -903,11 +1068,12 @@ chains (Section 3.5) and providing a fallback for patterns that
 `BufferIndexExpr` misses.
 
 The loop-carried extension becomes relevant when we want to handle the
-common pipeliner's separate-counter IR without requiring pipeliner-side
-changes. It is a natural second step after the initial constraint builder
-is in place.
+common pipeliner's separate-counter IR where the kernel source is not
+modifiable. When kernel source is available (e.g., Gluon), the unified
+counter pattern (Section 6) is the preferred approach — it requires no
+compiler changes and produces better register pressure as a side benefit.
 
-## 7. Limitations
+## 8. Limitations
 
 1. **No variable-variable multiplication.** Presburger arithmetic does not
    support multiplying two variables (`x * y`). When an index involves
@@ -933,7 +1099,7 @@ is in place.
    `x mod N` only when N is a power of 2 and x is non-negative. General
    bitwise operations require over-approximation or special-case handling.
 
-## 8. Summary
+## 9. Summary
 
 | Aspect | BufferIndexExpr | With Presburger |
 |--------|:-:|:-:|
@@ -941,7 +1107,7 @@ is in place.
 | **Patterns handled** | `remsi`, `addi`, `select/cmpi` | Any linear + modular composition (not variable×variable or general bitwise) |
 | **New Gluon patterns** | Must extend pattern matcher | Automatic for supported linear/modular encodings |
 | **Subslice overlap** | Static offsets only | Dynamic offsets (with constraints) |
-| **Separate-counter pipeliners** | Cannot handle (no shared SSA base) | Possible via loop-carried extension (Section 6) |
+| **Separate-counter pipeliners** | Cannot handle (no shared SSA base) | Possible via loop-carried extension (Section 7) |
 | **Pipeliner verification** | Not available | Automated disjointness assertion |
 | **Build dependency** | None | `MLIRPresburger` (stable upstream) |
 | **Engineering effort** | Done (~110 LOC) | ~200-300 LOC for constraint builder |
