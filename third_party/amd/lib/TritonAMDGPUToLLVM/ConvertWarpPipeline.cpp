@@ -421,13 +421,34 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
 
   // 3. Materialize cluster barriers.
   //    Cluster 0 gets only its priority (inserted after cond_barrier above).
-  //    Clusters 1..N get priority + cluster barrier.
+  //    Clusters 1..N get priority + cluster barrier, unless a pre-existing
+  //    barrier op (e.g., async_wait) already exists between the clusters —
+  //    in that case, wrap it with sched_barriers instead of adding a new one.
   emitClusterPriority(b, loc, clusterOps[0], anyHasPriority);
 
   for (int i = 1; i < numClusters; i++) {
-    b.setInsertionPoint(clusterOps[i]);
-    emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
-    emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
+    Operation *existingBarrier = nullptr;
+    for (Operation *op = clusterOps[i - 1]->getNextNode();
+         op && op != clusterOps[i].getOperation(); op = op->getNextNode()) {
+      if (isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::AsyncWaitOp,
+              triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait,
+              triton::amdgpu::AsyncTDMIntrinsicWait>(op)) {
+        existingBarrier = op;
+        break;
+      }
+    }
+
+    if (existingBarrier) {
+      b.setInsertionPoint(existingBarrier);
+      emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+      ROCDL::SchedBarrier::create(b, loc, 0);
+      b.setInsertionPointAfter(existingBarrier);
+      ROCDL::SchedBarrier::create(b, loc, 0);
+    } else {
+      b.setInsertionPoint(clusterOps[i]);
+      emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+      emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
+    }
   }
 
   // 4. Post-sequence reconverge.

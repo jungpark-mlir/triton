@@ -713,3 +713,74 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Reconverge for flat pipeline is kept.
 // CHECK: amdg.cond_barrier
 // CHECK: tt.return
+
+// -----
+
+// ---- Flat pipeline with pre-existing barrier between stages ----
+//
+// When an async_wait (or similar barrier op) already exists between
+// flat pipeline stages, the pass should wrap it with sched_barriers
+// instead of inserting a redundant s_barrier.
+//
+// Stage layout: stage0 -- async_wait -- stage1 -- (nothing) -- stage2
+//
+// Expected between stage0 and stage1:
+//   sched_barrier + async_wait + sched_barrier   (wrapped, no s_barrier)
+// Expected between stage1 and stage2:
+//   sched_barrier + s_barrier + sched_barrier     (inserted, no async_wait)
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @flat_pipeline_existing_barrier(%ptr: !tt.ptr<f32>) {
+    %v0 = arith.constant 0.0 : f32
+    %v1 = arith.constant 1.0 : f32
+    %v2 = arith.constant 2.0 : f32
+
+    scf.execute_region no_inline {
+      tt.store %ptr, %v0 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage0"}
+
+    amdg.async_wait {num_inst = 0 : i32}
+
+    scf.execute_region no_inline {
+      tt.store %ptr, %v1 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage1"}
+
+    scf.execute_region no_inline {
+      tt.store %ptr, %v2 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage2"}
+
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @flat_pipeline_existing_barrier
+// CHECK-NOT: no_inline
+//
+// Pre-barrier + phase shift.
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+//
+// Stage 0 ops.
+// CHECK: tt.store
+//
+// Between stage 0 and 1: existing async_wait wrapped, no s_barrier.
+// CHECK: rocdl.sched.barrier
+// CHECK-NEXT: amdg.async_wait
+// CHECK-NEXT: rocdl.sched.barrier
+// CHECK-NOT: rocdl.s.barrier
+// Stage 1 ops.
+// CHECK: tt.store
+//
+// Between stage 1 and 2: no pre-existing barrier, so s_barrier inserted.
+// CHECK: rocdl.sched.barrier
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier
+// Stage 2 ops.
+// CHECK: tt.store
+//
+// Reconverge.
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return
