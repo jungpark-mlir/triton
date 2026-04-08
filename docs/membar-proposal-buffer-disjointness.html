@@ -216,15 +216,15 @@ distinguish the slots and inserts a false-positive CTA barrier on every
 iteration.
 </p>
 
-<div class="diagram"><pre>memdesc&lt;3&times;128&times;128&times;f16&gt; allocation
-+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+
+<div class="diagram"><pre>memdesc&lt;3x128x128xf16&gt; allocation
++----------+----------+----------+
 |  Slot 0  |  Slot 1  |  Slot 2  |
-+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+
-    &uarr; consumer               &uarr; producer
++----------+----------+----------+
+    ^ consumer               ^ producer
     phase % 3          (phase+2) % 3
 
 Always different slots, but membar sees same allocation
-&rarr; barrier inserted (false positive)</pre></div>
+--> barrier inserted (false positive)</pre></div>
 
 <p>
 This affects every multi-buffered kernel&nbsp;&mdash; FA MQA decode, GEMM
