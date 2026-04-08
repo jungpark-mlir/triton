@@ -533,7 +533,10 @@ swapOutDimSemantics(const triton::LinearLayout &layout, StringAttr dimA,
       .transposeOuts(llvm::to_vector(layout.getOutDimNames()));
 }
 
-// Fill TDM descriptor for regular load/store operations (1D-5D tensors)
+// Fill TDM descriptor for regular load/store operations (1D-5D tensors).
+// activeWarps: number of warps that actually issue TDM copies (power of two,
+// <= numWarps).  Warps with warpId >= activeWarps get pred=0 (hardware no-op).
+// A value of 0 means all warps are active (no warp specialization).
 void fillTDMDescriptor(
     RewriterBase &rewriter, Location loc,
     const LLVMTypeConverter *typeConverter, Type elementType,
@@ -544,7 +547,7 @@ void fillTDMDescriptor(
     SmallVector<Value> offset, ArrayRef<Value> dstPtrs, Value pred,
     Value multicastMask, Value barrierPtr,
     const triton::LinearLayout &sharedLayout, Value ctaId, bool isStore,
-    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA) {
+    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA, int activeWarps) {
   size_t numDims = offset.size();
   assert(numDims >= 1 && numDims <= 5 && "TDM supports 1D to 5D tensors.");
   assert(!dstPtrs.empty() && "dstPtrs cannot be empty");
@@ -582,6 +585,48 @@ void fillTDMDescriptor(
               ? std::optional<ArrayRef<Value>>(group3.value().get())
               : std::nullopt,
           numDims);
+
+  // When warp specialization is active, the per-warp block shape differs from
+  // what createTDMDescriptor encoded (which used numWarps). Re-encode the
+  // correct per-warp tile dimensions based on warpsPerCTA (from activeWarps).
+  if (activeWarps > 0) {
+    Value v16 = b.i32_val(16);
+    for (size_t i = 0; i < numDims; ++i)
+      decodedBlockShape[i] =
+          b.i32_val(shapePerCTA[i] / static_cast<int64_t>(warpsPerCTA[i]));
+
+    // Re-encode into descriptor groups (same bit-field layout as
+    // createTDMDescriptor).
+    // tile_dim0 (innermost): upper 16 bits of group1[3]
+    group1[3] = b.and_(group1[3], b.i32_val(0xFFFF));
+    group1[3] = b.or_(group1[3], b.shl(decodedBlockShape[numDims - 1], v16));
+    if (numDims >= 2) {
+      // tile_dim1: lower 16 bits of group1[4]
+      group1[4] = b.and_(group1[4], b.i32_val(0xFFFF0000));
+      group1[4] = b.or_(group1[4],
+                         b.and_(decodedBlockShape[numDims - 2],
+                                b.i32_val(0xFFFF)));
+    }
+    if (numDims >= 3) {
+      // tile_dim2: upper 16 bits of group1[4]
+      group1[4] = b.and_(group1[4], b.i32_val(0x0000FFFF));
+      group1[4] = b.or_(group1[4], b.shl(decodedBlockShape[numDims - 3], v16));
+    }
+    if (numDims >= 4 && group2.has_value()) {
+      // tile_dim3: upper 16 bits of group2[3]
+      group2.value().get()[3] =
+          b.and_(group2.value().get()[3], b.i32_val(0x0000FFFF));
+      group2.value().get()[3] = b.or_(
+          group2.value().get()[3], b.shl(decodedBlockShape[numDims - 4], v16));
+    }
+    if (numDims == 5 && group3.has_value()) {
+      // tile_dim4: upper 16 bits of group3[2]
+      group3.value().get()[2] =
+          b.and_(group3.value().get()[2], b.i32_val(0x0000FFFF));
+      group3.value().get()[2] = b.or_(
+          group3.value().get()[2], b.shl(decodedBlockShape[numDims - 5], v16));
+    }
+  }
 
   auto kMessage = str_attr("message");
   auto kWarp = str_attr("warp");
@@ -693,6 +738,14 @@ void fillTDMDescriptor(
   // Update group0 with addresses
   Value globalAddr = b.ptrtoint(i64_ty, srcPtr);
   Value ldsAddr = b.ptrtoint(i32_ty, dstPtr);
+
+  // Combine user predicate with layout predicate for warp specialization.
+  // Duplicate warps (warpId >= activeWarps) get pred=0 (hardware no-op).
+  if (activeWarps > 0 && activeWarps < numWarps) {
+    Value isActive = b.icmp_ult(warpId, b.i32_val(activeWarps));
+    Value layoutPred = b.select(isActive, b.i32_val(1), b.i32_val(0));
+    pred = b.and_(pred, layoutPred);
+  }
   group0[0] = pred;
   group0[1] = ldsAddr;
   group0[2] = b.trunc(i32_ty, globalAddr);
@@ -932,7 +985,8 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
                  SmallVector<Value> globalOffset, ArrayRef<Value> instrDstPtrs,
                  Value pred, Value multicastMask, Value barrier,
                  const triton::LinearLayout &instrSharedLayout, Value ctaId,
-                 bool isLoad, bool isRowMajor, ArrayRef<unsigned> warpsPerCTA) {
+                 bool isLoad, bool isRowMajor, ArrayRef<unsigned> warpsPerCTA,
+                 int activeWarps = 0) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
   Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
@@ -948,7 +1002,7 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
                       group0Vec, group1Vec, std::ref(group2Vec),
                       std::ref(group3Vec), globalOffset, instrDstPtrs, pred,
                       multicastMask, barrier, instrSharedLayout, ctaId, !isLoad,
-                      isRowMajor, warpsPerCTA);
+                      isRowMajor, warpsPerCTA, activeWarps);
 
     auto group0 = packLLVector(loc, group0Vec, rewriter);
     auto group1 = packLLVector(loc, group1Vec, rewriter);
@@ -968,7 +1022,8 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
         rewriter, loc, typeConverter, elementType, effectiveBlockShape,
         numWarps, padInterval, padAmount, group0Vec, group1Vec, std::nullopt,
         std::nullopt, globalOffset, instrDstPtrs, pred, multicastMask, barrier,
-        instrSharedLayout, ctaId, !isLoad, isRowMajor, warpsPerCTA);
+        instrSharedLayout, ctaId, !isLoad, isRowMajor, warpsPerCTA,
+        activeWarps);
 
     auto group0 = packLLVector(loc, group0Vec, rewriter);
     auto group1 = packLLVector(loc, group1Vec, rewriter);
@@ -1000,16 +1055,41 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       Value pred, Value multicastMask, Type elementType,
                       Value barrierPtr, bool isLoad,
                       const triton::LinearLayout &sharedLayout,
-                      Attribute encoding, Value ctaId, bool isRowMajor) {
+                      Attribute encoding, Value ctaId, bool isRowMajor,
+                      ArrayRef<int64_t> warpBases) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   size_t numDims = blockShape.size();
   assert(numDims <= 5);
+
+  // Determine activeWarps from warp_bases.
+  // The non-zero prefix length gives log2(activeWarps).
+  int activeWarps = 0;
+  if (!warpBases.empty()) {
+    int numBits = warpBases.size() / numDims;
+    int activeCount = 0;
+    for (int bit = 0; bit < numBits; ++bit) {
+      bool isZero = true;
+      for (size_t d = 0; d < numDims; ++d) {
+        if (warpBases[bit * numDims + d] != 0) {
+          isZero = false;
+          break;
+        }
+      }
+      if (!isZero)
+        activeCount++;
+    }
+    activeWarps = 1 << activeCount;
+  }
+
+  // When warp specialization is active, compute the warp distribution based
+  // on activeWarps instead of numWarps.
+  int effectiveWarps = (activeWarps > 0) ? activeWarps : numWarps;
 
   auto partitionedEnc = dyn_cast<PartitionedSharedEncodingAttr>(encoding);
 
   // Compute warp distribution -- partition-aligned when needed.
   auto [warpsPerCTA, numTDMInstructions] =
-      distributeTDMWarpsAlignToPartition(blockShape, numWarps, encoding);
+      distributeTDMWarpsAlignToPartition(blockShape, effectiveWarps, encoding);
 
   // Fast path: single instruction covers the entire block.
   if (numTDMInstructions == 1) {
@@ -1017,7 +1097,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                      to_vector(blockShape), numWarps, padInterval, padAmount,
                      to_vector(offset), dstPtrs, pred, multicastMask,
                      barrierPtr, sharedLayout, ctaId, isLoad, isRowMajor,
-                     warpsPerCTA);
+                     warpsPerCTA, activeWarps);
     return;
   }
 
@@ -1081,7 +1161,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
     emitTDMIntrinsic(rewriter, loc, typeConverter, desc, numDims, elementType,
                      effectiveBlockShape, numWarps, padInterval, padAmount,
                      globalOffset, instrDstPtrs, pred, multicastMask, barrier,
-                     sliceLayout, ctaId, isLoad, isRowMajor, warpsPerCTA);
+                     sliceLayout, ctaId, isLoad, isRowMajor, warpsPerCTA,
+                     activeWarps);
   }
 }
 

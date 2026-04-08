@@ -1024,9 +1024,14 @@ void init_gluon_ir(py::module &&m) {
            })
       .def("create_async_tdm_copy_global_to_local",
            [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,
-              Value result, Value pred, Value barrier) {
+              Value result, Value pred, Value barrier,
+              std::vector<int64_t> warpBases) {
+             auto warpBasesAttr = warpBases.empty()
+                                      ? DenseI64ArrayAttr()
+                                      : DenseI64ArrayAttr::get(
+                                            self.getContext(), warpBases);
              self.create<ttag::AsyncTDMCopyGlobalToLocalOp>(
-                 descPtr, indices, result, pred, barrier);
+                 descPtr, indices, result, pred, barrier, warpBasesAttr);
            })
       .def("create_async_tdm_copy_local_to_global",
            [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,

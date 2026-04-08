@@ -744,6 +744,13 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
     swizzling.
     The operation can also take an optional 64bit LDS barrier address, in which case
     it sends an "LDS atomic arrive" to signal its completion.
+
+    `warp_bases` is an optional attribute for TDM warp specialization.
+    Each entry maps one bit of warpId to an element offset in the tensor
+    coordinate space.  A `[0, ..., 0]` basis means that bit of warpId
+    contributes no offset (degenerate / duplicate warp). Duplicate warps
+    get pred=0 and produce a hardware no-op. The attribute is stored as
+    a flattened row-major array of shape `(log2(num_warps), ndim)`.
   }];
 
   let arguments = (ins
@@ -751,14 +758,21 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
     Variadic<I32>:$indices,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
     I32:$pred,
-    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier
+    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
+    OptionalAttr<DenseI64ArrayAttr>:$warp_bases
   );
 
   let results = (outs TTG_AsyncToken:$token);
 
   let builders = [
     OpBuilder<(ins "Value":$desc, "ValueRange":$indices, "Value":$result, "Value":$pred), [{
-      return build($_builder, $_state, desc, indices, result, pred, /*barrier=*/static_cast<mlir::Value>(nullptr));
+      return build($_builder, $_state, desc, indices, result, pred,
+                   /*barrier=*/static_cast<mlir::Value>(nullptr),
+                   /*warp_bases=*/DenseI64ArrayAttr());
+    }]>,
+    OpBuilder<(ins "Value":$desc, "ValueRange":$indices, "Value":$result, "Value":$pred, "Value":$barrier), [{
+      return build($_builder, $_state, desc, indices, result, pred, barrier,
+                   /*warp_bases=*/DenseI64ArrayAttr());
     }]>
   ];
 

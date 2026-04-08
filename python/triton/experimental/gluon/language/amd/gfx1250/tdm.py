@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from typing import List, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
 
@@ -142,9 +143,69 @@ def make_tensor_descriptor(base: ttgl.tensor, shape: List[ttgl.constexpr | ttgl.
     return tensor_descriptor(handle, shape, strides, type)
 
 
+def _validate_warp_bases(warp_bases, block_shape, num_warps):
+    """Validate warp_bases for TDM warp specialization.
+
+    warp_bases must be log2(num_warps) entries where the non-zero entries form
+    a contiguous prefix matching the greedy distribution for block_shape over
+    active_warps, and the remaining entries are all zero.
+    """
+    ndim = len(block_shape)
+    num_bits = int(math.log2(num_warps))
+
+    assert num_warps > 0 and (num_warps & (num_warps - 1)) == 0, \
+        f"num_warps must be a power of two, got {num_warps}"
+    assert len(warp_bases) == num_bits, \
+        f"warp_bases must have log2(num_warps)={num_bits} entries, got {len(warp_bases)}"
+    for i, basis in enumerate(warp_bases):
+        assert len(basis) == ndim, \
+            f"warp_bases[{i}] must have {ndim} elements, got {len(basis)}"
+
+    active_count = 0
+    seen_zero = False
+    for bit, basis in enumerate(warp_bases):
+        is_zero = all(v == 0 for v in basis)
+        if is_zero:
+            seen_zero = True
+        else:
+            assert not seen_zero, \
+                f"warp_bases non-zero entries must form a contiguous prefix; " \
+                f"found non-zero basis at bit {bit} after a zero basis"
+            active_count += 1
+
+    active_warps = 1 << active_count
+
+    # Compute expected greedy distribution for active_warps.
+    warps_per_dim = [1] * ndim
+    remaining = active_warps
+    for d in range(ndim):
+        while remaining > 1 and warps_per_dim[d] * 2 <= block_shape[d]:
+            warps_per_dim[d] *= 2
+            remaining //= 2
+    if remaining > 1:
+        warps_per_dim[-1] *= remaining
+
+    # Reconstruct expected bases from the greedy distribution.
+    expected_bases = []
+    for d in range(ndim):
+        per_warp_tile = block_shape[d] // warps_per_dim[d]
+        for k in range(int(math.log2(warps_per_dim[d]))):
+            basis = [0] * ndim
+            basis[d] = per_warp_tile * (1 << k)
+            expected_bases.append(basis)
+
+    for bit in range(active_count):
+        assert warp_bases[bit] == expected_bases[bit], \
+            f"warp_bases[{bit}] = {warp_bases[bit]} but expected " \
+            f"{expected_bases[bit]} (greedy distribution for block_shape=" \
+            f"{block_shape}, active_warps={active_warps})"
+
+    return [v for basis in warp_bases for v in basis]
+
+
 @builtin
 def async_load(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tensor], dest: shared_memory_descriptor,
-               pred=1, mbarrier: shared_memory_descriptor = None, _semantic=None) -> None:
+               pred=1, mbarrier: shared_memory_descriptor = None, warp_bases=None, _semantic=None) -> None:
     """Load a block of tensor specified in tensor descriptor from global memory to shared memory asynchronously.
 
     Args:
@@ -153,14 +214,26 @@ def async_load(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tenso
         dest (shared_memory_descriptor): the shared memory destination to store the loaded data.
         pred (int, optional): Predicate to enable or disable the load. Defaults to 1.
         mbarrier (shared_memory_descriptor, optional): The barrier object to signal "arrive" on.
+        warp_bases (List[List[int]], optional): Per-bit warp-to-offset mapping for TDM warp specialization.
+            Each entry maps one bit of warpId to an element offset in the tensor coordinate space.
+            A zero basis means that bit contributes no offset (duplicate warp, gets pred=0).
     """
     offset_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
     pred = _semantic.to_tensor(pred)
     pred_handle = pred.handle
     mbarrier = _unwrap_if_constexpr(mbarrier)
     mbarrier_handle = mbarrier.handle if mbarrier is not None else ttgl.ir.value()
+
+    warp_bases = _unwrap_if_constexpr(warp_bases)
+    flat_warp_bases = []
+    if warp_bases is not None:
+        warp_bases = [_unwrap_if_constexpr(b) for b in warp_bases]
+        warp_bases = [[_unwrap_if_constexpr(v) for v in b] for b in warp_bases]
+        num_warps = _semantic.builder.options.num_warps
+        flat_warp_bases = _validate_warp_bases(warp_bases, list(src.block_shape), num_warps)
+
     _semantic.builder.create_async_tdm_copy_global_to_local(src.handle, offset_handles, dest.handle, pred_handle,
-                                                            mbarrier_handle)
+                                                            mbarrier_handle, flat_warp_bases)
 
 
 @builtin
