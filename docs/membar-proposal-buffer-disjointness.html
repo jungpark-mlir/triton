@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Proposal: Buffer Index Disjointness for Membar Analysis</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&family=Source+Code+Pro:wght@400;500&display=swap');
+
+  :root {
+    --fg: #1a1a1a;
+    --fg-secondary: #444;
+    --bg: #fff;
+    --accent: #1a56db;
+    --border: #d0d0d0;
+    --code-bg: #f5f5f5;
+    --code-border: #e0e0e0;
+    --table-header: #f0f2f5;
+    --table-stripe: #f8f9fa;
+    --tag-a: #0e7c42;
+    --tag-a-bg: #e6f4ec;
+    --tag-b: #1a56db;
+    --tag-b-bg: #e8eefb;
+    --tag-c: #9333ea;
+    --tag-c-bg: #f3e8ff;
+    --yes: #0e7c42;
+    --no: #b91c1c;
+    --partial: #b45309;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Source Serif 4', Georgia, serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.65;
+    font-size: 11pt;
+    max-width: 750px;
+    margin: 0 auto;
+    padding: 40px 24px;
+  }
+
+  @media print {
+    body { padding: 0; max-width: none; font-size: 10pt; }
+    .page-break { page-break-before: always; }
+    h2 { page-break-after: avoid; }
+    table, pre, .diagram { page-break-inside: avoid; }
+    a { color: var(--fg); text-decoration: none; }
+  }
+
+  h1 {
+    font-size: 1.7em;
+    font-weight: 700;
+    margin-bottom: 4px;
+    letter-spacing: -0.02em;
+  }
+
+  .subtitle {
+    color: var(--fg-secondary);
+    font-size: 0.95em;
+    margin-bottom: 32px;
+    font-style: italic;
+  }
+
+  h2 {
+    font-size: 1.25em;
+    font-weight: 700;
+    margin-top: 32px;
+    margin-bottom: 12px;
+    padding-bottom: 4px;
+    border-bottom: 1.5px solid var(--border);
+    letter-spacing: -0.01em;
+  }
+
+  h3 {
+    font-size: 1.05em;
+    font-weight: 600;
+    margin-top: 20px;
+    margin-bottom: 8px;
+  }
+
+  p { margin-bottom: 10px; }
+
+  .option-tag {
+    display: inline-block;
+    font-family: 'Source Code Pro', monospace;
+    font-size: 0.8em;
+    font-weight: 500;
+    padding: 1px 7px;
+    border-radius: 3px;
+    margin-right: 4px;
+    vertical-align: 1px;
+  }
+  .tag-a { color: var(--tag-a); background: var(--tag-a-bg); }
+  .tag-b { color: var(--tag-b); background: var(--tag-b-bg); }
+  .tag-c { color: var(--tag-c); background: var(--tag-c-bg); }
+
+  code {
+    font-family: 'Source Code Pro', monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+
+  pre {
+    font-family: 'Source Code Pro', monospace;
+    font-size: 0.82em;
+    line-height: 1.5;
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 4px;
+    padding: 12px 14px;
+    margin: 10px 0 14px 0;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .diagram {
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 4px;
+    padding: 14px 16px;
+    margin: 10px 0 14px 0;
+    text-align: center;
+  }
+
+  .diagram pre {
+    display: inline-block;
+    text-align: left;
+    border: none;
+    background: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0 16px 0;
+    font-size: 0.9em;
+  }
+
+  th {
+    background: var(--table-header);
+    font-weight: 600;
+    text-align: left;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+  }
+
+  td {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  tr:nth-child(even) td { background: var(--table-stripe); }
+
+  td.yes { color: var(--yes); font-weight: 600; }
+  td.no  { color: var(--no); font-weight: 600; }
+  td.partial { color: var(--partial); font-weight: 500; font-size: 0.92em; }
+  td.center { text-align: center; }
+
+  .field { margin-bottom: 6px; }
+  .field-label {
+    font-weight: 600;
+    font-size: 0.92em;
+  }
+
+  ul { margin: 4px 0 10px 20px; }
+  li { margin-bottom: 4px; }
+
+  .decision-box {
+    background: var(--table-stripe);
+    border-left: 3px solid var(--accent);
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 0 4px 4px 0;
+  }
+
+  .decision-box p { margin-bottom: 6px; }
+  .decision-box p:last-child { margin-bottom: 0; }
+
+  strong { font-weight: 600; }
+
+  .observation {
+    background: #fffbe6;
+    border: 1px solid #e6d88a;
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin: 12px 0;
+    font-size: 0.95em;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 24px 0;
+  }
+</style>
+</head>
+<body>
+
+<h1>Proposal: Buffer Index Disjointness</h1>
+<div class="subtitle">Membar Analysis &mdash; Eliminating False-Positive CTA Barriers in Multi-Buffered Pipelines</div>
+
+<!-- ================================================================ -->
+<h2>Problem</h2>
+
+<p>
+In multi-buffered pipelined kernels, producer and consumer access different
+slots of the same shared memory allocation via a dynamic index. Membar cannot
+distinguish the slots and inserts a false-positive CTA barrier on every
+iteration.
+</p>
+
+<div class="diagram"><pre>memdesc&lt;3&times;128&times;128&times;f16&gt; allocation
++&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+
+|  Slot 0  |  Slot 1  |  Slot 2  |
++&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;+
+    &uarr; consumer               &uarr; producer
+    phase % 3          (phase+2) % 3
+
+Always different slots, but membar sees same allocation
+&rarr; barrier inserted (false positive)</pre></div>
+
+<p>
+This affects every multi-buffered kernel&nbsp;&mdash; FA MQA decode, GEMM
+pipelined loops, and Gluon user-written pipelines. The barrier stalls all
+warps on every pipeline iteration with no benefit.
+</p>
+
+<!-- ================================================================ -->
+<h2>Options</h2>
+
+<!-- Option A -->
+<h3><span class="option-tag tag-a">A</span> BufferIndexExpr (Symbolic Pattern Matching)</h3>
+
+<p>
+Pattern-match the index arithmetic into a canonical form
+<code>{base, offset, modulus}</code>. Two indices are provably disjoint when
+they share the same SSA base, same modulus, and different offsets.
+</p>
+
+<pre>slot[remsi(phase, 3)]       &rarr; {base=%phase, offset=0, mod=3}
+slot[remsi(phase + 2, 3)]   &rarr; {base=%phase, offset=2, mod=3}
+                                     same       0&ne;2      same
+                                       &rarr; provably disjoint</pre>
+
+<div class="field"><span class="field-label">Where it lives:</span> Core <code>Membar.cpp</code> &mdash; all backends benefit.</div>
+
+<div class="field"><span class="field-label">Recognized patterns:</span> <code>arith.remsi</code>, <code>arith.addi</code>, <code>select/cmpi</code> conditional wrapping. Unrecognized patterns fall through to conservative (barrier inserted).</div>
+
+<div class="field"><span class="field-label">Effort:</span> ~200 LOC. <code>BufferIndexExpr</code> struct + <code>analyzeBufferIndex()</code> pattern matcher + <code>isProvablyDifferentFrom()</code> comparison + <code>AllocationSlice</code> additions for loop-carried tracking.</div>
+
+<div class="field"><span class="field-label">Tested:</span> Yes &mdash; local testing confirms correct barrier suppression on FA MQA decode and standard Gluon pipeline patterns.</div>
+
+<div class="field"><span class="field-label">Limitations:</span></div>
+<ul>
+  <li>Requires both indices to derive from the <strong>same SSA counter</strong> with different constant offsets. Gluon produces this (unified <code>%phase</code>), but the common NVIDIA-style pipeliner uses <strong>separate loop-carried counters</strong> (<code>insertIdx</code> / <code>extractIdx</code>) &mdash; different SSA bases that <code>BufferIndexExpr</code> cannot relate.</li>
+  <li>Each new index idiom needs a new pattern in <code>analyzeBufferIndex</code>. Current patterns cover what Gluon and the pipeliner&rsquo;s <code>createIncrementModulo</code> produce today.</li>
+</ul>
+
+<!-- Option B -->
+<h3><span class="option-tag tag-b">B</span> Presburger Constraint Solving</h3>
+
+<p>
+Encode the index arithmetic as linear constraints over integers and ask
+MLIR&rsquo;s Presburger solver whether <code>idx_a = idx_b</code> is satisfiable.
+</p>
+
+<pre>Encode:
+  idx_a = (phase + 2) mod 3  &rarr;  &exist;q1: idx_a = phase + 2 &minus; 3&middot;q1
+  idx_b = phase mod 3        &rarr;  &exist;q2: idx_b = phase &minus; 3&middot;q2
+  0 &le; idx_a &le; 2,  0 &le; idx_b &le; 2
+
+Query: is {idx_a = idx_b} satisfiable?
+
+Presburger solver: NO &rarr; provably disjoint</pre>
+
+<div class="field"><span class="field-label">Where it lives:</span> Core <code>Membar.cpp</code> &mdash; all backends benefit. Uses <code>mlir/Analysis/Presburger/IntegerRelation</code> (standalone library, no IR dependency).</div>
+
+<div class="field"><span class="field-label">Encoder:</span> Walk the arith SSA def-use chain from the <code>MemDescIndexOp</code> index value. For each op, emit constraints:</div>
+
+<table>
+  <tr><th>arith op</th><th>Constraint</th></tr>
+  <tr><td><code>arith.addi %x, C</code></td><td><code>result = x + C</code> (equality)</td></tr>
+  <tr><td><code>arith.remsi %x, N</code></td><td><code>&exist;q: result = x &minus; N&middot;q, 0 &le; result &lt; N</code></td></tr>
+  <tr><td><code>arith.muli %x, C</code></td><td><code>result = C&middot;x</code> (equality)</td></tr>
+  <tr><td>block argument</td><td>unconstrained <code>SetDim</code> variable</td></tr>
+  <tr><td>unrecognized op</td><td>unconstrained <code>SetDim</code> variable (conservative)</td></tr>
+</table>
+
+<p>Then add the query constraint <code>idx_a = idx_b</code> and call <code>isIntegerEmpty()</code>. If empty, the indices are provably different.</p>
+
+<div class="field"><span class="field-label">Effort:</span> ~300 LOC. Encoder + <code>IntegerPolyhedron</code> construction + <code>isIntegerEmpty()</code> call + integration into <code>AllocationSlice::intersects()</code>. Link target <code>MLIRPresburger</code> (already in LLVM/MLIR, no external dependency).</div>
+
+<div class="field"><span class="field-label">Tested:</span> Yes &mdash; local testing confirms correct results on FA MQA decode and standard Gluon pipeline patterns. Solver time negligible for small constraint systems.</div>
+
+<div class="field"><span class="field-label">Limitations:</span></div>
+<ul>
+  <li>Same IR shape constraint as BufferIndexExpr: requires both indices to derive from the <strong>same SSA counter</strong>. The solver is more powerful than pattern matching, but it still operates on SSA def-use chains &mdash; if the two indices have unrelated SSA bases, the solver treats them as unconstrained and cannot prove disjointness.</li>
+  <li>The Presburger library is ~12k LOC internally (Simplex, FM elimination, branch-and-bound). It is a well-tested MLIR component, but internal debugging is non-trivial. Our interaction surface is small (~5 API calls) and the constraint matrices are tiny (4&ndash;8 rows) &mdash; verifiable by <code>dump()</code>.</li>
+</ul>
+
+<!-- Option C -->
+<h3><span class="option-tag tag-c">C</span> Buffer Slot Coloring (Attribute-Based)</h3>
+
+<p>
+Tag each <code>MemDescIndexOp</code> with a <code>buffer_color</code> integer
+attribute. The membar filter treats different colors as disjoint &mdash; no
+arithmetic analysis needed.
+</p>
+
+<pre>%read  = ttg.memdesc_index %alloc[%phase] {buffer_color = 0}
+%write = ttg.memdesc_index %alloc[%next]  {buffer_color = 1}
+// 0 &ne; 1 &rarr; disjoint</pre>
+
+<div class="field"><span class="field-label">Where it lives:</span> Backend filter (AMD <code>membarFilter</code>). Requires the code generator (pipeliner or Gluon runtime) to assign colors.</div>
+
+<div class="field"><span class="field-label">Effort:</span> ~150 LOC. Attribute definition + filter clause + pipeliner/Gluon integration to assign colors.</div>
+
+<div class="field"><span class="field-label">Limitations:</span></div>
+<ul>
+  <li>Correctness depends on correct color assignment by the producer. If the pipeliner assigns wrong colors (e.g., single-buffer case), the filter silently suppresses a real hazard. No construction-time safety &mdash; unlike A/B where same offsets are never reported as disjoint.</li>
+  <li>AMD-specific (lives in backend filter, not core membar).</li>
+  <li>Attributes must survive lowering passes. If a pass recreates the op without copying attributes, the color is lost.</li>
+  <li>Requires a new Gluon API (<code>colored_memdesc_index</code> or similar).</li>
+</ul>
+
+<div class="field"><span class="field-label">Advantage over A and B:</span> Works with <strong>any IR shape</strong>, including the common pipeliner&rsquo;s separate <code>insertIdx</code>/<code>extractIdx</code> counters. The filter doesn&rsquo;t inspect the index arithmetic &mdash; it only compares the attribute.</div>
+
+<!-- ================================================================ -->
+<h2 class="page-break">IR Shape Compatibility</h2>
+
+<p>
+The critical distinction between the options is which pipeliner IR shapes
+they support:
+</p>
+
+<p><strong>Gluon pipelines</strong> use a unified <code>%phase</code> counter:</p>
+
+<pre>%r_idx = arith.remsi %phase, %c3
+%read  = ttg.memdesc_index %alloc[%r_idx]
+%w_off = arith.addi %phase, %c2
+%w_idx = arith.remsi %w_off, %c3
+%write = ttg.memdesc_index %alloc[%w_idx]</pre>
+
+<p>Both indices derive from <code>%phase</code> &rarr; A, B, and C all work.</p>
+
+<p><strong>Common (NVIDIA-style) pipeliner</strong> uses separate counters:</p>
+
+<pre>// Producer stage:
+%insertIdx = ...    // loop-carried, increments mod N
+%write = ttg.memdesc_index %alloc[%insertIdx]
+
+// Consumer stage:
+%extractIdx = ...   // separate loop-carried, increments mod N
+%read = ttg.memdesc_index %alloc[%extractIdx]</pre>
+
+<p>Different SSA bases &rarr; A and B cannot relate them. C works (color on the op, doesn&rsquo;t inspect the index).</p>
+
+<table>
+  <tr>
+    <th>IR Shape</th>
+    <th><span class="option-tag tag-a">A</span> BufferIndexExpr</th>
+    <th><span class="option-tag tag-b">B</span> Presburger</th>
+    <th><span class="option-tag tag-c">C</span> Coloring</th>
+  </tr>
+  <tr>
+    <td>Unified counter (Gluon)</td>
+    <td class="yes center">Yes</td>
+    <td class="yes center">Yes</td>
+    <td class="yes center">Yes</td>
+  </tr>
+  <tr>
+    <td>Separate counters (common pipeliner)</td>
+    <td class="no center">No</td>
+    <td class="no center">No</td>
+    <td class="yes center">Yes</td>
+  </tr>
+  <tr>
+    <td>Arbitrary index computation (Gluon user code)</td>
+    <td class="partial center">Pattern-dependent</td>
+    <td class="partial center">Yes (if arith)</td>
+    <td class="yes center">Yes</td>
+  </tr>
+</table>
+
+<!-- ================================================================ -->
+<h2>Comparison</h2>
+
+<table>
+  <tr>
+    <th></th>
+    <th><span class="option-tag tag-a">A</span> BufferIndexExpr</th>
+    <th><span class="option-tag tag-b">B</span> Presburger</th>
+    <th><span class="option-tag tag-c">C</span> Coloring</th>
+  </tr>
+  <tr><td><strong>Where</strong></td><td>Core membar</td><td>Core membar</td><td>Backend filter</td></tr>
+  <tr><td><strong>Mechanism</strong></td><td>Pattern matching</td><td>Constraint solving</td><td>Attribute comparison</td></tr>
+  <tr><td><strong>All backends</strong></td><td class="yes center">Yes</td><td class="yes center">Yes</td><td class="no center">No (AMD)</td></tr>
+  <tr><td><strong>Effort</strong></td><td>~200 LOC</td><td>~300 LOC</td><td>~150 LOC</td></tr>
+  <tr><td><strong>Safety</strong></td><td>By construction</td><td>By construction</td><td>Depends on producer</td></tr>
+  <tr><td><strong>Gluon unified counter</strong></td><td class="yes center">Yes</td><td class="yes center">Yes</td><td class="yes center">Yes</td></tr>
+  <tr><td><strong>Common pipeliner</strong></td><td class="no center">No</td><td class="no center">No</td><td class="yes center">Yes</td></tr>
+  <tr><td><strong>Pattern coverage</strong></td><td><code>remsi</code>, <code>addi</code>, <code>select/cmpi</code></td><td>Any <code>arith</code> op chain</td><td>Any (attribute)</td></tr>
+  <tr><td><strong>New patterns</strong></td><td>New matcher needed</td><td>Encoder handles automatically</td><td>N/A</td></tr>
+  <tr><td><strong>Dependency</strong></td><td>None</td><td><code>MLIRPresburger</code> link</td><td>Attribute + API</td></tr>
+  <tr><td><strong>Debuggability</strong></td><td>Trivial (our code)</td><td>Good (<code>dump()</code> constraints)</td><td>Trivial (integer comparison)</td></tr>
+  <tr><td><strong>Runtime cost</strong></td><td>O(1) per comparison</td><td>O(1) for small systems</td><td>O(1)</td></tr>
+  <tr><td><strong>Tested locally</strong></td><td class="yes center">Yes</td><td class="yes center">Yes</td><td class="no center">Not yet</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2>A vs B: BufferIndexExpr vs Presburger</h2>
+
+<p>
+Since both A and B cover the same IR shapes (unified counter), the choice
+between them is about <strong>simplicity vs generality</strong>:
+</p>
+
+<p><strong>Choose A if:</strong></p>
+<ul>
+  <li>The recognized patterns (<code>remsi</code>, <code>addi</code>, <code>select/cmpi</code>) are sufficient for all foreseeable use cases.</li>
+  <li>You want zero new dependencies and trivially debuggable code.</li>
+  <li>You accept that new index patterns require new matchers.</li>
+</ul>
+
+<p><strong>Choose B if:</strong></p>
+<ul>
+  <li>You want to handle any <code>arith</code> op chain without writing pattern matchers for each one (e.g., <code>andi</code> masking, nested modulo, multi-level indexing).</li>
+  <li>You&rsquo;re comfortable with the Presburger library as a dependency (well-tested MLIR component, but internal complexity is high).</li>
+  <li>You want a solution that doesn&rsquo;t need maintenance when the pipeliner or Gluon changes how it computes indices.</li>
+</ul>
+
+<div class="observation">
+<strong>Key observation:</strong> B subsumes A. Every pattern A recognizes, B
+handles. B also handles patterns A doesn&rsquo;t (power-of-2 <code>andi</code>,
+nested modulo, multi-level indexing). The extra ~100 LOC buys strictly broader
+coverage and no per-pattern maintenance.
+</div>
+
+<!-- ================================================================ -->
+<h2 class="page-break">Decision Points</h2>
+
+<div class="decision-box">
+<p><strong>1. For Gluon (unified counter): A or B?</strong></p>
+<p>Both work. B is more general and already tested. A is simpler and has zero dependencies. If the team is comfortable with Presburger as a dependency, B is the stronger choice.</p>
+</div>
+
+<div class="decision-box">
+<p><strong>2. For common pipeliner (separate counters): C or pipeliner change?</strong></p>
+<p>Neither A nor B can help here. Two options:</p>
+<ul>
+  <li><strong>Add C</strong> as a complement &mdash; the pipeliner stamps colors, the filter compares them. Works with the current IR shape.</li>
+  <li><strong>Change the pipeliner</strong> to use a unified counter (like Gluon) &mdash; then A or B handles it. This is a larger change but avoids attribute-based machinery.</li>
+</ul>
+</div>
+
+<div class="decision-box">
+<p><strong>3. Can A/B and C coexist?</strong></p>
+<p>Yes. They operate at different layers &mdash; A/B in core <code>AllocationSlice::intersects()</code>, C in the backend filter. If A/B proves disjointness, the filter is never consulted. If A/B can&rsquo;t (unrecognized pattern or different SSA bases), C provides a fallback.</p>
+</div>
+
+</body>
+</html>

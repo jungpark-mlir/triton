@@ -23,16 +23,6 @@ This affects every multi-buffered kernel — FA MQA decode, GEMM
 pipelined loops, and Gluon user-written pipelines. The barrier
 stalls all warps on every pipeline iteration with no benefit.
 
-### Why Range Analysis Cannot Solve This
-
-Triton has `IntegerRangeAnalysis` (AMD backend), which tracks per-value
-`[min, max]` intervals. Both `phase % 3` and `(phase+2) % 3` have
-range `[0, 2]` — overlapping completely. Range analysis answers "what
-values can X take?" but cannot answer "is X always different from Y?"
-This is a fundamental limitation of **non-relational** domains: they
-track each variable independently and cannot express relationships
-between two variables.
-
 ## Options
 
 ### Option A: BufferIndexExpr (Symbolic Pattern Matching)
@@ -267,11 +257,3 @@ strictly broader coverage and no per-pattern maintenance.
    A/B proves disjointness, the filter is never consulted. If A/B
    can't (unrecognized pattern or different SSA bases), C provides
    a fallback.
-
-## Detailed Design References
-
-- [membar-dynamic-index-disjointness.md](membar-dynamic-index-disjointness.md) — Full BufferIndexExpr design and implementation
-- [membar-buffer-slot-coloring.md](membar-buffer-slot-coloring.md) — Full Buffer Slot Coloring design
-- [membar-presburger.md](membar-presburger.md) — MLIR Presburger library deep dive and encoder design
-- [membar-disjointness-approaches.md](membar-disjointness-approaches.md) — Survey of all evaluated approaches
-- [membar-integer-range-analysis-evaluation.md](membar-integer-range-analysis-evaluation.md) — Why range analysis cannot solve this
