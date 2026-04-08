@@ -232,4 +232,78 @@ tt.func @loop_carried_conservative(%lb : index, %ub : index) {
   tt.return
 }
 
+// CHECK-LABEL: loop_backedge_cross_iteration_barrier
+// Pipelined double-buffering loop: write to slot (phase+1)%2, read from
+// slot phase%2.  Intra-iteration these are provably disjoint via Presburger.
+// But cross-iteration, the write from iteration N to (phase_N+1)%2 can
+// collide with the read from iteration N+1 at phase_{N+1}%2 = (phase_N+1)%2.
+// The backedge-propagated slices must be marked loop-carried so the
+// Presburger check is skipped and a barrier is conservatively inserted
+// at the loop body entry for cross-iteration safety.
+// The intra-iteration write/read pair still gets no barrier.
+tt.func @loop_backedge_cross_iteration_barrier(%lb : index, %ub : index) {
+  %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf16>
+  %step = arith.constant 1 : index
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %c2_i32 = arith.constant 2 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
+  scf.for %iv = %lb to %ub step %step iter_args(%phase = %c0_i32) -> (i32) {
+    // Cross-iteration barrier: loop-carried slices from previous iteration
+    // CHECK: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store
+    // Write to slot (phase+1)%2
+    %w_sum = arith.addi %phase, %c1_i32 : i32
+    %w_idx = arith.remui %w_sum, %c2_i32 : i32
+    %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    ttg.local_store %cst, %w_view : tensor<128x128xf16> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    // Read from slot phase%2 — intra-iteration: Presburger proves disjoint
+    %r_idx = arith.remui %phase, %c2_i32 : i32
+    %r_view = ttg.memdesc_index %alloc[%r_idx] : !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: ttg.local_load
+    %load = ttg.local_load %r_view : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16>
+    %next_phase = arith.addi %phase, %c1_i32 : i32
+    scf.yield %next_phase : i32
+  }
+  tt.return
+}
+
+// CHECK-LABEL: loop_backedge_intra_iteration_disjoint
+// Same pipelined pattern but with 3 buffers and 2-stage offset.
+// Intra-iteration: write (phase+2)%3 vs read phase%3 → always disjoint.
+// Cross-iteration: write (phase_N+2)%3 vs read (phase_N+1)%3 → also
+// disjoint for all phase, but the analysis can't prove this structurally
+// so it conservatively inserts a barrier for the loop-carried case.
+// The intra-iteration write/read pair gets no barrier via Presburger.
+tt.func @loop_backedge_intra_iteration_disjoint(%lb : index, %ub : index) {
+  %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf16>
+  %step = arith.constant 1 : index
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %c2_i32 = arith.constant 2 : i32
+  %c3_i32 = arith.constant 3 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable>
+  scf.for %iv = %lb to %ub step %step iter_args(%phase = %c0_i32) -> (i32) {
+    // Cross-iteration barrier (conservative — actually safe but can't prove)
+    // CHECK: ttg.barrier local
+    // CHECK-NEXT: ttg.local_store
+    // Write to slot (phase+2)%3
+    %w_sum = arith.addi %phase, %c2_i32 : i32
+    %w_idx = arith.remui %w_sum, %c3_i32 : i32
+    %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    ttg.local_store %cst, %w_view : tensor<128x128xf16> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    // Read from slot phase%3
+    %r_idx = arith.remui %phase, %c3_i32 : i32
+    %r_view = ttg.memdesc_index %alloc[%r_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    // Intra-iteration: Presburger proves (phase+2)%3 ≠ phase%3 → no barrier
+    // CHECK-NOT: ttg.barrier local
+    // CHECK: ttg.local_load
+    %load = ttg.local_load %r_view : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16>
+    %next_phase = arith.addi %phase, %c1_i32 : i32
+    scf.yield %next_phase : i32
+  }
+  tt.return
+}
+
 } // module
