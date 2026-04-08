@@ -67,12 +67,22 @@ public:
 
   void print(raw_ostream &os) const;
 
+  Value getSourceValue() const { return sourceValue; }
+
+  bool getIsLoopCarried() const { return isLoopCarried; }
+
+  AllocationSlice asLoopCarried() const {
+    AllocationSlice copy = *this;
+    copy.isLoopCarried = true;
+    return copy;
+  }
+
 private:
   std::tuple<Interval<size_t>, Allocation::BufferId, const void *,
-             llvm::ArrayRef<int64_t>>
+             llvm::ArrayRef<int64_t>, bool>
   asTuple() const {
     return {allocationInterval, bufferId, accessTy.getAsOpaquePointer(),
-            subsliceOffsets};
+            subsliceOffsets, isLoopCarried};
   }
   // Offsets from subslice. Empty when offsets are unknown
   SmallVector<int64_t> subsliceOffsets;
@@ -82,6 +92,14 @@ private:
   triton::gpu::MemDescType accessTy;
   // Buffer id for partial sync on wait_barrier deps.
   Allocation::BufferId bufferId;
+  // Original memdesc Value used to construct this slice.
+  // Used by the Presburger index analysis to trace back to MemDescIndexOp.
+  // Not part of the comparison key (asTuple).
+  Value sourceValue;
+  // True when this slice was propagated across a loop backedge.
+  // Loop-carried slices skip the Presburger index disjointness check
+  // because the SSA block argument refers to a different iteration's value.
+  bool isLoopCarried = false;
 };
 
 struct BlockInfo {
@@ -101,6 +119,18 @@ struct BlockInfo {
     for (auto &slice : other.syncWriteSlices)
       syncWriteSlices[slice.first].insert(slice.second.begin(),
                                           slice.second.end());
+    return *this;
+  }
+
+  /// Like join(), but marks all incoming slices as loop-carried.
+  /// Used when propagating slices across loop backedges so the Presburger
+  /// index check is skipped for cross-iteration comparisons.
+  BlockInfo &joinLoopCarried(const BlockInfo &other) {
+    for (auto &[slice, ops] : other.syncReadSlices)
+      syncReadSlices[slice.asLoopCarried()].insert(ops.begin(), ops.end());
+
+    for (auto &[slice, ops] : other.syncWriteSlices)
+      syncWriteSlices[slice.asLoopCarried()].insert(ops.begin(), ops.end());
     return *this;
   }
 
@@ -248,9 +278,12 @@ protected:
   void resolve(FunctionOpInterface funcOp, FuncBlockInfoMapT *funcBlockInfoMap,
                OpBuilder *builder);
 
-  /// Collects the successors of the terminator
+  /// Collects the successors of the terminator.  The isBackedge vector
+  /// is populated in parallel: isBackedge[i] is true when successors[i]
+  /// is reached via a loop backedge (e.g., scf.yield → same region entry).
   void visitTerminator(Operation *operation,
-                       SmallVector<VirtualBlock> &successors);
+                       SmallVector<VirtualBlock> &successors,
+                       SmallVector<bool> &isBackedge);
 
   /// Updates the BlockInfo operation based on the operation.
   virtual void update(Operation *operation, BlockInfo *blockInfo,

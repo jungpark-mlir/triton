@@ -3,6 +3,7 @@ add_triton_library(TritonAnalysis
   Allocation.cpp
   BufferRegion.cpp
   Membar.cpp
+  PresburgerIndexAnalysis.cpp
   Alias.cpp
   Utility.cpp
 
@@ -16,6 +17,7 @@ add_triton_library(TritonAnalysis
   LINK_LIBS PUBLIC
   MLIRAnalysis
   MLIRLLVMDialect
+  MLIRPresburger
   TritonIR
   TritonGPUIR
   GluonIR

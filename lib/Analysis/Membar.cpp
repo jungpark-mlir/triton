@@ -1,4 +1,5 @@
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/PresburgerIndexAnalysis.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -12,7 +13,8 @@ namespace mlir {
 AllocationSlice::AllocationSlice(Value value,
                                  Interval<size_t> allocationInterval,
                                  Allocation::BufferId bufferId)
-    : allocationInterval(allocationInterval), bufferId(bufferId) {
+    : allocationInterval(allocationInterval), bufferId(bufferId),
+      sourceValue(value) {
   auto accessTy = cast<triton::gpu::MemDescType>(value.getType());
   this->accessTy = accessTy;
 
@@ -37,9 +39,36 @@ bool AllocationSlice::intersects(const AllocationSlice &other) const {
   if (!accessTy || !other.accessTy)
     return true;
 
-  // If offsets are unknown, conservatively assume overlap
-  if (subsliceOffsets.empty() || other.subsliceOffsets.empty())
+  // When subslice offsets are unknown (empty), it means the access goes
+  // through a dynamic MemDescIndexOp on a multi-buffered allocation
+  // (e.g., memdesc<2x64x256xf8, ...>) where the buffer slot index is
+  // computed at runtime (phase % num_buffers).  Static analysis cannot
+  // determine the offsets, so we fall back to Presburger arithmetic:
+  // encode each index's arith chain as integer constraints and check
+  // whether "idx1 == idx2" is satisfiable.  If unsatisfiable, the
+  // accesses target provably different buffer slots and no barrier
+  // is needed.
+  //
+  // The Presburger check is skipped for loop-carried slices because
+  // the SSA block argument (e.g., %phase) refers to a different
+  // iteration's value after crossing a backedge.  The indices may
+  // appear disjoint for the same %phase but actually collide when
+  // %phase advances across iterations.
+  if (subsliceOffsets.empty() || other.subsliceOffsets.empty()) {
+    if (!isLoopCarried && !other.isLoopCarried &&
+        sourceValue && other.sourceValue) {
+      auto indexOp1 =
+          sourceValue.getDefiningOp<triton::gpu::MemDescIndexOp>();
+      auto indexOp2 =
+          other.sourceValue.getDefiningOp<triton::gpu::MemDescIndexOp>();
+      if (indexOp1 && indexOp2) {
+        if (triton::areIndicesProvablyDifferent(indexOp1.getIndex(),
+                                                indexOp2.getIndex()))
+          return false;
+      }
+    }
     return true;
+  }
 
   // If layouts differ, we assume intersection as we currently only work on
   // logical elements
@@ -129,6 +158,7 @@ void MembarOrFenceAnalysis::resolve(FunctionOpInterface funcOp,
     // Make a copy of the inputblockInfo but not update
     auto inputBlockInfo = inputBlockInfoMap[block];
     SmallVector<VirtualBlock> successors;
+    SmallVector<bool> successorIsBackedge;
     Block::iterator startIt =
         block.second.isValid() ? std::next(block.second) : block.first->begin();
     for (Operation &op : llvm::make_range(startIt, block.first->end())) {
@@ -138,7 +168,7 @@ void MembarOrFenceAnalysis::resolve(FunctionOpInterface funcOp,
       update(&op, &inputBlockInfo, funcBlockInfoMap, builder);
       if (op.hasTrait<OpTrait::IsTerminator>() ||
           isa<RegionBranchOpInterface>(op)) {
-        visitTerminator(&op, successors);
+        visitTerminator(&op, successors, successorIsBackedge);
         break;
       }
     }
@@ -152,10 +182,16 @@ void MembarOrFenceAnalysis::resolve(FunctionOpInterface funcOp,
     // Update the current block. The block transfer function is not monotonic,
     // so overwrite the output state entirely.
     outputBlockInfoMap[block] = inputBlockInfo;
-    // Update the successors
-    for (VirtualBlock successor : successors) {
-      inputBlockInfoMap[successor].join(outputBlockInfoMap[block]);
-      blockList.emplace_back(successor);
+    // Update the successors.  Slices propagated across loop backedges are
+    // marked as loop-carried so the Presburger index check is skipped for
+    // cross-iteration comparisons.
+    for (size_t i = 0; i < successors.size(); ++i) {
+      if (successorIsBackedge[i])
+        inputBlockInfoMap[successors[i]].joinLoopCarried(
+            outputBlockInfoMap[block]);
+      else
+        inputBlockInfoMap[successors[i]].join(outputBlockInfoMap[block]);
+      blockList.emplace_back(successors[i]);
     }
   }
 
@@ -184,11 +220,14 @@ void MembarOrFenceAnalysis::resolve(FunctionOpInterface funcOp,
 }
 
 void MembarOrFenceAnalysis::visitTerminator(
-    Operation *op, SmallVector<VirtualBlock> &successors) {
+    Operation *op, SmallVector<VirtualBlock> &successors,
+    SmallVector<bool> &isBackedge) {
   if (isa<BranchOpInterface>(op)) {
     // Collect the block successors of the branch.
-    for (Block *successor : op->getSuccessors())
+    for (Block *successor : op->getSuccessors()) {
       successors.emplace_back(successor, Block::iterator());
+      isBackedge.push_back(false);
+    }
     return;
   }
 
@@ -196,6 +235,7 @@ void MembarOrFenceAnalysis::visitTerminator(
     // The successors of an operation with regions can be queried via an
     // interface. The operation branches to the entry blocks of its region
     // successors. It can also branch to after itself.
+    // Entry into a region from the parent is always a forward edge.
     SmallVector<RegionSuccessor> regions;
     br.getSuccessorRegions(RegionBranchPoint::parent(), regions);
     for (RegionSuccessor &region : regions) {
@@ -205,6 +245,7 @@ void MembarOrFenceAnalysis::visitTerminator(
         Block &block = region.getSuccessor()->front();
         successors.emplace_back(&block, Block::iterator());
       }
+      isBackedge.push_back(false);
     }
     return;
   }
@@ -215,6 +256,7 @@ void MembarOrFenceAnalysis::visitTerminator(
   if (br && isa<RegionBranchOpInterface>(br->getParentOp())) {
     // Check the successors of a region branch terminator. It can branch to
     // another region of its parent operation or to after the parent op.
+    Region *terminatorRegion = br->getParentRegion();
     SmallVector<Attribute> operands(br->getNumOperands());
     SmallVector<RegionSuccessor> regions;
     br.getSuccessorRegions(operands, regions);
@@ -222,9 +264,16 @@ void MembarOrFenceAnalysis::visitTerminator(
       if (region.isParent()) {
         Operation *parent = br->getParentOp();
         successors.emplace_back(parent->getBlock(), parent->getIterator());
+        isBackedge.push_back(false);
       } else {
         Block &block = region.getSuccessor()->front();
         successors.emplace_back(&block, Block::iterator());
+        // A backedge occurs when a terminator in region K branches to
+        // region J where J <= K (e.g., scf.for yield → same body region,
+        // or scf.while "after" yield → "before" region).
+        Region *successorRegion = region.getSuccessor();
+        isBackedge.push_back(successorRegion->getRegionNumber() <=
+                             terminatorRegion->getRegionNumber());
       }
     }
     return;
