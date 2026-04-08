@@ -43,6 +43,8 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
 // address and pred in a given TDM descriptor for regular load/store (1D-5D).
 // For partitioned shared memory, dstPtrs contains multiple base pointers and
 // the correct one is selected based on sharedLayout's partition dimension.
+// activeWarps: number of warps that actually issue TDM copies (power of two,
+// <= numWarps).  0 means all warps are active (no warp specialization).
 void fillTDMDescriptor(
     RewriterBase &rewriter, Location loc,
     const LLVMTypeConverter *typeConverter, Type elementType,
@@ -53,7 +55,7 @@ void fillTDMDescriptor(
     SmallVector<Value> offset, ArrayRef<Value> dstPtrs, Value pred,
     Value multicastMask, Value barrierPtr,
     const triton::LinearLayout &sharedLayout, Value ctaId, bool isStore,
-    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA);
+    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA, int activeWarps = 0);
 
 // Fill TDM descriptor for gather/scatter operations (2D only).
 // Gather reads from non-contiguous rows in global memory to LDS.
@@ -86,6 +88,9 @@ void fillTDMDescriptorForGatherScatter(
 // - sharedLayout: linear layout for the full allocation shape (pre-CGA-split)
 // - encoding: shared memory encoding (used for partition constraints when
 //   splitting into multiple TDM instructions)
+// warpBases: flattened row-major array of shape (log2(numWarps), ndim).
+// Empty means all warps active (default greedy distribution).
+// Zero-basis entries produce duplicate warps that get pred=0.
 void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       const LLVMTypeConverter *typeConverter,
                       ArrayRef<Value> desc, ArrayRef<int64_t> blockShape,
@@ -94,7 +99,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       Value pred, Value multicastMask, Type elementType,
                       Value barrierPtr, bool isLoad,
                       const triton::LinearLayout &sharedLayout,
-                      Attribute encoding, Value ctaId, bool isRowMajor);
+                      Attribute encoding, Value ctaId, bool isRowMajor,
+                      ArrayRef<int64_t> warpBases = {});
 
 // Returns (warpsPerCTA, numTDMInstructions) for a given shared encoding.
 // For PartitionedSharedEncodingAttr, computes a partition-aligned warp

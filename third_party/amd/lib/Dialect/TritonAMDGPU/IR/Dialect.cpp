@@ -41,6 +41,7 @@
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 #include "third_party/amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
+#include "third_party/amd/backend/include/TDMCommon.h"
 
 using namespace mlir;
 using namespace mlir::triton::amdgpu;
@@ -653,6 +654,80 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
       auto paddingInDwords = padding * elementBitWidth / dwordSize;
       if (paddingInDwords < 1)
         return emitOpError("TDM padding amount must be at least 1 dword");
+    }
+  }
+
+  // Validate warp_bases if present.
+  if (auto warpBasesAttr = getWarpBasesAttr()) {
+    auto bases = warpBasesAttr.asArrayRef();
+    int numWarps = gpu::lookupNumWarps(*this);
+    int numDims = blockShape.size();
+    int numBits = llvm::Log2_32(numWarps);
+
+    if (!llvm::isPowerOf2_32(numWarps))
+      return emitOpError("num_warps must be a power of two when using "
+                         "warp_bases, got ")
+             << numWarps;
+
+    if (static_cast<int>(bases.size()) != numBits * numDims)
+      return emitOpError("warp_bases must have log2(num_warps) * ndim = ")
+             << numBits * numDims << " elements, got " << bases.size();
+
+    // Determine which basis vectors are zero vs non-zero.
+    // Non-zero entries must form a contiguous prefix.
+    int activeCount = 0;
+    bool seenZero = false;
+    for (int bit = 0; bit < numBits; ++bit) {
+      bool isZero = true;
+      for (int d = 0; d < numDims; ++d) {
+        if (bases[bit * numDims + d] != 0) {
+          isZero = false;
+          break;
+        }
+      }
+      if (isZero) {
+        seenZero = true;
+      } else {
+        if (seenZero)
+          return emitOpError("warp_bases non-zero entries must form a "
+                             "contiguous prefix; found non-zero basis at bit ")
+                 << bit << " after a zero basis";
+        activeCount++;
+      }
+    }
+
+    int activeWarps = 1 << activeCount;
+    if (!llvm::isPowerOf2_32(activeWarps) || activeWarps > numWarps)
+      return emitOpError("active_warps derived from warp_bases (")
+             << activeWarps << ") must be a power of two <= num_warps ("
+             << numWarps << ")";
+
+    // The non-zero prefix must match the greedy distribution for blockShape
+    // over activeWarps.
+    SmallVector<int> expectedWarps(numDims);
+    tdmGetWarpDistribution(blockShape.data(), numDims, activeWarps,
+                           expectedWarps.data());
+
+    // Reconstruct expected bases from the greedy warp distribution.
+    // For each dimension, the warp bases are cumulative powers of 2 of the
+    // per-warp tile size: basis[bit] contributes (perWarpTile * 2^k) along
+    // the dimension it subdivides.
+    int bitIdx = 0;
+    for (int d = 0; d < numDims; ++d) {
+      int warpsInDim = expectedWarps[d];
+      int64_t perWarpTile = blockShape[d] / warpsInDim;
+      for (int k = 0; k < llvm::Log2_32(warpsInDim); ++k, ++bitIdx) {
+        for (int dd = 0; dd < numDims; ++dd) {
+          int64_t expected = (dd == d) ? (perWarpTile * (1 << k)) : 0;
+          if (bases[bitIdx * numDims + dd] != expected)
+            return emitOpError("warp_bases mismatch at bit ")
+                   << bitIdx << " dim " << dd << ": expected " << expected
+                   << " but got " << bases[bitIdx * numDims + dd]
+                   << "; non-zero bases must match the greedy distribution "
+                      "for block_shape over active_warps="
+                   << activeWarps;
+        }
+      }
     }
   }
 

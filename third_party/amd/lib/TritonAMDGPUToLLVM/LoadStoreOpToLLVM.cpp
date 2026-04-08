@@ -1257,11 +1257,16 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
         shapePerCTA);
     bool isRowMajor = sharedOrder[0] == (sharedOrder.size() - 1);
 
+    SmallVector<int64_t> warpBases;
+    if (auto warpBasesAttr = op.getWarpBasesAttr())
+      warpBases.assign(warpBasesAttr.asArrayRef().begin(),
+                       warpBasesAttr.asArrayRef().end());
+
     mlir::LLVM::AMD::emitTDMLoadStore(
         rewriter, loc, getTypeConverter(), desc, shapePerCTA, numWarps,
         padInterval, padAmount, offset, dstPtrs, op.getPred(), multicastMask,
         elementType, barrierPtr, /*isLoad=*/true, sharedLayout, encoding, ctaId,
-        isRowMajor);
+        isRowMajor, warpBases);
 
     rewriter.eraseOp(op);
     return success();
