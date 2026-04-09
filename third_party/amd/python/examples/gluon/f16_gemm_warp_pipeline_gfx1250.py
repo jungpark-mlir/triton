@@ -170,7 +170,9 @@ def test_runtime_gemm_tdm_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRAN
     c_torch = a.to(torch.float32) @ (b.to(torch.float32) if not TRANSPOSE_B else b.T.to(torch.float32))
     if OUT_FP16:
         c_torch = c_torch.to(torch.float16)
-    torch.testing.assert_close(c_triton, c_torch, rtol=1e-4, atol=1e-4)
+    # FP16 rounding: two independent FP32→FP16 casts can differ by 1 ULP (rtol ≈ 2^-10)
+    rtol, atol = (1e-3, 1e-3) if OUT_FP16 else (1e-4, 1e-4)
+    torch.testing.assert_close(c_triton, c_torch, rtol=rtol, atol=atol)
     if DUMP:
         print("triton")
         print(c_triton)
