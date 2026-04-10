@@ -174,12 +174,12 @@ def gemm_tdm_specialized_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
 
     ttgl.amd.gfx1250.tdm.async_wait(1 * 2)
     for _ in range(0, ttgl.cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1)):
-        with ttgl.amd.warp_pipeline_stage("stage0", priority=1):
+        with ttgl.amd.warp_pipeline_stage("stage0", priority=0):
             consumer, a, b = lds_load(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B, NUM_BUFFERS,
                                       TRANSPOSE_B)
             producer = issue_loads_specialized(producer, a_desc, b_desc, 0, 0, a_buffer, b_buffer, BLOCK_K,
                                                NUM_BUFFERS, TRANSPOSE_B, TDM_WARP_BASES)
-        with ttgl.amd.warp_pipeline_stage("stage1", priority=0):
+        with ttgl.amd.warp_pipeline_stage("stage1", priority=1):
             accumulator = issue_wmma_compute(a, b, accumulator)
         ttgl.amd.gfx1250.tdm.async_wait(2)
 
