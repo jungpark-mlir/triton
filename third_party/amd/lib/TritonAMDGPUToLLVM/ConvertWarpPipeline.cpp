@@ -91,6 +91,30 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
                                         SmallVectorImpl<bool> &bars,
                                         Allocation *allocation, bool circular) {
   int numClusters = clusterInfo.size();
+
+  // Adjacent-stage check (distance 1).  Every pair of consecutive clusters
+  // is separated by a barrier slot.  When adjacent stages share an LDS
+  // allocation the barrier must be LOCAL (ds_wait + s_barrier) so that
+  // ModuleMembarAnalysis — which runs later and does not understand warp
+  // pipeline phases — will not insert a redundant ttg.barrier local inside
+  // the pipelined region.
+  int adjEnd = circular ? numClusters : numClusters - 1;
+  for (int src = 0; src < adjEnd; src++) {
+    int next = circular ? (src + 1) % numClusters : src + 1;
+    int barrierLoc = next; // barrier sits right before `next`
+    if (bars[barrierLoc])
+      continue;
+    if (clusterInfo[src].isIntersected(
+            clusterInfo[next], mlir::triton::AMD::membarFilter, allocation)) {
+      bars[barrierLoc] = true;
+      LDBG("adjacent cluster " << src << " need fence to " << next
+                               << " placing barrier at " << barrierLoc);
+    }
+  }
+
+  // Distance-2+ check.  For each (src, next) pair separated by at least one
+  // intermediate barrier position, verify the dependency is already covered
+  // by an intervening LOCAL barrier; if not, mark the closest position.
   for (int offset = 0; offset < numClusters; offset++) {
     for (int src = 0; src < numClusters; src++) {
       int next, barrierLoc;
@@ -158,6 +182,10 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
 // Returns warpLow (for reconverge) and warpHigh (consumed by phase shift).
 static std::pair<Value, Value>
 emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup) {
+  // Flush any pending shared-memory (LDS) dependencies before entering the
+  // warp-pipelined region.  Without this barrier ModuleMembarAnalysis may
+  // later insert a barrier inside the first pipeline stage, which would
+  // break the carefully tuned pipeline timing.
   mlir::triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
 
   auto i32ty = b.getIntegerType(32);
@@ -507,32 +535,135 @@ static void processUnrolledPipelineRegions(ModuleOp m,
   });
 }
 
-// Check if the wrap-around cluster barrier of a converted pipelined loop
-// includes a local memory fence (ttg.barrier local).  The wrap-around barrier
-// is the last cluster barrier emitted just before the scf.yield terminator:
-//   [s_setprio]  sched_barrier  ttg.barrier_local|s_barrier  sched_barrier
-//   yield
-static bool hasLocalFenceAtWrapAround(scf::ForOp forOp) {
-  auto *yieldOp = forOp.getBody()->getTerminator();
+// Collect execute_region clusters and their materialized barrier flags from
+// a converted pipelined for-loop body.  After ConvertPipelinedForPattern the
+// loop body contains: [priority] [barrier] execute_region ... [barrier] yield.
+// Returns false if the loop body doesn't match the expected pattern.
+static bool collectLoopClusters(scf::ForOp forOp,
+                                SmallVectorImpl<Block *> &blocks,
+                                SmallVectorImpl<bool> &bars) {
+  Operation *yieldOp = forOp.getBody()->getTerminator();
   if (!yieldOp)
     return false;
+  for (auto &op : *forOp.getBody()) {
+    if (auto exec = dyn_cast<scf::ExecuteRegionOp>(op)) {
+      if (!exec->hasAttr("triton.warp_pipeline.stage"))
+        continue;
+      blocks.push_back(&exec->getRegion(0).front());
+      bars.push_back(false);
+    }
+  }
+  if (blocks.empty())
+    return false;
+
+  int K = blocks.size();
+  // Walk backwards from yield to find the wrap-around barrier (barrier[0]).
+  // Pattern: [s_setprio] sched_barrier (ttg.barrier_local|s_barrier)
+  // sched_barrier yield
   Operation *op = yieldOp->getPrevNode();
-  if (!op || !isa<ROCDL::SchedBarrier>(op))
+  if (op && isa<ROCDL::SchedBarrier>(op)) {
+    op = op->getPrevNode();
+    if (auto barrier = dyn_cast_or_null<triton::gpu::BarrierOp>(op))
+      bars[0] = barrier.hasLocal();
+  }
+
+  // Walk the loop body to find barriers between clusters (barrier[1..K-1]).
+  // After materialization each barrier sits just before its cluster's
+  // execute_region: [s_setprio] sched_barrier (barrier) sched_barrier exec.
+  for (int i = 1; i < K; i++) {
+    auto *exec = blocks[i]->getParentOp();
+    for (Operation *scan = exec->getPrevNode(); scan;
+         scan = scan->getPrevNode()) {
+      if (isa<ROCDL::SchedBarrier, ROCDL::SetPrioOp>(scan))
+        continue;
+      if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(scan))
+        bars[i] = barrier.hasLocal();
+      break;
+    }
+  }
+  return true;
+}
+
+// Collect execute_region clusters from the next pipeline (flat or loop).
+// For a flat pipeline: collect the contiguous execute_regions starting at
+// `startOp`.  For a loop: collect from the for-loop body.
+static bool collectNextPipelineClusters(Operation *startOp,
+                                        SmallVectorImpl<Block *> &blocks) {
+  if (auto forOp = dyn_cast<scf::ForOp>(startOp)) {
+    for (auto &op : *forOp.getBody())
+      if (auto exec = dyn_cast<scf::ExecuteRegionOp>(op))
+        if (exec->hasAttr("triton.warp_pipeline.stage"))
+          blocks.push_back(&exec->getRegion(0).front());
+  } else if (auto exec = dyn_cast<scf::ExecuteRegionOp>(startOp)) {
+    blocks.push_back(&exec->getRegion(0).front());
+    for (Operation *op = startOp->getNextNode(); op; op = op->getNextNode()) {
+      auto nextExec = dyn_cast<scf::ExecuteRegionOp>(op);
+      if (nextExec && nextExec->hasAttr("triton.warp_pipeline.stage"))
+        blocks.push_back(&nextExec->getRegion(0).front());
+      else
+        break;
+    }
+  }
+  return !blocks.empty();
+}
+
+// Check whether merging two pipelines creates a cross-pipeline LDS dependency
+// at the boundary.  Concatenates the cluster infos and barrier flags from both
+// pipelines (with `false` at the boundary) and runs analyzePipelineDependencies
+// on the merged linear sequence.  The analysis now covers both adjacent
+// (distance-1) and longer-range pairs, so a single call is sufficient.
+//
+// Returns true if the boundary position is dependency-free and can be
+// eliminated.
+static bool isCrossPipelineSafe(ArrayRef<Block *> loopBlocks,
+                                ArrayRef<bool> loopBars,
+                                ArrayRef<Block *> nextBlocks,
+                                Allocation *allocation) {
+  int K = loopBlocks.size();
+  int M = nextBlocks.size();
+
+  SmallVector<BlockInfo> mergedInfo;
+  for (auto *b : loopBlocks)
+    mergedInfo.push_back(buildBlockInfoFromBlock(b, allocation));
+  for (auto *b : nextBlocks)
+    mergedInfo.push_back(buildBlockInfoFromBlock(b, allocation));
+
+  // Merged barrier flags: [loopBars..., false (boundary), false...]
+  // The boundary position is at index K.
+  SmallVector<bool> mergedBars;
+  for (bool b : loopBars)
+    mergedBars.push_back(b);
+  mergedBars.push_back(false); // boundary position
+  for (int i = 1; i < M; i++)
+    mergedBars.push_back(false);
+
+  analyzePipelineDependencies(mergedInfo, mergedBars, allocation,
+                              /*circular=*/false);
+
+  if (mergedBars[K]) {
+    LDBG("cross-pipeline LDS dependency at boundary");
     return false;
-  op = op->getPrevNode();
-  if (!op)
-    return false;
-  if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
-    return barrier.hasLocal();
-  return false;
+  }
+  return true;
 }
 
 // Eliminate redundant conditional barriers between consecutive warp-pipelined
-// regions.  When loop 1's wrap-around barrier already includes a local fence,
-// the phase shift naturally carries over into the next pipeline: the post-loop
-// reconverge and pre-pipeline phase shift cancel, and the intervening
-// pre-barrier is redundant because membar will not need to insert a barrier
-// (the wrap-around fence already resolved all pending LDS writes).
+// regions.  When two pipelines are back-to-back with no intervening
+// operations, the post-loop reconverge (cond_barrier warpLow) and the
+// pre-pipeline phase shift (cond_barrier warpHigh) cancel out — the phase
+// from the first pipeline naturally carries over.
+//
+// The prelude's ttg.barrier local (see emitPipelinePrelude) exists to flush
+// pending LDS state so ModuleMembarAnalysis won't insert barriers inside
+// pipeline stages.  When the post-loop cond_barrier is immediately followed
+// by this barrier and cross-pipeline dependency analysis confirms no LDS
+// hazard at the boundary, the barrier is also redundant.
+//
+// When the two pipelines merge, the phase offset causes stages from different
+// pipelines to execute concurrently (e.g., warp0 runs b0 while warp1 runs
+// a_{K-1}).  The cross-pipeline analysis checks all pairs (a_i, b_j) for LDS
+// conflicts, accounting for barriers already placed by each pipeline's own
+// dependency analysis.
 //
 // The "next pipeline" can be either another scf.for or a flat (unrolled)
 // pipeline represented as a sequence of scf.execute_region ops.
@@ -547,10 +678,15 @@ static bool hasLocalFenceAtWrapAround(scf::ForOp forOp) {
 //   [s_setprio P]
 //   scf.for / execute_region { pipeline 2 }
 //
-static void eliminateRedundantCondBarriers(ModuleOp m) {
+static void eliminateRedundantCondBarriers(ModuleOp m,
+                                           ModuleAllocation &moduleAllocation) {
   SmallVector<Operation *> toErase;
 
   m.walk([&](triton::FuncOp funcOp) {
+    Allocation *allocation = moduleAllocation.getFuncData(funcOp);
+    if (!allocation)
+      return;
+
     for (Block &block : funcOp.getBody()) {
       SmallVector<triton::amdgpu::CondBarrierOp> condBarriers;
       for (auto &op : block)
@@ -566,9 +702,9 @@ static void eliminateRedundantCondBarriers(ModuleOp m) {
         Operation *prev = postLoopCB->getPrevNode();
         if (prev && isa<ROCDL::SetPrioOp>(prev))
           prev = prev->getPrevNode();
-        auto prevFor = dyn_cast_or_null<scf::ForOp>(prev);
-        if (!prevFor)
+        if (!isa_and_nonnull<scf::ForOp>(prev))
           continue;
+        auto prevFor = cast<scf::ForOp>(prev);
 
         // The pre-loop cond_barrier must be followed by a warp-pipelined
         // scf.for or a flat pipeline execute_region (possibly with an
@@ -582,25 +718,30 @@ static void eliminateRedundantCondBarriers(ModuleOp m) {
         if (!nextIsPipeline)
           continue;
 
-        if (!hasLocalFenceAtWrapAround(prevFor))
+        // The post-loop cond_barrier must be immediately followed by the
+        // prelude's ttg.barrier local — this proves no operations were
+        // inserted between the two pipelines.
+        auto preBarrier =
+            dyn_cast_or_null<triton::gpu::BarrierOp>(postLoopCB->getNextNode());
+        if (!preBarrier || !preBarrier.hasLocal())
           continue;
 
-        // Find the ttg.barrier local (pre-barrier) between the two
-        // cond_barriers.
-        triton::gpu::BarrierOp preBarrier = nullptr;
-        for (Operation *op = postLoopCB->getNextNode(); op && op != preLoopCB;
-             op = op->getNextNode()) {
-          if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op)) {
-            if (barrier.hasLocal()) {
-              preBarrier = barrier;
-              break;
-            }
-          }
+        // Cross-pipeline LDS dependency analysis.  When the phase carries
+        // over, stages from different pipelines execute concurrently at the
+        // boundary.  We must verify that no uncovered LDS conflict exists.
+        SmallVector<Block *> loopBlocks, nextBlocks;
+        SmallVector<bool> loopBars;
+        if (!collectLoopClusters(prevFor, loopBlocks, loopBars))
+          continue;
+        if (!collectNextPipelineClusters(next, nextBlocks))
+          continue;
+        if (!isCrossPipelineSafe(loopBlocks, loopBars, nextBlocks,
+                                 allocation)) {
+          LDBG("cross-pipeline LDS dependency at boundary — keeping barriers");
+          continue;
         }
-        if (!preBarrier)
-          continue;
 
-        LDBG("eliminating redundant barriers between back-to-back loops");
+        LDBG("eliminating redundant barriers between back-to-back pipelines");
         toErase.push_back(postLoopCB);
         toErase.push_back(preBarrier);
         toErase.push_back(preLoopCB);
@@ -657,7 +798,7 @@ public:
     // Must run after patternFor and flat processing (all regions converted,
     // barriers inserted) but before patternInline (inlining execute_regions
     // would flatten the IR and obscure the cond_barrier adjacency we rely on).
-    eliminateRedundantCondBarriers(m);
+    eliminateRedundantCondBarriers(m, moduleAllocation);
 
     if (failed(applyPatternsGreedily(m, std::move(patternInline))))
       signalPassFailure();
