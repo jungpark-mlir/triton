@@ -534,6 +534,17 @@ class HIPBackend(BaseBackend):
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
+
+        if os.environ.get('WMMA_B2B') == '1':
+            lines = amdgcn.split('\n')
+            new_lines = []
+            for line in lines:
+                new_lines.append(line)
+                if 's_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE' in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    new_lines.append(f'{indent}s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 5), 16')
+            amdgcn = '\n'.join(new_lines)
+
         return amdgcn
 
     @staticmethod
