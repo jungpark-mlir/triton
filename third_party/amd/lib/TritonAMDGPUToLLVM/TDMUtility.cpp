@@ -739,6 +739,13 @@ void fillTDMDescriptor(
   Value globalAddr = b.ptrtoint(i64_ty, srcPtr);
   Value ldsAddr = b.ptrtoint(i32_ty, dstPtr);
 
+  // Combine user predicate with layout predicate for warp specialization.
+  // Duplicate warps (warpId >= activeWarps) get pred=0 (hardware no-op).
+  if (activeWarps > 0 && activeWarps < numWarps) {
+    Value isActive = b.icmp_ult(warpId, b.i32_val(activeWarps));
+    Value layoutPred = b.select(isActive, b.i32_val(1), b.i32_val(0));
+    pred = b.and_(pred, layoutPred);
+  }
   group0[0] = pred;
   group0[1] = ldsAddr;
   group0[2] = b.trunc(i32_ty, globalAddr);
@@ -984,24 +991,6 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
   auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
   Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
 
-  // When warp specialization is active, wrap the entire TDM emission in a
-  // conditional branch so inactive warps skip the instruction entirely.
-  Block *afterBlock = nullptr;
-  if (activeWarps > 0) {
-    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    Value isActive = b.icmp_ult(warpId, b.i32_val(activeWarps));
-
-    Block *currentBlock = rewriter.getInsertionBlock();
-    afterBlock =
-        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-    Block *tdmBlock = rewriter.createBlock(afterBlock);
-
-    rewriter.setInsertionPointToEnd(currentBlock);
-    LLVM::CondBrOp::create(rewriter, loc, isActive, tdmBlock, afterBlock);
-
-    rewriter.setInsertionPointToStart(tdmBlock);
-  }
-
   if (numDims > 2) {
     auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
     auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.begin() + 12);
@@ -1047,11 +1036,6 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
     LLVM::createLLVMIntrinsicCallOp(
         rewriter, loc, intrinsicName, {},
         {group0, group1, group2Zero, group3Zero, group4Zero, b.i32_val(0)});
-  }
-
-  if (afterBlock) {
-    LLVM::BrOp::create(rewriter, loc, afterBlock);
-    rewriter.setInsertionPointToStart(afterBlock);
   }
 }
 
