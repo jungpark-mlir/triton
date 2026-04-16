@@ -44,7 +44,8 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
 // For partitioned shared memory, dstPtrs contains multiple base pointers and
 // the correct one is selected based on sharedLayout's partition dimension.
 // activeWarps: number of warps that actually issue TDM copies (power of two,
-// <= numWarps).  0 means all warps are active (no partial TDM copy).
+// <= numWarps).  0 is the sentinel for "warp_bases absent, all warps active";
+// when warp_bases is present, activeWarps is at least 1.
 void fillTDMDescriptor(
     RewriterBase &rewriter, Location loc,
     const LLVMTypeConverter *typeConverter, Type elementType,

@@ -534,7 +534,8 @@ swapOutDimSemantics(const triton::LinearLayout &layout, StringAttr dimA,
 // Fill TDM descriptor for regular load/store operations (1D-5D tensors).
 // activeWarps: number of warps that actually issue TDM copies (power of two,
 // <= numWarps).  Warps with warpId >= activeWarps get pred=0 (hardware no-op).
-// A value of 0 means all warps are active (no partial TDM copy).
+// 0 is the sentinel for "warp_bases absent, all warps active"; when warp_bases
+// is present, activeWarps is at least 1.
 void fillTDMDescriptor(
     RewriterBase &rewriter, Location loc,
     const LLVMTypeConverter *typeConverter, Type elementType,
@@ -601,9 +602,8 @@ void fillTDMDescriptor(
     if (numDims >= 2) {
       // tile_dim1: lower 16 bits of group1[4]
       group1[4] = b.and_(group1[4], b.i32_val(0xFFFF0000));
-      group1[4] = b.or_(group1[4],
-                         b.and_(decodedBlockShape[numDims - 2],
-                                b.i32_val(0xFFFF)));
+      group1[4] = b.or_(
+          group1[4], b.and_(decodedBlockShape[numDims - 2], b.i32_val(0xFFFF)));
     }
     if (numDims >= 3) {
       // tile_dim2: upper 16 bits of group1[4]
@@ -1000,17 +1000,15 @@ static int64_t computePerPartitionSliceStride(
 
 // Emit a single TDM intrinsic (load or store) for the given block shape.
 // This handles both the 2D (d2 intrinsic) and >2D (full intrinsic) cases.
-static void
-emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
-                 const LLVMTypeConverter *typeConverter, ArrayRef<Value> desc,
-                 size_t numDims, Type elementType,
-                 SmallVector<int64_t> effectiveBlockShape, int numWarps,
-                 unsigned padInterval, unsigned padAmount,
-                 SmallVector<Value> globalOffset, ArrayRef<Value> instrDstPtrs,
-                 Value pred, Value multicastMask, Value barrier,
-                 const triton::LinearLayout &instrSharedLayout, Value ctaId,
-                 bool isLoad, bool isRowMajor, ArrayRef<unsigned> warpsPerCTA,
-                 int activeWarps = 0) {
+static void emitTDMIntrinsic(
+    RewriterBase &rewriter, Location loc,
+    const LLVMTypeConverter *typeConverter, ArrayRef<Value> desc,
+    size_t numDims, Type elementType, SmallVector<int64_t> effectiveBlockShape,
+    int numWarps, unsigned padInterval, unsigned padAmount,
+    SmallVector<Value> globalOffset, ArrayRef<Value> instrDstPtrs, Value pred,
+    Value multicastMask, Value barrier,
+    const triton::LinearLayout &instrSharedLayout, Value ctaId, bool isLoad,
+    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA, int activeWarps = 0) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
   Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
@@ -1042,12 +1040,12 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
     auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
     auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.end());
 
-    fillTDMDescriptor(
-        rewriter, loc, typeConverter, elementType, effectiveBlockShape,
-        numWarps, padInterval, padAmount, group0Vec, group1Vec, std::nullopt,
-        std::nullopt, globalOffset, instrDstPtrs, pred, multicastMask, barrier,
-        instrSharedLayout, ctaId, !isLoad, isRowMajor, warpsPerCTA,
-        activeWarps);
+    fillTDMDescriptor(rewriter, loc, typeConverter, elementType,
+                      effectiveBlockShape, numWarps, padInterval, padAmount,
+                      group0Vec, group1Vec, std::nullopt, std::nullopt,
+                      globalOffset, instrDstPtrs, pred, multicastMask, barrier,
+                      instrSharedLayout, ctaId, !isLoad, isRowMajor,
+                      warpsPerCTA, activeWarps);
 
     auto group0 = packLLVector(loc, group0Vec, rewriter);
     auto group1 = packLLVector(loc, group1Vec, rewriter);
@@ -1086,7 +1084,9 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
   assert(numDims <= 5);
 
   // Determine activeWarps from warp_bases.
-  // The non-zero prefix length gives log2(activeWarps).
+  // activeWarps = 2^(number of non-zero bit-rows), so it is at least 1 when
+  // warp_bases is present (even all-zero rows yield activeWarps=1).
+  // activeWarps=0 is the sentinel for "attribute absent, all warps active."
   int activeWarps = 0;
   if (!warpBases.empty()) {
     int numBits = warpBases.size() / numDims;
