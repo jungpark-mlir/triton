@@ -100,7 +100,7 @@ def gemm_tdm_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
 
 
 # ---------------------------------------------------------------------------
-# TDM warp-specialized variant: only a subset of warps issue TDM copies.
+# Partial TDM copy variant: only a subset of warps issue TDM copies.
 # Duplicate warps get pred=0 (hardware no-op), freeing TDM bandwidth.
 # ---------------------------------------------------------------------------
 
@@ -194,7 +194,7 @@ def gemm_tdm_specialized_pipelined_warp_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
 # ---------------------------------------------------------------------------
 
 def _compute_tdm_warp_bases(block_shape, num_warps, active_warps):
-    """Compute warp_bases for TDM specialization with the given active warp count.
+    """Compute warp_bases for partial TDM copy with the given active warp count.
 
     Returns a tuple of tuples suitable for passing as a constexpr.
     """
@@ -311,7 +311,7 @@ def test_runtime_gemm_tdm_specialized_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_B
     num_warps = 8
     WARP_BASES = [(0, 1), (1, 0), (2, 0)]
 
-    # 4-warp TDM specialization: warps 4-7 duplicate 0-3 (pred=0, hardware no-op)
+    # 4-warp partial TDM copy: warps 4-7 duplicate 0-3 (pred=0, hardware no-op)
     tdm_warp_bases = _compute_tdm_warp_bases([BLOCK_M, BLOCK_K], num_warps, 4)
 
     warp_bases = tuple(WARP_BASES)
@@ -348,7 +348,7 @@ if __name__ == "__main__":
     parser.add_argument("-K", type=int, default=1024, help='problem K size')
     parser.add_argument("--num-buffers", type=int, choices=[2, 3, 4], default=3, help='num shared memory buffers')
     parser.add_argument("--4warp-tdm", action="store_true", dest="four_warp_tdm",
-                        help="Use 4-warp TDM specialization (warps 4-7 skip TDM copies)")
+                        help="Use 4-warp partial TDM copy (warps 4-7 skip TDM copies)")
     parser.add_argument("--dump", action="store_true", help="Print out result/golden tensors")
     args = parser.parse_args()
 

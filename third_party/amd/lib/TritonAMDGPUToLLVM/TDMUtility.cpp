@@ -534,7 +534,7 @@ swapOutDimSemantics(const triton::LinearLayout &layout, StringAttr dimA,
 // Fill TDM descriptor for regular load/store operations (1D-5D tensors).
 // activeWarps: number of warps that actually issue TDM copies (power of two,
 // <= numWarps).  Warps with warpId >= activeWarps get pred=0 (hardware no-op).
-// A value of 0 means all warps are active (no warp specialization).
+// A value of 0 means all warps are active (no partial TDM copy).
 void fillTDMDescriptor(
     RewriterBase &rewriter, Location loc,
     const LLVMTypeConverter *typeConverter, Type elementType,
@@ -584,7 +584,7 @@ void fillTDMDescriptor(
               : std::nullopt,
           numDims);
 
-  // When warp specialization is active, the per-warp block shape differs from
+  // When partial TDM copy is active, the per-warp block shape differs from
   // what createTDMDescriptor encoded (which used numWarps). Re-encode the
   // correct per-warp tile dimensions based on warpsPerCTA (from activeWarps).
   if (activeWarps > 0) {
@@ -737,7 +737,7 @@ void fillTDMDescriptor(
   Value globalAddr = b.ptrtoint(i64_ty, srcPtr);
   Value ldsAddr = b.ptrtoint(i32_ty, dstPtr);
 
-  // Combine user predicate with layout predicate for warp specialization.
+  // Combine user predicate with layout predicate for partial TDM copy.
   // Duplicate warps (warpId >= activeWarps) get pred=0 (hardware no-op).
   if (activeWarps > 0 && activeWarps < numWarps) {
     Value isActive = b.icmp_ult(warpId, b.i32_val(activeWarps));
@@ -1105,7 +1105,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
     activeWarps = 1 << activeCount;
   }
 
-  // When warp specialization is active, compute the warp distribution based
+  // When partial TDM copy is active, compute the warp distribution based
   // on activeWarps instead of numWarps.
   int effectiveWarps = (activeWarps > 0) ? activeWarps : numWarps;
 

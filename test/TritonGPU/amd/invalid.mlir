@@ -282,3 +282,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// warp_bases validation tests
+#shared_wb = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_wb = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @warp_bases_wrong_size(
+    %tensorDesc: !tt.tensordesc<256x64xf16>,
+    %memDesc: !ttg.memdesc<256x64xf16, #shared_wb, #smem_wb, mutable>,
+    %pred: i32
+  ) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{warp_bases must have log2(num_warps) * ndim = 6 elements, got 4}}
+    %0 = amdg.async_tdm_copy_global_to_local %tensorDesc[%c0, %c0] into %memDesc, pred = %pred {warp_bases = array<i64: 64, 0, 128, 0>} : !tt.tensordesc<256x64xf16> -> !ttg.memdesc<256x64xf16, #shared_wb, #smem_wb, mutable>
+    tt.return
+  }
+
+  tt.func @warp_bases_non_contiguous_prefix(
+    %tensorDesc: !tt.tensordesc<256x64xf16>,
+    %memDesc: !ttg.memdesc<256x64xf16, #shared_wb, #smem_wb, mutable>,
+    %pred: i32
+  ) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{warp_bases non-zero entries must form a contiguous prefix; found non-zero basis at bit 1 after a zero basis}}
+    %0 = amdg.async_tdm_copy_global_to_local %tensorDesc[%c0, %c0] into %memDesc, pred = %pred {warp_bases = array<i64: 0, 0, 64, 0, 0, 0>} : !tt.tensordesc<256x64xf16> -> !ttg.memdesc<256x64xf16, #shared_wb, #smem_wb, mutable>
+    tt.return
+  }
+
+  tt.func @warp_bases_greedy_mismatch(
+    %tensorDesc: !tt.tensordesc<256x64xf16>,
+    %memDesc: !ttg.memdesc<256x64xf16, #shared_wb, #smem_wb, mutable>,
+    %pred: i32
+  ) {
+    %c0 = arith.constant 0 : i32
+    // expected-error @+1 {{warp_bases mismatch at bit 0 dim 0: expected 64 but got 0; non-zero bases must match the greedy distribution for block_shape over active_warps=4}}
+    %0 = amdg.async_tdm_copy_global_to_local %tensorDesc[%c0, %c0] into %memDesc, pred = %pred {warp_bases = array<i64: 0, 32, 0, 64, 0, 0>} : !tt.tensordesc<256x64xf16> -> !ttg.memdesc<256x64xf16, #shared_wb, #smem_wb, mutable>
+    tt.return
+  }
+}

@@ -144,7 +144,7 @@ def make_tensor_descriptor(base: ttgl.tensor, shape: List[ttgl.constexpr | ttgl.
 
 
 def _validate_warp_bases(warp_bases, block_shape, num_warps):
-    """Validate warp_bases for TDM warp specialization.
+    """Validate warp_bases for partial TDM copy.
 
     warp_bases must be log2(num_warps) entries where the non-zero entries form
     a contiguous prefix matching the greedy distribution for block_shape over
@@ -214,7 +214,7 @@ def async_load(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tenso
         dest (shared_memory_descriptor): the shared memory destination to store the loaded data.
         pred (int, optional): Predicate to enable or disable the load. Defaults to 1.
         mbarrier (shared_memory_descriptor, optional): The barrier object to signal "arrive" on.
-        warp_bases (List[List[int]], optional): Per-bit warp-to-offset mapping for TDM warp specialization.
+        warp_bases (List[List[int]], optional): Per-bit warp-to-offset mapping for partial TDM copy.
             Each entry maps one bit of warpId to an element offset in the tensor coordinate space.
             A zero basis means that bit contributes no offset (duplicate warp, gets pred=0).
     """

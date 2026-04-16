@@ -751,7 +751,7 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
     The operation can also take an optional 64bit LDS barrier address, in which case
     it sends an "LDS atomic arrive" to signal its completion.
 
-    `warp_bases` is an optional attribute for TDM warp specialization.
+    `warp_bases` is an optional attribute for partial TDM copy.
     Each entry maps one bit of warpId to an element offset in the tensor
     coordinate space.  A `[0, ..., 0]` basis means that bit of warpId
     contributes no offset (degenerate / duplicate warp). Duplicate warps
