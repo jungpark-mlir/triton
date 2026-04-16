@@ -1023,10 +1023,10 @@ void init_gluon_ir(py::module &&m) {
            [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,
               Value result, Value pred, Value barrier,
               std::vector<int64_t> warpBases) {
-             auto warpBasesAttr = warpBases.empty()
-                                      ? DenseI64ArrayAttr()
-                                      : DenseI64ArrayAttr::get(
-                                            self.getContext(), warpBases);
+             auto warpBasesAttr =
+                 warpBases.empty()
+                     ? DenseI64ArrayAttr()
+                     : DenseI64ArrayAttr::get(self.getContext(), warpBases);
              self.create<ttag::AsyncTDMCopyGlobalToLocalOp>(
                  descPtr, indices, result, pred, barrier, warpBasesAttr);
            })

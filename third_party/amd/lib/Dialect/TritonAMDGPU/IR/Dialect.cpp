@@ -39,9 +39,9 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.cpp.inc"
 // clang-format on
 
+#include "third_party/amd/backend/include/TDMCommon.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 #include "third_party/amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
-#include "third_party/amd/backend/include/TDMCommon.h"
 
 using namespace mlir;
 using namespace mlir::triton::amdgpu;
