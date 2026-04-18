@@ -80,80 +80,92 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
   return info;
 }
 
-// Pairwise dependency analysis between pipeline clusters.
-// For each src → next pair, checks whether their memory intervals overlap.
-// If so, marks `bars[barrierLoc] = true` to indicate a fence is needed.
+// Pairwise LDS-dependency analysis between pipeline clusters.
 //
-// When `circular` is true (loop pipelines), indices wrap around modulo
-// numClusters so that the last cluster feeds back to the first.
-// When false (flat pipelines), indices are strictly linear.
+// PIPELINE LAYOUT
+// ---------------
+//   cluster:   c0    c1    c2    ...    c_{N-1}
+//   bars:    b0    b1    b2    b3   ...        b_{N-1}        (b_i sits
+//                                                              before c_i)
+//
+//   * `circular = true`  (loop pipelines): N is the number of stages and b0
+//     is the wrap-around barrier inside the loop body — sitting between
+//     c_{N-1} of one iteration and c0 of the next.
+//   * `circular = false` (flat pipelines): b0 has no physical slot (no
+//     barrier exists before the first cluster), and the schedule never
+//     wraps around.
+//
+// GOAL
+// ----
+//   For every ordered pair (src, dst) whose LDS effects intersect, guarantee
+//   that the schedule has at least one LOCAL (ds_wait + s_barrier) barrier
+//   somewhere on the path src → dst.  If no existing slot on the path is
+//   LOCAL, mark one as LOCAL.
+//
+// PLACEMENT CHOICE
+// ----------------
+//   When forced to place a LOCAL barrier we pick:
+//     dist == 1 → bars[dst]      (the only slot between src and dst)
+//     dist >  1 → bars[dst - 1]  (the second-rightmost slot on the path)
+//   The `dst - 1` choice is somewhat arbitrary — any slot in (src, dst] is
+//   correct for memory ordering — and is preserved here to match upstream
+//   behavior and existing tests.
+//
+// COVERAGE CHECK
+// --------------
+//   A pair is "covered" if any slot in (src, barrierLoc] is already LOCAL.
+//   Note that bars[dst] is intentionally NOT consulted when dist > 1; this
+//   mirrors the placement choice (we never look at, nor place into, the
+//   slot owned by the adjacent (dst-1, dst) pair).
+//
+// ITERATION ORDER
+// ---------------
+//   We sweep `dist` from 1 up to `maxDist`:
+//     * circular: maxDist = N.  dist == N is the self-loop (src == dst),
+//       which captures iter-i write vs iter-(i+1) read across the
+//       wrap-around when only one cluster touches the buffer.
+//     * flat:     maxDist = N - 1.  No wrap.
+//   Walking by increasing distance ensures the shorter-range LOCAL
+//   barriers we just placed are visible when checking longer-range pairs,
+//   skipping many redundant placements.
 static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
                                         SmallVectorImpl<bool> &bars,
                                         Allocation *allocation, bool circular) {
-  int numClusters = clusterInfo.size();
+  const int N = clusterInfo.size();
+  const int maxDist = circular ? N : N - 1;
 
-  // Adjacent-stage check (distance 1).  Every pair of consecutive clusters
-  // is separated by a barrier slot.  When adjacent stages share an LDS
-  // allocation the barrier must be LOCAL (ds_wait + s_barrier) so that
-  // ModuleMembarAnalysis — which runs later and does not understand warp
-  // pipeline phases — will not insert a redundant ttg.barrier local inside
-  // the pipelined region.
-  int adjEnd = circular ? numClusters : numClusters - 1;
-  for (int src = 0; src < adjEnd; src++) {
-    int next = circular ? (src + 1) % numClusters : src + 1;
-    int barrierLoc = next; // barrier sits right before `next`
-    if (bars[barrierLoc])
-      continue;
-    if (clusterInfo[src].isIntersected(
-            clusterInfo[next], mlir::triton::AMD::membarFilter, allocation)) {
-      bars[barrierLoc] = true;
-      LDBG("adjacent cluster " << src << " need fence to " << next
-                               << " placing barrier at " << barrierLoc);
-    }
-  }
+  // Modular wrap; a no-op in linear mode where indices stay in range.
+  auto wrap = [&](int i) -> int { return circular ? (i % N + N) % N : i; };
 
-  // Distance-2+ check.  For each (src, next) pair separated by at least one
-  // intermediate barrier position, verify the dependency is already covered
-  // by an intervening LOCAL barrier; if not, mark the closest position.
-  for (int offset = 0; offset < numClusters; offset++) {
-    for (int src = 0; src < numClusters; src++) {
-      int next, barrierLoc;
-      if (circular) {
-        next = (src + 2 + offset) % numClusters;
-        barrierLoc = (src + 1 + offset) % numClusters;
-      } else {
-        next = src + 2 + offset;
-        barrierLoc = src + 1 + offset;
-        if (next >= numClusters || barrierLoc >= numClusters)
-          continue;
-      }
-
-      auto isSynced = [&]() -> bool {
-        if (circular) {
-          for (int idx = (src + 1) % numClusters; idx != src;
-               idx = (idx + 1) % numClusters) {
-            if (bars[idx])
-              return true;
-            if (idx == barrierLoc)
-              break;
-          }
-        } else {
-          for (int idx = src + 1; idx <= barrierLoc; idx++)
-            if (bars[idx])
-              return true;
-        }
+  // Returns true if any barrier slot in (src, stop] is already LOCAL.
+  // The walk starts at `src + 1` and advances one slot at a time, wrapping
+  // modulo N in circular mode; it terminates as soon as it finds a LOCAL
+  // slot or reaches `stop`.
+  auto isCovered = [&](int src, int stop) -> bool {
+    for (int i = src + 1;; i++) {
+      const int idx = wrap(i);
+      if (bars[idx])
+        return true;
+      if (idx == stop)
         return false;
-      };
-      if (isSynced())
-        continue;
+    }
+  };
 
-      const bool needFence = clusterInfo[src].isIntersected(
-          clusterInfo[next], mlir::triton::AMD::membarFilter, allocation);
-      if (needFence) {
-        bars[barrierLoc] = true;
-        LDBG("cluster " << src << " need fence to " << next
-                        << " placing barrier at " << barrierLoc);
-      }
+  for (int dist = 1; dist <= maxDist; dist++) {
+    // In linear mode, src + dist must stay in range.  In circular mode all
+    // src values are valid and dst wraps modulo N.
+    const int srcEnd = circular ? N : N - dist;
+    for (int src = 0; src < srcEnd; src++) {
+      const int dst = wrap(src + dist);
+      const int barrierLoc = (dist == 1) ? dst : wrap(dst - 1);
+      if (isCovered(src, barrierLoc))
+        continue;
+      if (!clusterInfo[src].isIntersected(
+              clusterInfo[dst], mlir::triton::AMD::membarFilter, allocation))
+        continue;
+      bars[barrierLoc] = true;
+      LDBG("cluster " << src << " need fence to " << dst
+                      << " placing barrier at " << barrierLoc);
     }
   }
 }
