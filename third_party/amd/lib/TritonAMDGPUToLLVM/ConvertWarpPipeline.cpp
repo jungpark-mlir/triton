@@ -605,7 +605,8 @@ static bool collectLoopClusters(scf::ForOp forOp,
 // Collect execute_region clusters and their preceding barrier flags from a
 // flat (unrolled) pipeline starting at `firstExec`.  After emitPipelinedFlat
 // the sequence looks like:
-//   exec { b_0 } [s_setprio] sched_barrier (barrier) sched_barrier exec { b_1 } ...
+//   exec { b_0 } [s_setprio] sched_barrier (barrier) sched_barrier exec { b_1 }
+//   ...
 // bars[0] is always false (no barrier before the first cluster); bars[i] for
 // i > 0 is the barrier between b_{i-1} and b_i.
 static bool collectFlatClusters(scf::ExecuteRegionOp firstExec,
