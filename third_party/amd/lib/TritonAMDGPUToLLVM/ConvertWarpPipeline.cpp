@@ -82,18 +82,24 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
 
 // Pairwise LDS-dependency analysis between pipeline clusters.
 //
-// PIPELINE LAYOUT
-// ---------------
+// `circular` selects the index topology used by the analysis:
+//   * true  — the schedule wraps modulo N.  Used by loop pipelines (scf.for)
+//             where the wrap-around represents iter-i feeding iter-(i+1).
+//   * false — the schedule is straight-line, indices stay in [0, N).  Used
+//             by flat (unrolled) pipelines.
+// The rest of this comment uses "circular" / "linear" exclusively, since
+// the analysis only cares about topology and not about the source IR kind.
+//
+// LAYOUT
+// ------
 //   cluster:   c0    c1    c2    ...    c_{N-1}
 //   bars:    b0    b1    b2    b3   ...        b_{N-1}        (b_i sits
 //                                                              before c_i)
 //
-//   * `circular = true`  (loop pipelines): N is the number of stages and b0
-//     is the wrap-around barrier inside the loop body — sitting between
-//     c_{N-1} of one iteration and c0 of the next.
-//   * `circular = false` (flat pipelines): b0 has no physical slot (no
-//     barrier exists before the first cluster), and the schedule never
-//     wraps around.
+//   * circular: b0 is the wrap-around barrier inside the loop body —
+//     sitting between c_{N-1} of one iteration and c0 of the next.
+//   * linear:   b0 has no physical slot (no barrier exists before the first
+//     cluster), and the schedule never wraps around.
 //
 // GOAL
 // ----
@@ -124,7 +130,7 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
 //     * circular: maxDist = N.  dist == N is the self-loop (src == dst),
 //       which captures iter-i write vs iter-(i+1) read across the
 //       wrap-around when only one cluster touches the buffer.
-//     * flat:     maxDist = N - 1.  No wrap.
+//     * linear:   maxDist = N - 1.  No wrap.
 //   Walking by increasing distance ensures the shorter-range LOCAL
 //   barriers we just placed are visible when checking longer-range pairs,
 //   skipping many redundant placements.
@@ -362,7 +368,7 @@ private:
       }
     }
 
-    // Post-loop priority reset and reconverge.
+    // 5. Post-loop priority reset and reconverge.
     b.setInsertionPointAfter(forOp);
     emitPipelinePostlude(b, loc, anyHasPriority, warpLow);
     return success();
@@ -438,7 +444,7 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
   auto [warpLow, warpHigh] =
       emitPipelinePrelude(b, loc, threadsPerPipelineGroup);
 
-  // 2. Dependency analysis — linear, no wrap-around.
+  // 2. Collect cluster info.
   SmallVector<Block *> clusterBlocks;
   SmallVector<bool> bars(numClusters, false);
 
@@ -455,11 +461,11 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     return op->hasAttr("triton.warp_pipeline.priority");
   });
 
-  // Linear dependency analysis (no wrap-around for flat pipelines).
+  // 3. Linear dependency analysis (no wrap-around for flat pipelines).
   analyzePipelineDependencies(clusterInfo, bars, allocation,
                               /*circular=*/false);
 
-  // 3. Materialize cluster barriers.
+  // 4. Materialize cluster barriers.
   //    Cluster 0 gets only its priority (inserted after cond_barrier above).
   //    Clusters 1..N get priority + cluster barrier, unless a pre-existing
   //    barrier op (e.g., async_wait) already exists between the clusters —
@@ -491,7 +497,7 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     }
   }
 
-  // 4. Post-sequence reconverge.
+  // 5. Post-sequence reconverge.
   b.setInsertionPointAfter(clusterOps.back());
   emitPipelinePostlude(b, loc, anyHasPriority, warpLow);
 }
@@ -663,15 +669,16 @@ static bool collectNextPipelineClusters(Operation *startOp,
 
 // Check whether merging two pipelines creates a cross-pipeline LDS dependency
 // at the boundary.  Concatenates the cluster infos and barrier flags from both
-// pipelines and runs analyzePipelineDependencies on the merged linear
+// pipelines and runs analyzePipelineDependencies in linear mode on the merged
 // sequence.
 //
-// Note on concurrency vs memory ordering: with a one-stage phase offset, the
-// only cross-warp concurrent pair at the boundary is (a_{K-1}, b_0) — all
+// Note on concurrency vs memory ordering: with a one-stage phase offset the
+// only cross-warp concurrent pair at the boundary is (a_{K-1}, b_0); all
 // other pairs execute sequentially within the same warp.  However, within a
-// warp, LDS write→read ordering still requires a LOCAL barrier (ds_wait)
-// between producer and consumer.  The distance-2+ check verifies that such a
-// barrier exists somewhere along the path.
+// warp LDS write→read ordering still requires a LOCAL barrier (ds_wait)
+// between producer and consumer, so the merged analysis must check every
+// (a_i, b_j) pair, not just the concurrent one.  The single-distance sweep
+// inside analyzePipelineDependencies covers both cases uniformly.
 //
 // Returns true if the boundary position stays dependency-free after analysis
 // (i.e. safe to eliminate).
@@ -693,7 +700,8 @@ static bool isCrossPipelineSafe(ArrayRef<Block *> loopBlocks,
   // mergedBars[i] = LOCAL barrier immediately before cluster i.
   //   i < K     : A's internal barriers (loopBars[i]).  loopBars[0]
   //               corresponds to A's wrap-around inside the loop body and is
-  //               never consulted by the linear distance checks (src ≥ 0).
+  //               never consulted in linear mode (analyzePipelineDependencies
+  //               only reads bars[idx] for idx > src ≥ 0).
   //   i == K    : boundary — initialized false; this is what we decide.
   //   i > K     : B's internal barriers (nextBars[i - K]).  nextBars[0] is
   //               skipped: for flat B it is always false, for loop B it is
