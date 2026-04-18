@@ -1088,3 +1088,99 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK-NEXT: rocdl.sched.barrier
 //
 // CHECK: scf.yield
+
+// -----
+
+// ---- Back-to-back: cross-pipeline dep in a later flat stage (b_1) ----
+//
+// This test exercises `collectNextPipelineClusters` when the next pipeline is
+// a flat (unrolled) sequence of more than one stage.  Before the fix, only
+// the first stage (b_0) was collected, so a cross-pipeline dependency
+// involving a later stage (b_1, b_2, …) was missed and the boundary barriers
+// were wrongly eliminated.
+//
+// Layout:
+//   Loop A (2 stages): a_0 tt.store          (no LDS)
+//                      a_1 ttg.local_store   (WRITES LDS)
+//   Flat B (2 stages): b_0 tt.store          (no LDS)
+//                      b_1 ttg.local_store   (WRITES the same LDS buffer)
+//
+// A's circular analysis places its single LOCAL barrier at bars[0] (the
+// wrap-around) because the only intersecting pair is (a_1, a_1) via the
+// distance-2 self-check.  Its internal barrier between stages (bars[1]) is
+// therefore s_barrier and does NOT cover the cross-pipeline dep.
+//
+// Cross-pipeline dep: (a_1, b_1) WAW at merged distance 2, barrierLoc = K = 2
+// (the boundary).  With all other barrier slots non-LOCAL in the merged
+// sequence, the analysis must flag the boundary and preserve the post-loop
+// cond_barrier, prelude ttg.barrier local, and phase-shift cond_barrier.
+//
+// Before the fix the boundary barriers would have been removed (false
+// negative) because only b_0 was collected, making b_1 invisible to the
+// cross-pipeline analysis.
+
+#crossb_blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
+#crossb_shared = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 16, order = [1, 0]}>
+#crossb_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @cross_pipeline_dep_in_b1(
+      %lb: i32, %ub: i32, %step: i32,
+      %ptr: tensor<256x64x!tt.ptr<f16>, #crossb_blocked>,
+      %gptr: !tt.ptr<f32>) {
+
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<256x64xf16, #crossb_shared, #crossb_smem, mutable>
+    %v0 = arith.constant 0.0 : f32
+    %v1 = arith.constant 1.0 : f32
+
+    // Loop A: stage 0 no LDS, stage 1 writes %smem.
+    scf.for %i = %lb to %ub step %step : i32 {
+      scf.execute_region no_inline {
+        tt.store %gptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "a_compute"}
+
+      scf.execute_region no_inline {
+        %data = tt.load %ptr : tensor<256x64x!tt.ptr<f16>, #crossb_blocked>
+        ttg.local_store %data, %smem : tensor<256x64xf16, #crossb_blocked> -> !ttg.memdesc<256x64xf16, #crossb_shared, #crossb_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "a_store"}
+    } {triton.warp_pipeline.pipelined_for}
+
+    // Flat B: b_0 no LDS (masks the bug), b_1 writes the same %smem (dep).
+    scf.execute_region no_inline {
+      tt.store %gptr, %v1 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "b_nolds"}
+
+    scf.execute_region no_inline {
+      %data = tt.load %ptr : tensor<256x64x!tt.ptr<f16>, #crossb_blocked>
+      ttg.local_store %data, %smem : tensor<256x64xf16, #crossb_blocked> -> !ttg.memdesc<256x64xf16, #crossb_shared, #crossb_smem, mutable>
+      scf.yield
+    } {triton.warp_pipeline.stage = "b_lds"}
+
+    ttg.local_dealloc %smem : !ttg.memdesc<256x64xf16, #crossb_shared, #crossb_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @cross_pipeline_dep_in_b1
+// Pre-barrier and phase shift for loop A.
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: scf.for
+// Loop body: a_0 (tt.store), internal s_barrier, a_1 (local_store), wrap-around LOCAL.
+// CHECK: tt.store
+// CHECK: ttg.local_store
+// CHECK: ttg.barrier local
+// Boundary barriers between loop A and flat B are KEPT because (a_1, b_1)
+// is a cross-pipeline WAW dep on %smem and A's internal barriers do NOT
+// cover the path a_1 → boundary → b_0 → b_1.
+// CHECK: amdg.cond_barrier
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// Flat B stages: b_0 (tt.store), internal s_barrier, b_1 (local_store).
+// CHECK: tt.store
+// CHECK: ttg.local_store
+// Reconverge cond_barrier for flat B.
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return

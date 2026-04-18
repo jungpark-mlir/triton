@@ -535,9 +535,38 @@ static void processUnrolledPipelineRegions(ModuleOp m,
   });
 }
 
+// Return true if `op` is intra-pipeline glue between two clusters — the
+// sequence emitted by emitClusterBarrier/emitClusterPriority and any
+// pre-existing barrier op that emitPipelinedFlat wraps with sched_barriers.
+static bool isIntraPipelineGlue(Operation *op) {
+  return isa<ROCDL::SchedBarrier, ROCDL::SetPrioOp, ROCDL::SBarrierOp,
+             ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::BarrierOp,
+             triton::gpu::AsyncWaitOp, triton::amdgpu::AsyncWaitOp,
+             triton::amdgpu::AsyncTDMWait,
+             triton::amdgpu::AsyncTDMIntrinsicWait>(op);
+}
+
+// Walk backward from `exec` past `sched_barrier` / `s_setprio` and check
+// whether the first non-glue op is a LOCAL `triton::gpu::BarrierOp`.
+// Any other barrier kind (s_barrier, async_wait, …) is treated as
+// non-LOCAL for the purposes of LDS-dependency coverage.
+static bool hasLocalBarrierBefore(Operation *exec) {
+  for (Operation *scan = exec->getPrevNode(); scan;
+       scan = scan->getPrevNode()) {
+    if (isa<ROCDL::SchedBarrier, ROCDL::SetPrioOp>(scan))
+      continue;
+    if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(scan))
+      return barrier.hasLocal();
+    return false;
+  }
+  return false;
+}
+
 // Collect execute_region clusters and their materialized barrier flags from
 // a converted pipelined for-loop body.  After ConvertPipelinedForPattern the
 // loop body contains: [priority] [barrier] execute_region ... [barrier] yield.
+// bars[0] corresponds to the wrap-around barrier (before yield); bars[i] for
+// i > 0 is the barrier immediately preceding cluster i.
 // Returns false if the loop body doesn't match the expected pattern.
 static bool collectLoopClusters(scf::ForOp forOp,
                                 SmallVectorImpl<Block *> &blocks,
@@ -557,9 +586,9 @@ static bool collectLoopClusters(scf::ForOp forOp,
     return false;
 
   int K = blocks.size();
-  // Walk backwards from yield to find the wrap-around barrier (barrier[0]).
+  // bars[0]: wrap-around barrier immediately before the yield.
   // Pattern: [s_setprio] sched_barrier (ttg.barrier_local|s_barrier)
-  // sched_barrier yield
+  //          sched_barrier yield
   Operation *op = yieldOp->getPrevNode();
   if (op && isa<ROCDL::SchedBarrier>(op)) {
     op = op->getPrevNode();
@@ -567,57 +596,76 @@ static bool collectLoopClusters(scf::ForOp forOp,
       bars[0] = barrier.hasLocal();
   }
 
-  // Walk the loop body to find barriers between clusters (barrier[1..K-1]).
-  // After materialization each barrier sits just before its cluster's
-  // execute_region: [s_setprio] sched_barrier (barrier) sched_barrier exec.
-  for (int i = 1; i < K; i++) {
-    auto *exec = blocks[i]->getParentOp();
-    for (Operation *scan = exec->getPrevNode(); scan;
-         scan = scan->getPrevNode()) {
-      if (isa<ROCDL::SchedBarrier, ROCDL::SetPrioOp>(scan))
-        continue;
-      if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(scan))
-        bars[i] = barrier.hasLocal();
-      break;
+  // bars[1..K-1]: barrier immediately preceding each cluster's execute_region.
+  for (int i = 1; i < K; i++)
+    bars[i] = hasLocalBarrierBefore(blocks[i]->getParentOp());
+  return true;
+}
+
+// Collect execute_region clusters and their preceding barrier flags from a
+// flat (unrolled) pipeline starting at `firstExec`.  After emitPipelinedFlat
+// the sequence looks like:
+//   exec { b_0 } [s_setprio] sched_barrier (barrier) sched_barrier exec { b_1 } ...
+// bars[0] is always false (no barrier before the first cluster); bars[i] for
+// i > 0 is the barrier between b_{i-1} and b_i.
+static bool collectFlatClusters(scf::ExecuteRegionOp firstExec,
+                                SmallVectorImpl<Block *> &blocks,
+                                SmallVectorImpl<bool> &bars) {
+  if (!firstExec->hasAttr("triton.warp_pipeline.stage"))
+    return false;
+  blocks.push_back(&firstExec->getRegion(0).front());
+  bars.push_back(false);
+
+  for (Operation *op = firstExec->getNextNode(); op; op = op->getNextNode()) {
+    if (auto exec = dyn_cast<scf::ExecuteRegionOp>(op);
+        exec && exec->hasAttr("triton.warp_pipeline.stage")) {
+      blocks.push_back(&exec->getRegion(0).front());
+      bars.push_back(hasLocalBarrierBefore(op));
+      continue;
     }
+    // Walk past cluster barriers / priority / pre-existing barriers that
+    // emitPipelinedFlat may have wrapped with sched_barriers.  Anything
+    // else (e.g. cond_barrier postlude, unrelated ops) terminates the
+    // flat sequence.
+    if (isIntraPipelineGlue(op))
+      continue;
+    break;
   }
   return true;
 }
 
-// Collect execute_region clusters from the next pipeline (flat or loop).
-// For a flat pipeline: collect the contiguous execute_regions starting at
-// `startOp`.  For a loop: collect from the for-loop body.
+// Dispatch to collectLoopClusters / collectFlatClusters based on the kind of
+// the next pipeline.  The resulting bars follow the same convention as
+// collectLoopClusters: bars[0] is either a wrap-around (loop) or false (flat);
+// bars[i>0] is the barrier preceding cluster i.
 static bool collectNextPipelineClusters(Operation *startOp,
-                                        SmallVectorImpl<Block *> &blocks) {
-  if (auto forOp = dyn_cast<scf::ForOp>(startOp)) {
-    for (auto &op : *forOp.getBody())
-      if (auto exec = dyn_cast<scf::ExecuteRegionOp>(op))
-        if (exec->hasAttr("triton.warp_pipeline.stage"))
-          blocks.push_back(&exec->getRegion(0).front());
-  } else if (auto exec = dyn_cast<scf::ExecuteRegionOp>(startOp)) {
-    blocks.push_back(&exec->getRegion(0).front());
-    for (Operation *op = startOp->getNextNode(); op; op = op->getNextNode()) {
-      auto nextExec = dyn_cast<scf::ExecuteRegionOp>(op);
-      if (nextExec && nextExec->hasAttr("triton.warp_pipeline.stage"))
-        blocks.push_back(&nextExec->getRegion(0).front());
-      else
-        break;
-    }
-  }
-  return !blocks.empty();
+                                        SmallVectorImpl<Block *> &blocks,
+                                        SmallVectorImpl<bool> &bars) {
+  if (auto forOp = dyn_cast<scf::ForOp>(startOp))
+    return collectLoopClusters(forOp, blocks, bars);
+  if (auto exec = dyn_cast<scf::ExecuteRegionOp>(startOp))
+    return collectFlatClusters(exec, blocks, bars);
+  return false;
 }
 
 // Check whether merging two pipelines creates a cross-pipeline LDS dependency
 // at the boundary.  Concatenates the cluster infos and barrier flags from both
-// pipelines (with `false` at the boundary) and runs analyzePipelineDependencies
-// on the merged linear sequence.  The analysis now covers both adjacent
-// (distance-1) and longer-range pairs, so a single call is sufficient.
+// pipelines and runs analyzePipelineDependencies on the merged linear
+// sequence.
 //
-// Returns true if the boundary position is dependency-free and can be
-// eliminated.
+// Note on concurrency vs memory ordering: with a one-stage phase offset, the
+// only cross-warp concurrent pair at the boundary is (a_{K-1}, b_0) — all
+// other pairs execute sequentially within the same warp.  However, within a
+// warp, LDS write→read ordering still requires a LOCAL barrier (ds_wait)
+// between producer and consumer.  The distance-2+ check verifies that such a
+// barrier exists somewhere along the path.
+//
+// Returns true if the boundary position stays dependency-free after analysis
+// (i.e. safe to eliminate).
 static bool isCrossPipelineSafe(ArrayRef<Block *> loopBlocks,
                                 ArrayRef<bool> loopBars,
                                 ArrayRef<Block *> nextBlocks,
+                                ArrayRef<bool> nextBars,
                                 Allocation *allocation) {
   int K = loopBlocks.size();
   int M = nextBlocks.size();
@@ -628,14 +676,23 @@ static bool isCrossPipelineSafe(ArrayRef<Block *> loopBlocks,
   for (auto *b : nextBlocks)
     mergedInfo.push_back(buildBlockInfoFromBlock(b, allocation));
 
-  // Merged barrier flags: [loopBars..., false (boundary), false...]
-  // The boundary position is at index K.
+  // Merged layout: [a_0..a_{K-1}, b_0..b_{M-1}]
+  // mergedBars[i] = LOCAL barrier immediately before cluster i.
+  //   i < K     : A's internal barriers (loopBars[i]).  loopBars[0]
+  //               corresponds to A's wrap-around inside the loop body and is
+  //               never consulted by the linear distance checks (src ≥ 0).
+  //   i == K    : boundary — initialized false; this is what we decide.
+  //   i > K     : B's internal barriers (nextBars[i - K]).  nextBars[0] is
+  //               skipped: for flat B it is always false, for loop B it is
+  //               B's own wrap-around (inside B's loop body) which is
+  //               covered by B's own circular analysis.
   SmallVector<bool> mergedBars;
+  mergedBars.reserve(K + M);
   for (bool b : loopBars)
     mergedBars.push_back(b);
-  mergedBars.push_back(false); // boundary position
+  mergedBars.push_back(false); // boundary
   for (int i = 1; i < M; i++)
-    mergedBars.push_back(false);
+    mergedBars.push_back(nextBars[i]);
 
   analyzePipelineDependencies(mergedInfo, mergedBars, allocation,
                               /*circular=*/false);
@@ -730,12 +787,12 @@ static void eliminateRedundantCondBarriers(ModuleOp m,
         // over, stages from different pipelines execute concurrently at the
         // boundary.  We must verify that no uncovered LDS conflict exists.
         SmallVector<Block *> loopBlocks, nextBlocks;
-        SmallVector<bool> loopBars;
+        SmallVector<bool> loopBars, nextBars;
         if (!collectLoopClusters(prevFor, loopBlocks, loopBars))
           continue;
-        if (!collectNextPipelineClusters(next, nextBlocks))
+        if (!collectNextPipelineClusters(next, nextBlocks, nextBars))
           continue;
-        if (!isCrossPipelineSafe(loopBlocks, loopBars, nextBlocks,
+        if (!isCrossPipelineSafe(loopBlocks, loopBars, nextBlocks, nextBars,
                                  allocation)) {
           LDBG("cross-pipeline LDS dependency at boundary — keeping barriers");
           continue;
