@@ -301,7 +301,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // CHECK-LABEL: warp_local_padded
 tt.func @warp_local_padded(
-    %desc: !tt.tensordesc<tensor<64x64xf16>>,
+    %desc: !tt.tensordesc<64x64xf16, #shared_wl>,
     %pred: i32) {
   %c0 = arith.constant 0 : i32
   %c2 = arith.constant 2 : i32
@@ -309,7 +309,7 @@ tt.func @warp_local_padded(
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable>
 
   %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
-  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<tensor<64x64xf16>> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<64x64xf16, #shared_wl> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
 
   // async_tdm_wait has MemWaitOpTrait — membar always inserts barrier here.
   %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
@@ -320,7 +320,7 @@ tt.func @warp_local_padded(
   // analysis, membar would insert a barrier. But each warp touches disjoint
   // rows, so no cross-warp synchronization is needed.
   %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
-  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<tensor<64x64xf16>> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<64x64xf16, #shared_wl> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
 
   %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
   // CHECK: amdg.async_tdm_copy_global_to_local
@@ -349,7 +349,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // CHECK-LABEL: warp_local_mismatched_warps
 tt.func @warp_local_mismatched_warps(
-    %desc: !tt.tensordesc<tensor<64x64xf16>>,
+    %desc: !tt.tensordesc<64x64xf16, #shared_mismatch>,
     %pred: i32) {
   %c0 = arith.constant 0 : i32
   %c2 = arith.constant 2 : i32
@@ -357,14 +357,14 @@ tt.func @warp_local_mismatched_warps(
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
 
   %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
-  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<tensor<64x64xf16>> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<64x64xf16, #shared_mismatch> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
 
   %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
   // CHECK: amdg.async_tdm_wait
   // CHECK-NEXT: ttg.barrier local
 
   %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
-  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<tensor<64x64xf16>> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<64x64xf16, #shared_mismatch> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
 
   %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
   // CHECK: amdg.async_tdm_copy_global_to_local
