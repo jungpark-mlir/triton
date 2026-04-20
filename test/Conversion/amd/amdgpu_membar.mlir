@@ -292,7 +292,7 @@ tt.func @missing_barrier_reused_allocation(%A: !tt.ptr<f16>, %B: !tt.ptr<f16>) {
 //
 // The check compares warpsPerCTA on both sides: TDM distributes warps as
 // [4, 1], blocked encoding also has warpsPerCTA = [4, 1] — matching warp
-// distribution means each warp reads exactly what it wrote.
+// distribution means different warps' byte-address ranges are always disjoint.
 #blocked_wl = #ttg.blocked<{sizePerThread = [8, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared_wl = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
 #smem_wl = #ttg.shared_memory

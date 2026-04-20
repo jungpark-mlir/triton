@@ -120,26 +120,27 @@ static RankedTensorType getDistributedType(Operation *op) {
       .Default([](Operation *) { return RankedTensorType(); });
 }
 
-// Get TDM warpsPerCTA from the tensor descriptor's block shape.
-static SmallVector<unsigned>
-getTDMWarpsPerCTA(triton::amdgpu::AsyncTDMCopyGlobalToLocalOp tdmOp) {
-  auto descTy = tdmOp.getDesc().getType();
-  auto blockShape =
-      SmallVector<int64_t>(descTy.getBlockType().getShape());
-  int numWarps = triton::gpu::lookupNumWarps(tdmOp);
-  int numDims = blockShape.size();
-  SmallVector<int> warpsRaw(numDims);
-  tdmGetWarpDistribution(blockShape.data(), numDims, numWarps, warpsRaw.data());
-  return SmallVector<unsigned>(warpsRaw.begin(), warpsRaw.end());
-}
-
-// Get warpsPerCTA for a register-side op from its distributed encoding.
-static SmallVector<unsigned>
-getRegWarpsPerCTA(Operation *op) {
+// Extract warpsPerCTA and tile element count from an op. For TDM ops, warps
+// come from tdmGetWarpDistribution on the tensor descriptor's block shape.
+// For register-side ops (local_load/store/alloc), warps come from the
+// distributed encoding.
+static std::pair<SmallVector<unsigned>, int64_t> getWarpInfo(Operation *op) {
+  if (auto tdm = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
+    auto descTy = tdm.getDesc().getType();
+    auto blockShape =
+        SmallVector<int64_t>(descTy.getBlockType().getShape());
+    int numWarps = triton::gpu::lookupNumWarps(tdm);
+    int numDims = blockShape.size();
+    SmallVector<int> warpsRaw(numDims);
+    tdmGetWarpDistribution(blockShape.data(), numDims, numWarps,
+                           warpsRaw.data());
+    return {SmallVector<unsigned>(warpsRaw.begin(), warpsRaw.end()),
+            product<int64_t>(blockShape)};
+  }
   auto regTy = getDistributedType(op);
   if (!regTy)
-    return {};
-  return triton::gpu::getWarpsPerCTA(regTy);
+    return {{}, 0};
+  return {triton::gpu::getWarpsPerCTA(regTy), product(regTy.getShape())};
 }
 
 // Strip trailing 1s so warpsPerCTA vectors of different ranks compare equal
@@ -157,36 +158,16 @@ normalizeWarpsPerCTA(SmallVector<unsigned> warps) {
   return warps;
 }
 
-// Get the total number of tile elements for an op.
-static int64_t getTileElements(Operation *op) {
-  if (auto tdm = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op))
-    return product(tdm.getDesc().getType().getBlockType().getShape());
-  auto regTy = getDistributedType(op);
-  return regTy ? product(regTy.getShape()) : 0;
-}
-
 // Returns true if both ops distribute warps identically over same-sized tiles,
 // proving each warp accesses a disjoint set of shared memory addresses on both
 // sides. The tile element count check guards against false positives when
 // different-shaped allocations reuse the same physical memory (dealloc/realloc).
 static bool hasMatchingWarpDistribution(Operation *op1, Operation *op2) {
-  SmallVector<unsigned> warps1, warps2;
-
-  if (auto tdm = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op1))
-    warps1 = getTDMWarpsPerCTA(tdm);
-  else
-    warps1 = getRegWarpsPerCTA(op1);
-
-  if (auto tdm = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op2))
-    warps2 = getTDMWarpsPerCTA(tdm);
-  else
-    warps2 = getRegWarpsPerCTA(op2);
+  auto [warps1, elems1] = getWarpInfo(op1);
+  auto [warps2, elems2] = getWarpInfo(op2);
 
   if (warps1.empty() || warps2.empty())
     return false;
-
-  int64_t elems1 = getTileElements(op1);
-  int64_t elems2 = getTileElements(op2);
   if (elems1 == 0 || elems2 == 0 || elems1 != elems2)
     return false;
 
