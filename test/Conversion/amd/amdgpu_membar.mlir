@@ -332,3 +332,47 @@ tt.func @warp_local_padded(
 }
 
 }
+
+// -----
+
+// Warp-local barrier suppression — mismatched warpsPerCTA negative test.
+//
+// TDM distributes warps as [4, 1] across the 64x64 tile, but the local_load's
+// blocked encoding has warpsPerCTA = [1, 4]. After normalization, [4] != [1, 4],
+// so warps access different partitions on each side and the barrier must be
+// kept.
+#blocked_mismatch = #ttg.blocked<{sizePerThread = [4, 8], threadsPerWarp = [16, 2], warpsPerCTA = [1, 4], order = [1, 0]}>
+#shared_mismatch = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#smem_mismatch = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "hip:gfx1250"} {
+
+// CHECK-LABEL: warp_local_mismatched_warps
+tt.func @warp_local_mismatched_warps(
+    %desc: !tt.tensordesc<tensor<64x64xf16>>,
+    %pred: i32) {
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+
+  %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<tensor<64x64xf16>> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+
+  %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
+  // CHECK: amdg.async_tdm_wait
+  // CHECK-NEXT: ttg.barrier local
+
+  %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<tensor<64x64xf16>> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+
+  %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+  // CHECK: amdg.async_tdm_copy_global_to_local
+  // CHECK: ttg.barrier local
+  // CHECK: ttg.local_load
+  %load = ttg.local_load %slot0_r : !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> tensor<64x64xf16, #blocked_mismatch>
+
+  tt.return
+}
+
+}
