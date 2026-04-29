@@ -31,6 +31,22 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
     scf::YieldOp::create(ifOpBuilder, loc, dotOp->getOperand(2));
     return ifOp;
   }
+  // TDM ops with I32 predicates need explicit type conversion since the
+  // generic PredicatedOpInterface path produces I1 masks.
+  if (isa<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp,
+          triton::amdgpu::AsyncTDMGatherOp>(op)) {
+    auto predicatedOp = cast<tt::PredicatedOpInterface>(op);
+    rewriter.setInsertionPoint(op);
+    auto predI32 = arith::ExtUIOp::create(
+        rewriter, op->getLoc(), predicatedOp.getPredicateOperand().getType(),
+        pred);
+    Value mask = arith::AndIOp::create(
+        rewriter, op->getLoc(), predicatedOp.getPredicateOperand(), predI32);
+    predicatedOp.setPredicateOperand(mask);
+    return op;
+  }
+  if (isa<triton::amdgpu::AsyncTDMWait>(op))
+    return op;
   return tt::wrapInMaskOp(rewriter, op, pred);
 }
 

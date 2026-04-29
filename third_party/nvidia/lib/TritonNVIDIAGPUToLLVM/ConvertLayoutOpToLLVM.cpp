@@ -18,7 +18,6 @@ using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 using mlir::LLVM::NVIDIA::lowerLdStMatrix;
 
-constexpr int kPtrBitWidth = 64;
 struct ConvertLayoutOpSwizzlingConversion
     : public ConvertOpToLLVMPattern<triton::gpu::ConvertLayoutOp> {
   const NVIDIA::TargetInfo &targetInfo;
@@ -227,29 +226,6 @@ struct ConvertLayoutOpSwizzlingConversion
     // Undo the permLoad used to divideRight
     outVals = permLoad.inverse().apply(outVals);
     return outVals;
-  }
-
-  LogicalResult
-  transferWithinBlockSwizzling(ConvertLayoutOp op, Value src,
-                               ConversionPatternRewriter &rewriter) const {
-    auto loc = op.getLoc();
-    auto srcTy = op.getSrc().getType();
-    auto dstTy = op.getType();
-
-    auto srcLayout = toLinearLayout(srcTy);
-    auto dstLayout = toLinearLayout(dstTy);
-
-    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
-    auto smemBase =
-        LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
-    auto inVals = unpackLLElements(loc, src, rewriter);
-    auto outVals = transferWithinBlockSwizzling(
-        loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase);
-
-    Value result =
-        packLLElements(loc, getTypeConverter(), outVals, rewriter, dstTy);
-    rewriter.replaceOp(op, result);
-    return success();
   }
 };
 

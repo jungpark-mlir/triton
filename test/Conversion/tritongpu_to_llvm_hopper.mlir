@@ -136,6 +136,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @dot_reg_operand_A
   // Generate a wgmma where the first operand is a struct.
+  // CHECK: %[[A_MOV0:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV1:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV2:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: %[[A_MOV3:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+  // CHECK: nvvm.wgmma.fence.aligned
+  // CHECK: %[[A_PACK0:.*]] = llvm.insertvalue %[[A_MOV0]], %{{.*}}[0] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK1:.*]] = llvm.insertvalue %[[A_MOV1]], %[[A_PACK0]][1] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK2:.*]] = llvm.insertvalue %[[A_MOV2]], %[[A_PACK1]][2] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: %[[A_PACK3:.*]] = llvm.insertvalue %[[A_MOV3]], %[[A_PACK2]][3] : !llvm.struct<(i32, i32, i32, i32)>
+  // CHECK: nvg.wgmma %[[A_PACK3]], %{{.*}}
   // CHECK: nvg.wgmma {{.*}} : (!llvm.struct<(i32, i32, i32, i32)>, i64, i1) -> !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
   // CHECK: nvg.wgmma_wait_group %{{.*}} {pendings = 0 : i32} : !llvm.struct<(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32)>
   tt.func @dot_reg_operand_A(%a: tensor<128x64xf16, #mma>, %b: !ttg.memdesc<64x64xf16, #shared, #smem>) {
@@ -602,9 +612,9 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
     %3 = ttg.local_load %1 : !ttg.memdesc<16x16xf64, #shared1, #smem, mutable> -> tensor<16x16xf64, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
 
     // CHECK: llvm.inline_asm
-    // CHECK-SAME: mma.sync.aligned.m16n8k16.row.col.f64.f64.f64.f64
+    // CHECK-SAME: mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64
     // CHECK: llvm.inline_asm
-    // CHECK-SAME: mma.sync.aligned.m16n8k16.row.col.f64.f64.f64.f64
+    // CHECK-SAME: mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64
 
     %out = tt.dot %2, %3, %cst, inputPrecision = tf32 : tensor<16x16xf64, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 1}>> * tensor<16x16xf64, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>> -> tensor<16x16xf64, #mma>
 

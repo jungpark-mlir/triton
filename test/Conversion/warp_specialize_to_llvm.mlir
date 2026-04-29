@@ -1,5 +1,5 @@
 // RUN: triton-opt %s -split-input-file -mlir-print-local-scope -allow-unregistered-dialect -convert-warp-specialize-to-llvm -canonicalize=region-simplify=disabled | FileCheck %s --check-prefixes=COMMON,CHECK
-// RUN: triton-opt %s -split-input-file -mlir-print-local-scope -allow-unregistered-dialect -triton-amdgpu-convert-warp-specialize-to-llvm=arch=gfx1250 -canonicalize=region-simplify=disabled | FileCheck %s --check-prefixes=COMMON,AMD
+// RUN: triton-opt %s -split-input-file -mlir-print-local-scope -allow-unregistered-dialect -triton-amdgpu-convert-warp-specialize-to-llvm=gfx-arch=gfx1250 -canonicalize=region-simplify=disabled | FileCheck %s --check-prefixes=COMMON,AMD
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 11 : i32} {
 
@@ -531,6 +531,51 @@ llvm.func @partition_warpid_order() attributes {allocation.offset = 32 : i32} {
   }
   partition2() num_warps(8) {
     "ws0_partition2"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 18 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @warpid_warp_specialize
+llvm.func @warpid_warp_specialize() attributes {allocation.offset = 32 : i32} {
+  // CHECK-DAG: [[C4:%.*]] = llvm.mlir.constant(4 : i32)
+  // CHECK-DAG: [[C6:%.*]] = llvm.mlir.constant(6 : i32)
+
+  // Partition warp IDs are rewritten to be relative in this pass, while
+  // keeping ttg.warp_id for NVGPUToLLVM to lower later.
+  // CHECK: %{{.*}} = ttg.warp_id
+  // CHECK-NEXT: [[REL0:%.*]] = llvm.sub %{{.*}}, [[C6]] : i32
+  // CHECK-NEXT: "use"([[REL0]]) : (i32) -> ()
+
+  // CHECK: %{{.*}} = ttg.warp_id
+  // CHECK-NEXT: [[REL1:%.*]] = llvm.sub %{{.*}}, [[C4]] : i32
+  // CHECK-NEXT: "use"([[REL1]]) : (i32) -> ()
+
+  %0 = ttg.warp_id
+  "use"(%0) : (i32) -> ()
+
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 6, 4>}
+  default {
+    %1 = ttg.warp_id
+    "use"(%1) : (i32) -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    %1 = ttg.warp_id
+    "use"(%1) : (i32) -> ()
+    ttg.warp_return
+  }
+  partition1() num_warps(2) {
+    %1 = ttg.warp_id
+    "use"(%1) : (i32) -> ()
     ttg.warp_return
   } : () -> ()
   llvm.return
@@ -1190,6 +1235,30 @@ llvm.func @dynamic_register_reallocation_overalloc() attributes {allocation.offs
   }
   partition2() num_warps(4) {
     "partition2"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
+module attributes {ttg.maxnreg = 80 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 8 : i32} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @gsan_dynamic_register_reallocation_disabled
+llvm.func @gsan_dynamic_register_reallocation_disabled() attributes {allocation.offset = 0 : i32} {
+  // CHECK-NOT: nvvm.setmaxregister
+  // CHECK: llvm.return
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4>, actualRegisters = array<i32: 152, 80>, "tti.disable_setmaxregister"}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
     ttg.warp_return
   } : () -> ()
   llvm.return

@@ -117,7 +117,8 @@ proton.start(name="profile_name", context="shadow", backend="cupti", mode="pcsam
 #### Instrumentation
 
 The instrumentation backend allows for detailed, fine-grained profiling of intra-kernel behavior, generating trace or tree views similar to those produced by coarse-grained profiling.
-By default, if no `mode` is specified, Proton profiles kernel cycles, which may require shared memory or global memory (depends on `buffer-type`). If there is insufficient profiling memory capacity, profiling will abort and a warning will be displayed. Future releases will introduce additional instrumentation modes. See the [tutorial](tutorials/intra_kernel) for more detailed information and examples.
+By default, if no `mode` is specified, Proton profiles kernel cycles, which may require shared memory or global memory (depends on `buffer-type`). If there is insufficient profiling memory capacity, profiling will abort and a warning will be displayed. Future releases will introduce additional instrumentation modes. See the [tutorial](tutorials/intra_kernel) for more detailed information and examples. A video demo of the Tutorials from the 2025 Triton conference can be found here:
+https://youtu.be/PGUw2P55ZYM?si=EgsYeGzb9suBZSX5&t=984
 
 **Host-side usage:**
 
@@ -166,7 +167,7 @@ def kernel(...):
             gl.load(...)
 ```
 
-Advanced users can instrument either the `ttir` or `ttgir` intermediate representations for even finer-grained measurement. The relevant IR instructions are `proton.record start` and `proton.record end`. This can be combined with the environment variable `TRITON_KERNEL_OVERRIDE=1` for custom kernel overrides. For detailed steps, refer to the Triton [documentation](https://github.com/triton-lang/triton?tab=readme-ov-file#tips-for-hacking) under the **Kernel Override Steps** section. We have also assembled a [tutorial](tutorials/intra_kernel) that demonstrates how to use the IR-based instrumentation approach and the proton DSL approach.
+Advanced users can instrument either the `ttir` or `ttgir` intermediate representations for even finer-grained measurement. The relevant IR instructions are `proton.record start` and `proton.record end`. This can be combined with the environment variable `TRITON_KERNEL_OVERRIDE=1` for custom kernel overrides. For detailed steps, refer to the Triton [documentation](https://github.com/triton-lang/triton?tab=readme-ov-file#tips-for-hacking) under the **Kernel Override Steps** section. We have also assembled a [tutorial](tutorials/intra_kernel) that demonstrates how to use the IR-based instrumentation approach and the proton DSL approach. Video demo of the IR-based instrumentation approach can be found here:https://youtu.be/PGUw2P55ZYM?si=mBaHPud74EPAa7xt&t=1074
 
 ### Hook
 
@@ -291,6 +292,10 @@ Triton's runtime has a centralized configuration system called *knobs* that cont
 - `triton.knobs.proton.enable_nvtx` or `TRITON_ENABLE_NVTX` (default: `True`): Whether to enable NVTX ranges in Proton.
 
 - `triton.knobs.proton.cupti_lib_dir` or `TRITON_CUPTI_LIB_DIR` (default: `<triton_root>/backends/nvidia/lib/cupti`): The directory of the CUPTI library.
+
+- `triton.knobs.proton.profile_buffer_size` or `TRITON_PROFILE_BUFFER_SIZE` (default: `67108864`): The size in bytes of Proton's activity/profile buffers.
+
+- `triton.knobs.proton.profile_metric_buffer_size` or `TRITON_PROFILE_METRIC_BUFFER_SIZE` (default: `67108864`): The size in bytes of Proton's GPU metric buffer, which is used for storing flexible metrics during CUDA graph launches.
 
 ## Advanced features and knowledge
 

@@ -116,6 +116,7 @@ public:
       const std::vector<std::pair<size_t, std::string>> &scopeIdNames,
       const std::vector<std::pair<size_t, size_t>> &scopeIdParents,
       const std::string &metadataPath);
+  void destroyFunctionMetadata(uint64_t functionId);
 
   void enterInstrumentedOp(uint64_t streamId, uint64_t functionId,
                            uint8_t *buffer, size_t size);
@@ -127,8 +128,7 @@ public:
                   const std::map<std::string, MetricValueType> &scalarMetrics,
                   const std::map<std::string, TensorMetric> &tensorMetrics);
 
-  void setMetricKernels(void *tensorMetricKernel, void *scalarMetricKernel,
-                        void *stream);
+  void setMetricKernels(const MetricKernelLaunchState &metricKernelLaunchState);
 
   void setState(std::optional<Context> context);
 
@@ -146,7 +146,7 @@ private:
 
   void activateSessionImpl(size_t sessionId);
 
-  void deActivateSessionImpl(size_t sessionId, bool flushing);
+  void deactivateSessionImpl(size_t sessionId, bool flushing);
 
   size_t getSessionId(const std::string &path) { return sessionPaths[path]; }
 

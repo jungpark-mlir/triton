@@ -12,6 +12,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/MathExtras.h"
 
 // Provide custom directive handlers for declarative assemblyFormat.
 // They must be visible before including the generated op classes.
@@ -68,6 +69,16 @@ bool isConvertTrivial(ConvertLayoutOp op) {
 }
 
 } // namespace
+
+Value AsyncCopyGlobalToLocalOp::getPredicateOperand() { return getMask(); }
+
+void AsyncCopyGlobalToLocalOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+
+Type AsyncCopyGlobalToLocalOp::getPredicateOperandTypeLike() {
+  return getSrc().getType();
+}
 
 //===----------------------------------------------------------------------===//
 // Canonicalizer
@@ -345,7 +356,7 @@ struct CanonicalizeConvertFromConvert
 
     // cvt(cat) -> cat
     if (auto cat = dyn_cast<CatOp>(arg)) {
-      if (isExpensiveCat(cat, op.getType().getEncoding()))
+      if (!isLegalCatEncoding(cat, op.getType().getEncoding()))
         return failure();
 
       rewriter.replaceOpWithNewOp<CatOp>(op, op->getResult(0).getType(),
@@ -452,7 +463,6 @@ LogicalResult Fp4ToFpOp::verifyFp4ToFp(mlir::Operation *op,
   auto srcLl = toLinearLayout(srcTy);
   auto resLl = toLinearLayout(resTy);
   auto *ctx = srcTy.getContext();
-  auto regDim = StringAttr::get(ctx, "register");
   auto outDims = standardOutDimNames(ctx, rank);
 
   // We use backward inference here as it is striclty more general
@@ -480,23 +490,10 @@ LogicalResult Fp4ToFpOp::verifyFp4ToFp(mlir::Operation *op,
 void Fp4ToFpOp::build(OpBuilder &builder, OperationState &state,
                       TypedValue<RankedTensorType> src, Type elemType,
                       int32_t axis) {
-  auto srcTy = src.getType();
-  auto shape = llvm::to_vector(srcTy.getShape());
-  auto rank = srcTy.getRank();
-  assert(0 <= axis && axis < rank);
-  shape[axis] *= 2;
-
-  Attribute inEnc = srcTy.getEncoding();
-  Attribute outEnc;
-  auto result =
-      inEnc.getDialect()
-          .getRegisteredInterface<triton::DialectInferLayoutInterface>()
-          ->inferFp4ToFpOpEncoding(shape, axis, inEnc, outEnc,
-                                   /*fwdInference=*/true, state.location);
-  assert(succeeded(result));
-
-  auto resultTy = RankedTensorType::get(shape, elemType, outEnc);
-  build(builder, state, resultTy, src, axis);
+  auto resultTy =
+      inferFp4ToFpResultType(src.getType(), elemType, axis, state.location);
+  assert(succeeded(resultTy));
+  build(builder, state, *resultTy, src, axis);
 }
 
 OpFoldResult MemDescTransOp::fold(FoldAdaptor adaptor) {
@@ -654,6 +651,23 @@ OpFoldResult MemDescReinterpretOp::fold(FoldAdaptor adaptor) {
   if (getType() == getSrc().getType())
     return getSrc();
   return {};
+}
+
+LogicalResult MemDescReinterpretOp::verify() {
+  auto srcTy = getSrc().getType();
+  auto dstTy = getResult().getType();
+  auto kBlock = StringAttr::get(getContext(), "block");
+  auto getNumBroadcastCTADims = [kBlock](MemDescType ty) {
+    auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
+    auto layout =
+        toLinearLayout(ty.getAllocShape().take_back(rank), ty.getEncoding());
+    auto freeVariableMask = layout.getFreeVariableMasks().lookup(kBlock);
+    return llvm::popcount<uint32_t>(freeVariableMask);
+  };
+  if (getNumBroadcastCTADims(srcTy) != getNumBroadcastCTADims(dstTy))
+    return emitError(
+        "source and result must have the same number of broadcast CTA dims");
+  return success();
 }
 
 // LocalAllocOp
@@ -881,6 +895,9 @@ LogicalResult MemDescIndexOp::verify() {
   if (srcTy.getElementType() != dstTy.getElementType()) {
     return emitError("result element type must match desc element type");
   }
+  if (srcTy.getEncoding() != dstTy.getEncoding()) {
+    return emitError("src and result must have the same encoding");
+  }
   // memdesc_index reduces rank by 1 and preserves the trailing shape.
   bool correctRank = srcTy.getRank() == dstTy.getRank() + 1;
   if (!correctRank) {
@@ -955,6 +972,9 @@ LogicalResult MemDescSubsliceOp::verify() {
   if (srcTy.getElementType() != dstTy.getElementType()) {
     return emitError("result element type must match desc element type");
   }
+  if (srcTy.getEncoding() != dstTy.getEncoding()) {
+    return emitError("src and result must have the same encoding");
+  }
   if (getOffsets().size() != srcTy.getRank()) {
     return emitError("offsets must have the same rank as input");
   }
@@ -993,6 +1013,9 @@ LogicalResult MemDescSubsliceOp::verify() {
       if (offset & (dstTy.getDimSize(dim) - 1)) {
         return emitError("The split offset may not touch the tile");
       }
+      if (offset >= srcTy.getDimSize(dim)) {
+        return emitError("The split offset may not exceed the source shape");
+      }
     }
   }
 
@@ -1007,10 +1030,12 @@ LogicalResult MemDescSubsliceOp::verify() {
   } else {
     ll = triton::gpu::toLinearLayout(srcTy);
   }
-  // NYI: We don't support non-trivial block dimension for now.
-  auto kBlock = mlir::StringAttr::get(getContext(), "block");
-  if (ll.getInDimSize(kBlock) != 1) {
-    return emitError("non-trivial block dimension not supported");
+
+  // If any block basis is fully broadcasted, multiple CTAs can alias the same
+  // output tile region. Subslice on such layouts is unsupported.
+  auto kBlock = mlir::StringAttr::get(ctx, "block");
+  if (ll.getFreeVariableMasks()[kBlock] != 0) {
+    return emitError("We don't support splitting with broadcasted CTA outputs");
   }
 
   auto llInv = ll.invert();
@@ -1023,9 +1048,15 @@ LogicalResult MemDescSubsliceOp::verify() {
     for (int dimSize = dstTy.getDimSize(dim); dimSize < srcTy.getDimSize(dim);
          dimSize *= 2) {
       namedOffsets[dim] = {kDim, dimSize};
-      if (!llvm::isPowerOf2_32(llInv.apply(namedOffsets)[0].second)) {
+      auto offsetAndBlock = llInv.apply(namedOffsets);
+      auto offset = offsetAndBlock[0];
+      auto block = offsetAndBlock[1];
+      if (!llvm::isPowerOf2_32(offset.second) && offset.second != 0) {
         return emitError(
             "We don't support splitting along the swizzling pattern");
+      }
+      if (block.second != 0) {
+        return emitError("We don't support splitting along CTA dimensions");
       }
     }
   }
@@ -1175,7 +1206,7 @@ void WarpSpecializeOp::build(OpBuilder &builder, OperationState &state,
                              unsigned partitionNumRegions) {
   build(builder, state, resultTypes, partitionNumWarps, {}, {}, {});
   OpBuilder::InsertionGuard guard(builder);
-  Block *container = builder.createBlock(state.regions.back().get());
+  builder.createBlock(state.regions.back().get());
   WarpSpecializePartitionsOp::create(builder, state.location,
                                      /*explicitCaptures=*/ValueRange(),
                                      partitionNumRegions);
@@ -1204,7 +1235,6 @@ ParseResult WarpSpecializeOp::parse(OpAsmParser &p, OperationState &result) {
   while (succeeded(p.parseOptionalKeyword(
       ("partition" + Twine(partitionNumWarps.size()).str())))) {
     partitionArgs.clear();
-    SMLoc regionLoc = p.getCurrentLocation();
     if (p.parseArgumentList(partitionArgs, AsmParser::Delimiter::Paren,
                             /*allowType=*/true) ||
         p.parseKeyword("num_warps") || p.parseLParen() ||
@@ -1335,10 +1365,10 @@ LogicalResult WarpYieldOp::verify() {
 
 // Get the size of a scalar type when stored in shared memory.
 // TODO: Generalize this as needed.
-static size_t getSharedMemorySize(Type type) {
+size_t getSharedMemorySize(Type type) {
   if (isa<IntegerType, FloatType>(type))
     return llvm::divideCeil(type.getIntOrFloatBitWidth(), 8);
-  if (isa<PointerType, TensorDescType>(type))
+  if (isa<PointerType, TensorDescInterface>(type))
     return 8;
   if (auto desc = dyn_cast<MemDescType>(type)) {
     if (!isa<SharedMemorySpaceAttr>(desc.getMemorySpace()))
@@ -1350,14 +1380,18 @@ static size_t getSharedMemorySize(Type type) {
       mlir::debugString(type));
 }
 
-std::pair<uint64_t, uint64_t> WarpSpecializeOp::getCaptureSizeAlign() {
+uint64_t WarpSpecializeOp::getCaptureSize() {
   uint64_t captureSize = 0;
   // Tightly pack the captures in memory.
   for (Type type : getPartitionOp().getOperandTypes()) {
     captureSize += getSharedMemorySize(type);
   }
+  return captureSize;
+}
+
+uint64_t WarpSpecializeOp::getCaptureAlign() {
   // Align the captures to 8 bytes.
-  return {captureSize, 8};
+  return 8;
 }
 
 unsigned WarpSpecializeOp::getTotalPartitionWarps() {

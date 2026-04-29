@@ -1,5 +1,5 @@
-// RUN: triton-opt %s -split-input-file -convert-warp-pipeline="arch=gfx1250" | FileCheck %s --check-prefixes CHECK,WAVE32
-// RUN: triton-opt %s -split-input-file -convert-warp-pipeline="arch=gfx950" | FileCheck %s --check-prefixes CHECK,WAVE64
+// RUN: triton-opt %s -split-input-file -convert-warp-pipeline="gfx-arch=gfx1250" | FileCheck %s --check-prefixes CHECK,WAVE32
+// RUN: triton-opt %s -split-input-file -convert-warp-pipeline="gfx-arch=gfx950" | FileCheck %s --check-prefixes CHECK,WAVE64
 
 // ---- 2-stage pipeline (basic) ----
 //
@@ -401,5 +401,47 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK-LABEL: tt.func @no_priority_no_setprio
 // CHECK: scf.for
 // CHECK-NOT: rocdl.s.setprio
+// CHECK: amdg.cond_barrier
+// CHECK: tt.return
+
+// -----
+
+// ---- amdg.async_wait recognized as a valid barrier between stages ----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @async_wait_between_stages(%n: index, %ptr: !tt.ptr<f32>) {
+    %c0  = arith.constant 0 : index
+    %c1  = arith.constant 1 : index
+    %v0  = arith.constant 0.0 : f32
+    %v1  = arith.constant 1.0 : f32
+
+    scf.for %i = %c0 to %n step %c1 {
+      scf.execute_region {
+        tt.store %ptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "stage1"}
+
+      // amdg.async_wait sits between stages and must be recognized as a barrier.
+      amdg.async_wait {num_inst = 0 : i32}
+
+      scf.execute_region {
+        tt.store %ptr, %v1 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "stage2"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    tt.return
+  }
+}
+
+// The pass should succeed (not bail out) and produce barriers.
+// CHECK-LABEL: tt.func @async_wait_between_stages
+// CHECK: ttg.barrier local
+// CHECK: amdg.cond_barrier
+// CHECK: scf.for
+// CHECK-NOT: scf.execute_region
+// CHECK: rocdl.sched.barrier
 // CHECK: amdg.cond_barrier
 // CHECK: tt.return

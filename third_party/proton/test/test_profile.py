@@ -115,6 +115,15 @@ def test_cudagraph(tmp_path: pathlib.Path, device: str):
         g.replay()
 
     g.reset()
+
+    with torch.cuda.graph(g):  # this will create new graphexecs
+        for i in range(10):
+            with proton.scope(f"new_iter_{i}"):
+                fn()
+
+    with proton.scope("test2"):
+        g.replay()
+
     proton.finalize()
 
     with temp_file.open() as f:
@@ -125,28 +134,91 @@ def test_cudagraph(tmp_path: pathlib.Path, device: str):
     # find the test frame
     test0_frame = None
     test1_frame = None
+    test2_frame = None
     for child in data[0]["children"]:
         if child["frame"]["name"] == "test0":
             test0_frame = child
         if child["frame"]["name"] == "test1":
             test1_frame = child
+        if child["frame"]["name"] == "test2":
+            test2_frame = child
     assert test0_frame is not None
     assert test1_frame is not None
+    assert test2_frame is not None
     # {torch.ones, add, foo}
     if is_hip():
         assert len(test0_frame["children"]) >= 2
         assert test0_frame["children"][0]["metrics"]["time (ns)"] > 0
     else:
         # cuda backend supports "<captured_at>" annotation
-        for test_frame in [test0_frame, test1_frame]:
+        for test_frame in [test0_frame, test1_frame, test2_frame]:
             child = test_frame["children"][0]
             assert child["frame"]["name"] == "<captured_at>"
-            # 0...9 iterations
-            assert len(child["children"]) == 10
             # check all iterations
-            for i in range(10):
-                assert child["children"][i]["frame"]["name"] == f"iter_{i}"
-                assert child["children"][i]["children"][0]["metrics"]["time (ns)"] > 0
+            total_iters = 0
+            for child in child["children"]:
+                iter_frame = "iter" if test_frame != test2_frame else "new_iter"
+                if iter_frame in child["frame"]["name"]:  # TODO(Keren): remove empty frames
+                    if "time (ns)" in child["children"][0]["metrics"]:
+                        total_iters += 1
+            # 0...9 iterations
+            assert total_iters == 10
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph replay")
+def test_cudagraph_not_captured_by_profiler(tmp_path: pathlib.Path, capfd, device: str):
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    @triton.jit
+    def foo(x, y, z):
+        tl.store(z, tl.load(y) + tl.load(x))
+
+    def fn():
+        a = torch.ones((2, 2), device=device)
+        b = torch.ones((2, 2), device=device)
+        c = a + b
+        foo[(1, )](a, b, c)
+
+    # Build/capture graph before profiler starts.
+    fn()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+
+    temp_file = tmp_path / "test_cudagraph_not_captured_by_profiler.hatchet"
+    proton.start(str(temp_file.with_suffix("")), context="shadow")
+    with proton.scope("replay0"):
+        g.replay()
+    with proton.scope("replay1"):
+        g.replay()
+    proton.finalize()
+
+    captured = capfd.readouterr()
+    assert captured.err.count("Cannot find graph for graphExecId:") == 1
+    assert "start profiling before the graph is created" in captured.err
+
+    with temp_file.open() as f:
+        data = json.load(f)
+    replay0_frame = None
+    replay1_frame = None
+    for child in data[0]["children"]:
+        if child["frame"]["name"] == "replay0":
+            replay0_frame = child
+        elif child["frame"]["name"] == "replay1":
+            replay1_frame = child
+    assert replay0_frame is not None
+    assert replay1_frame is not None
+    assert len(replay0_frame["children"]) == 3
+    assert len(replay1_frame["children"]) == 3
+
+    def has_positive_time_metric(node):
+        if node["metrics"].get("time (ns)", 0) > 0:
+            return True
+        return any(has_positive_time_metric(child) for child in node["children"])
+
+    assert has_positive_time_metric(replay0_frame)
+    assert has_positive_time_metric(replay1_frame)
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph deactivation")
@@ -212,6 +284,69 @@ def test_cudagraph_deactivate(tmp_path, device: str):
     assert scope_a_frame is not None
     assert scope_b_frame is None
     assert scope_c_frame is not None
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph replay")
+@pytest.mark.parametrize("data_format", ["hatchet", "hatchet_msgpack"])
+def test_cudagraph_filters_unlinked_virtual_scopes(tmp_path: pathlib.Path, data_format: str, device: str):
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    @triton.jit
+    def foo(x, y, z):
+        tl.store(z, tl.load(y) + tl.load(x))
+
+    a = torch.ones((2, 2), device=device)
+    b = torch.ones((2, 2), device=device)
+    c = torch.empty_like(a)
+
+    temp_file = tmp_path / f"test_cudagraph_filters_unlinked_virtual_scopes.{data_format}"
+    proton.start(str(temp_file.with_suffix("")), context="shadow")
+
+    # Warmup to avoid one-time setup effects in replay output.
+    foo[(1, )](a, b, c)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        with proton.scope("iter_with_kernel"):
+            foo[(1, )](a, b, c)
+        with proton.scope("iter_without_kernel"):
+            pass
+
+    with proton.scope("replay"):
+        g.replay()
+
+    proton.finalize(output_format=data_format)
+
+    if data_format == "hatchet_msgpack":
+        import msgpack
+
+        with temp_file.open("rb") as f:
+            data = msgpack.load(f, raw=False, strict_map_key=False)
+    else:
+        with temp_file.open() as f:
+            data = json.load(f)
+
+    replay_frame = next(
+        (child for child in data[0]["children"] if child["frame"]["name"] == "replay"),
+        None,
+    )
+    assert replay_frame is not None
+    capture_frame = replay_frame["children"][0]
+    assert capture_frame["frame"]["name"] == "<captured_at>"
+
+    capture_children = capture_frame["children"]
+    capture_child_names = {child["frame"]["name"] for child in capture_children}
+    assert "iter_with_kernel" in capture_child_names
+    assert "iter_without_kernel" not in capture_child_names
+
+    iter_with_kernel_frame = next(
+        (child for child in capture_children if child["frame"]["name"] == "iter_with_kernel"),
+        None,
+    )
+    assert iter_with_kernel_frame is not None
+    assert len(iter_with_kernel_frame["children"]) > 0
+    assert iter_with_kernel_frame["children"][0]["metrics"]["time (ns)"] > 0
 
 
 def test_metrics(tmp_path: pathlib.Path, device: str):
@@ -682,6 +817,113 @@ def test_multiple_sessions(tmp_path: pathlib.Path, device: str):
     assert scope0_count + scope1_count == 3
 
 
+@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports metrics profiling in cudagraphs")
+def test_multiple_sessions_cudagraph_metric_kernels(tmp_path: pathlib.Path, device: str):
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    foo_iters = 3
+    bar_iters = 2
+
+    def foo_metadata_fn(grid: tuple, metadata: NamedTuple, args: dict):
+        x = args["x"]
+        # Tensor custom metric in graph capture mode launches metric kernels.
+        return {"name": "foo_with_metric", "sum_metric": x.sum()}
+
+    def bar_metadata_fn(grid: tuple, metadata: NamedTuple, args: dict):
+        # Name-only metadata (no custom metric).
+        return {"name": "bar_without_metric"}
+
+    @triton.jit(launch_metadata=foo_metadata_fn)
+    def foo(x, y, z):
+        tl.store(z, tl.load(y) + tl.load(x))
+
+    @triton.jit(launch_metadata=bar_metadata_fn)
+    def bar(x, y, z):
+        tl.store(z, tl.load(y) - tl.load(x))
+
+    x = torch.ones((2, 2), device=device)
+    y = torch.ones((2, 2), device=device)
+    z = torch.empty_like(x)
+
+    # Compile kernels before profiling starts to reduce unrelated profile noise.
+    foo[(1, )](x, y, z)
+    bar[(1, )](x, y, z)
+
+    temp_file0 = tmp_path / "test_multiple_sessions_cudagraph_metric_kernels0.hatchet"
+    temp_file1 = tmp_path / "test_multiple_sessions_cudagraph_metric_kernels1.hatchet"
+    session_id0 = proton.start(str(temp_file0.with_suffix("")), context="shadow", hook="triton")
+    session_id1 = proton.start(str(temp_file1.with_suffix("")), context="shadow", hook="triton")
+
+    proton.deactivate(session_id1)
+
+    graph_foo = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph_foo):
+        for _ in range(foo_iters):
+            foo[(1, )](x, y, z)
+    with proton.scope("session0_replay"):
+        graph_foo.replay()
+
+    proton.deactivate(session_id0)
+    proton.activate(session_id1)
+
+    graph_bar = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph_bar):
+        for _ in range(bar_iters):
+            bar[(1, )](x, y, z)
+    with proton.scope("session1_replay"):
+        graph_bar.replay()
+
+    proton.finalize(session_id0)
+    proton.finalize(session_id1)
+
+    def get_frame_by_name(node, name: str):
+        queue = [node]
+        while queue:
+            cur = queue.pop(0)
+            if cur["frame"]["name"] == name:
+                return cur
+            queue.extend(cur["children"])
+        return None
+
+    def get_all_names(node):
+        names = set()
+        queue = [node]
+        while queue:
+            cur = queue.pop(0)
+            names.add(cur["frame"]["name"])
+            queue.extend(cur["children"])
+        return names
+
+    with temp_file0.open() as f:
+        data0 = json.load(f)
+    with temp_file1.open() as f:
+        data1 = json.load(f)
+
+    session0_replay_frame = get_frame_by_name(data0[0], "session0_replay")
+    session1_replay_frame = get_frame_by_name(data1[0], "session1_replay")
+    assert session0_replay_frame is not None
+    assert session1_replay_frame is not None
+
+    capture0 = session0_replay_frame["children"][0]
+    capture1 = session1_replay_frame["children"][0]
+
+    foo_frame0 = get_frame_by_name(capture0, "foo_with_metric")
+    bar_frame0 = get_frame_by_name(capture0, "bar_without_metric")
+    foo_frame1 = get_frame_by_name(capture1, "foo_with_metric")
+    bar_frame1 = get_frame_by_name(capture1, "bar_without_metric")
+
+    assert foo_frame0 is not None
+    assert bar_frame0 is None
+    assert foo_frame1 is None
+    assert bar_frame1 is not None
+
+    assert foo_frame0["metrics"]["sum_metric"] == float(foo_iters * x.numel())
+    assert int(foo_frame0["metrics"]["count"]) == foo_iters
+    assert "sum_metric" not in bar_frame1["metrics"]
+    assert int(bar_frame1["metrics"]["count"]) == bar_iters
+
+
 def test_trace(tmp_path: pathlib.Path, device: str):
     temp_file = tmp_path / "test_trace.chrome_trace"
     proton.start(str(temp_file.with_suffix("")), data="trace")
@@ -703,9 +945,243 @@ def test_trace(tmp_path: pathlib.Path, device: str):
     with temp_file.open() as f:
         data = json.load(f)
         trace_events = data["traceEvents"]
-        assert len(trace_events) == 3
         assert trace_events[-1]["name"] == "foo"
         assert trace_events[-1]["args"]["call_stack"] == ["ROOT", "test", "foo"]
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports metrics profiling in cudagraphs")
+def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str):
+
+    @triton.jit
+    def foo(x, y, size: tl.constexpr):
+        offs = tl.arange(0, size)
+        tl.store(y + offs, tl.load(x + offs))
+
+    x = torch.ones((1024, ), device=device, dtype=torch.float32)
+    y = torch.zeros_like(x)
+    temp_file = tmp_path / "test_trace_flexible_metrics_scope_ranges.chrome_trace"
+    proton.start(str(temp_file.with_suffix("")), data="trace")
+
+    with proton.scope("scope_3", metrics={"m3": 3.0}):
+        with proton.scope("scope_2", metrics={"m2": 2.0}):
+            with proton.scope("scope_1", metrics={"m1": 1.0}):
+                foo[(1, )](x, y, x.size()[0], num_warps=4)
+            with proton.scope("scope_4"):
+                foo[(1, )](x, y, x.size()[0], num_warps=4)
+            with proton.scope("scope_5"):
+                foo[(1, )](x, y, x.size()[0], num_warps=4)
+        with proton.scope("scope_6"):
+            with proton.scope("scope_7"):
+                foo[(1, )](x, y, x.size()[0], num_warps=4)
+
+    proton.finalize()
+    with temp_file.open() as f:
+        trace_events = json.load(f)["traceEvents"]
+    kernel_events = [event for event in trace_events if event.get("cat") == "kernel" and event["name"] == "foo"]
+    metric_events = [event for event in trace_events if event.get("cat") == "metric"]
+    scope_events = [event for event in trace_events if event.get("cat") == "scope"]
+    flow_events = [event for event in trace_events if event.get("cat") == "flow"]
+
+    assert (len(kernel_events), len(metric_events), len(scope_events), len(flow_events)) == (4, 3, 4, 8)
+
+    assert {tuple(event["args"]["call_stack"])
+            for event in kernel_events} == {
+                ("ROOT", "scope_3", "scope_2", "scope_1", "foo"),
+                ("ROOT", "scope_3", "scope_2", "scope_4", "foo"),
+                ("ROOT", "scope_3", "scope_2", "scope_5", "foo"),
+                ("ROOT", "scope_3", "scope_6", "scope_7", "foo"),
+            }
+
+    metric_by_name = {next(iter(event["args"]["metrics"])): event for event in metric_events}
+    assert {
+        name: (event["name"], tuple(event["args"]["call_stack"]), event["args"]["metrics"])
+        for name, event in metric_by_name.items()
+    } == {
+        "m1": ("scope_1: <m1, 1.000000>", ("ROOT", "scope_3", "scope_2", "scope_1"), {"m1": "1.000000"}),
+        "m2": ("scope_2: <m2, 2.000000>", ("ROOT", "scope_3", "scope_2"), {"m2": "2.000000"}),
+        "m3": ("scope_3: <m3, 3.000000>", ("ROOT", "scope_3"), {"m3": "3.000000"}),
+    }
+
+    assert {tuple(event["args"]["call_stack"])
+            for event in scope_events} == {
+                ("ROOT", "scope_3", "scope_2", "scope_4"),
+                ("ROOT", "scope_3", "scope_2", "scope_5"),
+                ("ROOT", "scope_3", "scope_6"),
+                ("ROOT", "scope_3", "scope_6", "scope_7"),
+            }
+
+    gpu_tid = kernel_events[0]["tid"]
+    cpu_tid = metric_by_name["m1"]["tid"]
+    flow_starts = {event["id"]: event for event in flow_events if event["ph"] == "s"}
+    flow_finishes = {event["id"]: event for event in flow_events if event["ph"] == "f"}
+    assert set(flow_starts) == set(flow_finishes)
+    assert len(flow_starts) == 4
+    assert all(event["name"] == "launch->kernel" and event["bp"] == "e" and event["tid"] == cpu_tid
+               for event in flow_starts.values())
+    assert all(event["name"] == "launch->kernel" and event["bp"] == "e" and event["tid"] == gpu_tid
+               for event in flow_finishes.values())
+
+
+def test_trace_flexible_metrics_no_kernel_anchor(tmp_path: pathlib.Path):
+    temp_file = tmp_path / "test_trace_flexible_metrics_no_kernel_anchor.chrome_trace"
+    proton.start(str(temp_file.with_suffix("")), data="trace")
+
+    with proton.scope("metric_only", metrics={"foo": 1.0}):
+        pass
+
+    proton.finalize()
+    with temp_file.open() as f:
+        trace_events = json.load(f)["traceEvents"]
+    assert len(trace_events) == 1
+    assert (
+        trace_events[0]["cat"],
+        trace_events[0]["name"],
+        trace_events[0]["args"]["call_stack"],
+        trace_events[0]["args"]["metrics"],
+    ) == ("metric", "metric_only: <foo, 1.000000>", ["ROOT", "metric_only"], {"foo": "1.000000"})
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph trace reconstruction")
+def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str):
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    @triton.jit
+    def foo(x, y, size: tl.constexpr):
+        offs = tl.arange(0, size)
+        tl.store(y + offs, tl.load(x + offs))
+
+    x = torch.ones((128, ), device=device, dtype=torch.float32)
+    y = torch.zeros_like(x)
+    metric_tensor = torch.tensor(1.0, device=device)
+
+    foo[(1, )](x, y, x.numel(), num_warps=4)
+    torch.cuda.synchronize(torch.device(device))
+
+    def fn():
+        with proton.scope("a"):
+            with proton.scope("b"):
+                with proton.scope("c", metrics={"m1": metric_tensor}):
+                    foo[(1, )](x, y, x.numel(), num_warps=4)
+                foo[(1, )](x, y, x.numel(), num_warps=4)
+            foo[(1, )](x, y, x.numel(), num_warps=4)
+
+    temp_file = tmp_path / "test_trace_cudagraph_graph_scope_ranges.chrome_trace"
+    proton.start(str(temp_file.with_suffix("")), data="trace", context="shadow")
+
+    # warmup
+    fn()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+
+    with proton.scope("test0"):
+        g.replay()
+
+    proton.finalize()
+    with temp_file.open() as f:
+        trace_events = json.load(f)["traceEvents"]
+
+    thread_name_events = [
+        event for event in trace_events if event.get("ph") == "M" and event.get("name") == "thread_name"
+    ]
+    graph_tids = [event["tid"] for event in thread_name_events if event["args"]["name"].startswith("Graph: Stream ")]
+    assert len(graph_tids) == 1
+    graph_tid = graph_tids[0]
+
+    graph_scope_events = [event for event in trace_events if event.get("cat") == "scope" and event["tid"] == graph_tid]
+    assert {"<captured_at>", "a", "b", "c"}.issubset({event["name"] for event in graph_scope_events})
+    assert not any(event.get("cat") == "metric" and event["tid"] == graph_tid for event in trace_events)
+
+    replay_kernel_events = [
+        event for event in trace_events
+        if event.get("cat") == "kernel" and event.get("args", {}).get("call_stack", [])[:2] == ["ROOT", "test0"]
+    ]
+    foo_events = [event for event in replay_kernel_events if event["name"] == "foo"]
+    metric_kernel_events = [event for event in replay_kernel_events if event["name"] == "<metric>"]
+    metadata_kernel_events = [
+        event for event in replay_kernel_events
+        if COMPUTE_METADATA_SCOPE_NAME in event.get("args", {}).get("call_stack", [])
+    ]
+
+    assert len(foo_events) == 3
+    assert {tuple(event["args"]["call_stack"])
+            for event in foo_events} == {
+                ("ROOT", "test0", "<captured_at>", "a", "b", "c", "foo"),
+                ("ROOT", "test0", "<captured_at>", "a", "b", "foo"),
+                ("ROOT", "test0", "<captured_at>", "a", "foo"),
+            }
+    assert len(metric_kernel_events) == 1
+    assert metric_kernel_events[0]["args"]["call_stack"] == [
+        "ROOT", "test0", "<captured_at>", "a", "b", "c", "<metric>"
+    ]
+    assert all(event["name"] not in {"foo", "<metric>"} for event in metadata_kernel_events)
+
+    test0_scope = next(
+        event for event in trace_events
+        if event.get("cat") == "scope" and event.get("args", {}).get("call_stack", []) == ["ROOT", "test0"])
+    replay_gpu_tid = foo_events[0]["tid"]
+    first_replay_kernel = min(replay_kernel_events, key=lambda event: event["ts"])
+    flow_finish = next(event for event in trace_events
+                       if event.get("cat") == "flow" and event["ph"] == "f" and event["name"] == "launch->kernel"
+                       and event["tid"] == replay_gpu_tid and event["ts"] == first_replay_kernel["ts"])
+    flow_start = next(event for event in trace_events
+                      if event.get("cat") == "flow" and event["ph"] == "s" and event["id"] == flow_finish["id"])
+    assert flow_start["tid"] == test0_scope["tid"]
+    assert test0_scope["ts"] == flow_start["ts"] <= flow_finish["ts"]
+
+
+@pytest.mark.parametrize("profile_kind,suffix", [("tree", ".hatchet"), ("trace", ".chrome_trace")],
+                         ids=["tree", "trace"])
+def test_multi_stream(profile_kind: str, suffix: str, tmp_path: pathlib.Path, device: str):
+
+    @triton.jit
+    def foo(x, y, size: tl.constexpr):
+        offs = tl.arange(0, size)
+        tl.store(y + offs, tl.load(x + offs))
+
+    temp_file = tmp_path / f"test_multi_stream{suffix}"
+    device_obj = torch.device(device)
+    x = torch.ones((1024, ), device=device_obj, dtype=torch.float32)
+    outputs = [torch.zeros_like(x) for _ in range(2)]
+    streams = [torch.cuda.Stream(device=device_obj) for _ in range(2)]
+    scope_names = [f"stream_scope_{idx}" for idx in range(len(streams))]
+
+    foo[(1, )](x, outputs[0], x.numel(), num_warps=4)
+    torch.cuda.synchronize(device_obj)
+
+    start_kwargs = {"data": "trace"} if profile_kind == "trace" else {}
+    proton.start(str(temp_file.with_suffix("")), **start_kwargs)
+
+    for scope_name, stream, output in zip(scope_names, streams, outputs):
+        with torch.cuda.stream(stream):
+            with proton.scope(scope_name):
+                foo[(1, )](x, output, x.numel(), num_warps=4)
+
+    for stream in streams:
+        stream.synchronize()
+    proton.finalize()
+
+    with temp_file.open() as f:
+        data = json.load(f)
+
+    if profile_kind == "trace":
+        assert "traceEvents" in data
+        kernel_events = [event for event in data["traceEvents"] if event["name"] == "foo"]
+        assert len(kernel_events) == len(scope_names)
+        assert len({event["tid"] for event in kernel_events}) == len(scope_names)
+        for scope_name in scope_names:
+            matching_events = [event for event in kernel_events if scope_name in event["args"]["call_stack"]]
+            assert len(matching_events) == 1
+    else:
+        root = data[0]
+        scope_0 = next(child for child in root["children"] if child["frame"]["name"] == "stream_scope_0")
+        scope_1 = next(child for child in root["children"] if child["frame"]["name"] == "stream_scope_1")
+        assert len(scope_0["children"]) > 0
+        assert len(scope_1["children"]) > 0
+        assert scope_0["children"][0]["metrics"]["time (ns)"] > 0
+        assert scope_1["children"][0]["metrics"]["time (ns)"] > 0
 
 
 def test_scope_multiple_threads(tmp_path: pathlib.Path, device: str):
@@ -1079,8 +1555,8 @@ def test_periodic_flushing(tmp_path, fresh_knobs, data_format, buffer_size, devi
     temp_file = tmp_path / f"test_periodic_flushing.{data_format}"
     session = proton.start(str(temp_file.with_suffix("")), mode=f"periodic_flushing:format={data_format}")
 
-    for i in range(10000):
-        if i != 0 and i % 1000 == 0:
+    for i in range(5000):
+        if i != 0 and i % 500 == 0:
             proton.data.advance_phase(session=session)
         with proton.scope(f"test_{i}", metrics={"count": 1}):
             torch.zeros((100), device=device)
@@ -1100,12 +1576,12 @@ def test_periodic_flushing(tmp_path, fresh_knobs, data_format, buffer_size, devi
         else:
             with open(hatchet_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        assert len(data[0]["children"]) == 1000
+        assert len(data[0]["children"]) == 500
         assert data[0]["children"][0]["metrics"]["count"] == 1
         assert data[0]["children"][0]["frame"]["name"].startswith("test_")
         assert data[0]["children"][0]["children"][0]["metrics"]["time (ns)"] > 0
         num_scopes += len(data[0]["children"])
-    assert num_scopes == 10000
+    assert num_scopes == 5000
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports metrics profiling in cudagraphs")
@@ -1135,14 +1611,20 @@ def test_periodic_flushing_cudagraph(tmp_path, fresh_knobs, data_format, buffer_
     # warmup
     fn()
 
+    # Recycle GPU memory before graph capture to reduce memory pressure
+    # when running with parallel test workers (-n 8).
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
     # no kernels
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         fn()
 
+    test_iterations = 500
     with proton.scope("test0"):
-        for i in range(10000):
-            if i != 0 and i % 1000 == 0:
+        for i in range(test_iterations):
+            if i != 0 and i % (test_iterations // 10) == 0:
                 proton.data.advance_phase(session=session)
             g.replay()
 
@@ -1175,9 +1657,9 @@ def test_periodic_flushing_cudagraph(tmp_path, fresh_knobs, data_format, buffer_
                 foo_test_frame = child
         assert scope_a_frame is not None
         assert foo_test_frame is not None
-        assert scope_a_frame["metrics"]["bytes"] == 16000
-        assert foo_test_frame["metrics"]["bytes"] == 16000
-        assert foo_test_frame["metrics"]["flops"] == 4000
+        assert scope_a_frame["metrics"]["bytes"] == test_iterations / 10 * 16
+        assert foo_test_frame["metrics"]["bytes"] == test_iterations / 10 * 16
+        assert foo_test_frame["metrics"]["flops"] == test_iterations / 10 * 4
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="HW trace is only supported on Blackwell GPUs")

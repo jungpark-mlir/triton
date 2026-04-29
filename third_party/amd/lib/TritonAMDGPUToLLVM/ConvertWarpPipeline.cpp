@@ -178,7 +178,7 @@ private:
         clusterBlocks.push_back(&exeOp->getRegion(0).front());
         bars.push_back(false);
       } else if (isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::AsyncWaitOp,
-                     triton::amdgpu::AsyncTDMWait,
+                     triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait,
                      triton::amdgpu::AsyncTDMIntrinsicWait>(op)) {
         int currCluster = clusterBlocks.size();
         // Reject if multiple barriers appear without an intervening cluster.
@@ -190,7 +190,6 @@ private:
         if (existingBarrierMap.find(currCluster) != existingBarrierMap.end())
           return failure();
         existingBarrierMap[currCluster] = &op;
-        bars.push_back(false);
       } else if (auto yieldOp = dyn_cast<scf::YieldOp>(op)) {
         terminatorOp = &op;
       } else { // Fail conversion if any other op found outside of the cluster.
@@ -351,21 +350,21 @@ struct ConvertWarpPipeline
     : public mlir::triton::impl::ConvertWarpPipelineBase<ConvertWarpPipeline> {
 
 public:
-  ConvertWarpPipeline(StringRef arch)
+  ConvertWarpPipeline(StringRef gfxArch)
       : ConvertWarpPipelineBase<ConvertWarpPipeline>() {
-    this->arch = arch.str();
+    this->gfxArch = gfxArch.str();
   }
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
-    mlir::triton::AMD::TargetInfo targetInfo(arch.getValue());
+    mlir::triton::AMD::TargetInfo targetInfo(gfxArch.getValue());
     size_t partitionSize = targetInfo.getSharedMemoryPartitionSize();
     ModuleAllocation moduleAllocation(
         m, triton::defaultAllocationAnalysisScratchSizeFn, partitionSize);
 
     if (targetInfo.getISAFamily() == mlir::triton::AMD::ISAFamily::Unknown) {
-      m.emitError("unsupported target: '") << arch.getValue() << "'";
+      m.emitError("unsupported target: '") << gfxArch.getValue() << "'";
       return signalPassFailure();
     }
     // Thread count of one warp-pipeline group.
@@ -391,7 +390,7 @@ public:
 
 namespace mlir::triton::AMD {
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertWarpPipelinePass(StringRef arch) {
-  return std::make_unique<ConvertWarpPipeline>(arch);
+createConvertWarpPipelinePass(StringRef gfxArch) {
+  return std::make_unique<ConvertWarpPipeline>(gfxArch);
 }
 } // namespace mlir::triton::AMD

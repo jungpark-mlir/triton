@@ -89,6 +89,7 @@ def TTG_AsyncCommitGroupOp : TTG_Op<"async_commit_group"> {
 
 def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
   AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   OptionalTypesMatchWith<"infer mask type from src type",
                  "src", "mask", "getI1SameShape($_self)">,
   OptionalTypesMatchWith<"infer other type from src type",
@@ -350,6 +351,7 @@ def TTG_MemDescReinterpretOp : TTG_Op<"memdesc_reinterpret", [Pure, MemDescViewT
   }];
 
   let hasFolder = 1;
+  let hasVerifier = 1;
 }
 
 def TTG_LocalLoadOp : TTG_Op<"local_load", [LocalLoadTrait]> {
@@ -525,17 +527,30 @@ def TTG_GlobalScratchAllocOp : TTG_Op<"global_scratch_alloc"> {
   let summary = "allocate a global memory buffer";
   let description = [{
     This operation allocates a buffer in global memory that is private to the current program.
-    The `backend` attribute specifies the backend to use for allocation.
-    The `default` backend is used by TritonGPU passes.
-    Downstream Triton tools and compilers can register a different backend and use a different allocation policy.
+    A custom third-party allocation can be marked using the optional
+    `third_party_allocation` unit attribute.
+    Concurrency sanitizer allocations that hold cluster-wide state can be marked
+    using the optional `shared_cluster_state` unit attribute.
   }];
   let arguments = (
     ins
     I32Attr:$nbytes,
     I32Attr:$alignment,
-    DefaultValuedAttr<StrAttr, "\"default\"">:$backend
+    OptionalAttr<UnitAttr>:$third_party_allocation,
+    OptionalAttr<UnitAttr>:$shared_cluster_state
   );
   let results = (outs Arg<TT_Ptr, "", [MemAlloc<GlobalMemory>]>:$result);
+
+  let extraClassDeclaration = [{
+    static GlobalScratchAllocOp create(::mlir::OpBuilder &builder,
+                                       ::mlir::Location location,
+                                       ::mlir::Type result, uint32_t nbytes,
+                                       uint32_t alignment,
+                                       ::mlir::UnitAttr third_party_allocation) {
+      return create(builder, location, result, nbytes, alignment,
+                    third_party_allocation, ::mlir::UnitAttr());
+    }
+  }];
 
   let assemblyFormat = [{attr-dict `:` qualified(type($result))}];
 }
@@ -594,8 +609,10 @@ def TTG_WarpSpecializeOp : TTG_Op<"warp_specialize", [
     RegionRange getPartitionRegions();
     WarpSpecializePartitionsOp getPartitionOp();
 
-    // Get the size and alignment of the capture list.
-    std::pair<uint64_t, uint64_t> getCaptureSizeAlign();
+    // Get the size of the capture list.
+    uint64_t getCaptureSize();
+    // Get the alignment of the capture list.
+    uint64_t getCaptureAlign();
     // Get the total number of extra warps required.
     unsigned getTotalPartitionWarps();
   }];

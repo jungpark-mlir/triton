@@ -1031,7 +1031,6 @@ void Pingponger::getDotPingponged() {
     auto scaledDotType = scaledDotOps[0].getType();
     auto scaledDotShape = scaledDotType.getShape();
     auto aType = scaledDotOps[0].getA().getType();
-    auto aShape = aType.getShape();
     auto elemWidth = aType.getElementTypeBitWidth();
 
     // MxN = 256x256
@@ -1070,7 +1069,12 @@ void Pingponger::getDotPingponged() {
   auto encoding = cast<RankedTensorType>(aType).getEncoding();
   auto srcEncoding = cast<ttg::DotOperandEncodingAttr>(encoding);
   kWidth = srcEncoding.getKWidth();
-  auto mfmaEncoding = cast<ttg::AMDMfmaEncodingAttr>(srcEncoding.getParent());
+  auto mfmaEncoding =
+      dyn_cast<ttg::AMDMfmaEncodingAttr>(srcEncoding.getParent());
+  if (!mfmaEncoding) {
+    LDBG("Encountered non-MFMA layout");
+    return;
+  }
   SmallVector<int64_t> intShape;
   auto mnkDim = mfmaEncoding.getInstrShape();
   intShape.push_back(mnkDim[0]);

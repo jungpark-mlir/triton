@@ -169,6 +169,13 @@ void InstrumentationProfiler::initFunctionMetadata(
   functionMetadata.emplace(functionId, InstrumentationMetadata(metadataPath));
 }
 
+void InstrumentationProfiler::destroyFunctionMetadata(uint64_t functionId) {
+  functionScopeIdNames.erase(functionId);
+  functionScopeIdContexts.erase(functionId);
+  functionNames.erase(functionId);
+  functionMetadata.erase(functionId);
+}
+
 void InstrumentationProfiler::enterInstrumentedOp(uint64_t streamId,
                                                   uint64_t functionId,
                                                   uint8_t *buffer,
@@ -255,7 +262,7 @@ void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
   exitOp(Scope(functionName));
 }
 
-void InstrumentationProfiler::doAddMetrics(
+void InstrumentationProfiler::addMetrics(
     size_t scopeId, const std::map<std::string, MetricValueType> &scalarMetrics,
     const std::map<std::string, TensorMetric> &tensorMetrics) {
   if (dataToEntryMap.empty()) {

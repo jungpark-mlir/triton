@@ -230,31 +230,34 @@ static const char *hipLibSearchPaths[] = {"/*py_libhip_search_path*/"};
 // |FOR_EACH_ERR_FN| is a macro to process APIs that return hipError_t;
 // |FOR_EACH_STR_FN| is a macro to process APIs that return const char *.
 #define HIP_SYMBOL_LIST(FOR_EACH_ERR_FN, FOR_EACH_STR_FN)                      \
-  FOR_EACH_STR_FN(hipGetLastError)                                             \
-  FOR_EACH_STR_FN(hipGetErrorString, hipError_t hipError)                      \
-  FOR_EACH_ERR_FN(hipGetDeviceProperties, hipDeviceProp_t *prop, int deviceId) \
-  FOR_EACH_ERR_FN(hipModuleLoadDataEx, hipModule_t *module, const void *image, \
-                  unsigned int numOptions, hipJitOption *options,              \
-                  void **optionValues)                                         \
-  FOR_EACH_ERR_FN(hipModuleGetFunction, hipFunction_t *function,               \
+  FOR_EACH_STR_FN(hipGetLastError, true)                                       \
+  FOR_EACH_STR_FN(hipGetErrorString, true, hipError_t hipError)                \
+  FOR_EACH_ERR_FN(hipGetDeviceProperties, true, hipDeviceProp_t *prop,         \
+                  int deviceId)                                                \
+  FOR_EACH_ERR_FN(hipModuleLoadDataEx, true, hipModule_t *module,              \
+                  const void *image, unsigned int numOptions,                  \
+                  hipJitOption *options, void **optionValues)                  \
+  FOR_EACH_ERR_FN(hipModuleUnload, true, hipModule_t module)                   \
+  FOR_EACH_ERR_FN(hipModuleGetFunction, true, hipFunction_t *function,         \
                   hipModule_t module, const char *kname)                       \
-  FOR_EACH_ERR_FN(hipFuncGetAttribute, int *, hipFunction_attribute attr,      \
-                  hipFunction_t function)                                      \
-  FOR_EACH_ERR_FN(hipDrvLaunchKernelEx, const HIP_LAUNCH_CONFIG *config,       \
-                  hipFunction_t f, void **kernelParams, void **extra)          \
-  FOR_EACH_ERR_FN(hipModuleLaunchKernel, hipFunction_t f,                      \
+  FOR_EACH_ERR_FN(hipFuncGetAttribute, true, int *,                            \
+                  hipFunction_attribute attr, hipFunction_t function)          \
+  FOR_EACH_ERR_FN(hipDrvLaunchKernelEx, false,                                 \
+                  const HIP_LAUNCH_CONFIG *config, hipFunction_t f,            \
+                  void **kernelParams, void **extra)                           \
+  FOR_EACH_ERR_FN(hipModuleLaunchKernel, true, hipFunction_t f,                \
                   unsigned int gridDimX, unsigned int gridDimY,                \
                   unsigned int gridDimZ, unsigned int blockDimX,               \
                   unsigned int blockDimY, unsigned int blockDimZ,              \
                   unsigned int sharedMemBytes, hipStream_t stream,             \
                   void **kernelParams, void **extra)                           \
-  FOR_EACH_ERR_FN(hipModuleLaunchCooperativeKernel, hipFunction_t f,           \
+  FOR_EACH_ERR_FN(hipModuleLaunchCooperativeKernel, true, hipFunction_t f,     \
                   unsigned int gridDimX, unsigned int gridDimY,                \
                   unsigned int gridDimZ, unsigned int blockDimX,               \
                   unsigned int blockDimY, unsigned int blockDimZ,              \
                   unsigned int sharedMemBytes, hipStream_t stream,             \
                   void **kernelParams, void **extra)                           \
-  FOR_EACH_ERR_FN(hipPointerGetAttribute, void *data,                          \
+  FOR_EACH_ERR_FN(hipPointerGetAttribute, true, void *data,                    \
                   hipPointer_attribute attribute, hipDeviceptr_t ptr)
 
 // HIP driver version format: HIP_VERSION_MAJOR * 10000000 + HIP_VERSION_MINOR *
@@ -287,9 +290,9 @@ static const char *hipLibSearchPaths[] = {"/*py_libhip_search_path*/"};
 
 // The HIP symbol table for holding resolved dynamic library symbols.
 struct HIPSymbolTable {
-#define DEFINE_EACH_ERR_FIELD(hipSymbolName, ...)                              \
+#define DEFINE_EACH_ERR_FIELD(hipSymbolName, required, ...)                    \
   hipError_t (*hipSymbolName)(__VA_ARGS__);
-#define DEFINE_EACH_STR_FIELD(hipSymbolName, ...)                              \
+#define DEFINE_EACH_STR_FIELD(hipSymbolName, required, ...)                    \
   const char *(*hipSymbolName)(__VA_ARGS__);
 
   HIP_SYMBOL_LIST(DEFINE_EACH_ERR_FIELD, DEFINE_EACH_STR_FIELD)
@@ -379,11 +382,11 @@ bool initSymbolTable() {
   uint64_t hipFlags = 0;
   hipDriverProcAddressQueryResult symbolStatus;
   hipError_t status = hipSuccess;
-#define QUERY_EACH_FN(hipSymbolName, ...)                                      \
+#define QUERY_EACH_FN(hipSymbolName, required, ...)                            \
   status = hipGetProcAddress(#hipSymbolName,                                   \
                              (void **)&hipSymbolTable.hipSymbolName,           \
                              hipVersion, hipFlags, &symbolStatus);             \
-  if (status != hipSuccess) {                                                  \
+  if (required && status != hipSuccess) {                                      \
     PyErr_SetString(PyExc_RuntimeError,                                        \
                     "cannot get address for '" #hipSymbolName                  \
                     "' from libamdhip64.so");                                  \
@@ -476,7 +479,6 @@ static PyObject *loadBinary(PyObject *self, PyObject *args) {
       hipSymbolTable.hipModuleLoadDataEx(&mod, data, 5, opt, optval))
   HIP_CHECK_AND_RETURN_NULL(
       hipSymbolTable.hipModuleGetFunction(&fun, mod, name));
-
   // get allocated registers and spilled registers from the function
   int n_regs = 0;
   int n_spills = 0;
@@ -492,6 +494,17 @@ static PyObject *loadBinary(PyObject *self, PyObject *args) {
   }
   return Py_BuildValue("(KKiii)", (uint64_t)mod, (uint64_t)fun, n_regs,
                        n_spills, n_max_threads);
+}
+
+static PyObject *unloadModule(PyObject *self, PyObject *args) {
+  hipModule_t mod;
+  if (!PyArg_ParseTuple(args, "K", &mod)) {
+    return NULL;
+  }
+
+  HIP_CHECK_AND_RETURN_NULL(hipSymbolTable.hipModuleUnload(mod))
+
+  return Py_None;
 }
 
 static PyObject *createTDMDescriptor(PyObject *self, PyObject *args) {
@@ -1002,6 +1015,7 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   uint64_t _stream;
   uint64_t _function;
   int launch_cooperative_grid;
+  PyObject *global_scratch_obj = NULL;
   PyObject *profile_scratch_obj = NULL;
   PyObject *launch_enter_hook = NULL;
   PyObject *launch_exit_hook = NULL;
@@ -1011,12 +1025,12 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *arg_annotations = NULL;
   Py_buffer signature;
   PyObject *kernel_args = NULL;
-  if (!PyArg_ParseTuple(args, "piiiKKO(iii)OOOiOy*O", &launch_cooperative_grid,
+  if (!PyArg_ParseTuple(args, "piiiKKOO(iii)OOOiOy*O", &launch_cooperative_grid,
                         &gridX, &gridY, &gridZ, &_stream, &_function,
-                        &profile_scratch_obj, &num_warps, &num_ctas,
-                        &shared_memory, &launch_metadata, &launch_enter_hook,
-                        &launch_exit_hook, &warp_size, &arg_annotations,
-                        &signature, &kernel_args)) {
+                        &global_scratch_obj, &profile_scratch_obj, &num_warps,
+                        &num_ctas, &shared_memory, &launch_metadata,
+                        &launch_enter_hook, &launch_exit_hook, &warp_size,
+                        &arg_annotations, &signature, &kernel_args)) {
     return NULL;
   }
 
@@ -1058,9 +1072,9 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       goto cleanup;
     }
   }
-  // Add global scratch object (nullptr).
+  // Add global scratch object.
   params[params_idx] = alloca(sizeof(void *));
-  if (!extractPointer(params[params_idx++], Py_None)) {
+  if (!extractPointer(params[params_idx++], global_scratch_obj)) {
     goto cleanup;
   }
   // Add profile scratch object.
@@ -1091,6 +1105,8 @@ cleanup:
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided hsaco into HIP driver"},
+    {"unload_module", unloadModule, METH_VARARGS,
+     "unload provided module to free memory"},
     {"get_device_properties", getDeviceProperties, METH_VARARGS,
      "Get the properties for a given device"},
     {"create_tdm_descriptor", createTDMDescriptor, METH_VARARGS,

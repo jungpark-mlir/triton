@@ -2,15 +2,29 @@ import torch
 import triton
 from triton_kernels import target_info
 from triton_kernels.numerics_details.mxfp_details._downcast_to_mxfp import MXFP_BLOCK_SIZE
-from triton_kernels.tensor import FP4, Tensor, FP16, BF16
+from triton_kernels.tensor import FP4, FP16, FP32, BF16, Tensor
 from triton_kernels.tensor_details.layout import HopperMXScaleLayout
-from triton_kernels.tensor_details.layout_details.blackwell_scale import BlackwellActMXScaleLayout
+from triton_kernels.tensor_details.layout_details.blackwell_scale import BlackwellActMXScaleLayout, BlackwellMXScaleLayout
 
 
 def is_x_scale_swizzled(precision_config):
     return (precision_config is not None and precision_config.a_mx_scale is not None
             and isinstance(precision_config.a_mx_scale, Tensor)
             and isinstance(precision_config.a_mx_scale.storage.layout, BlackwellActMXScaleLayout))
+
+
+def compute_swap_xw(precision_config, block_m, is_persistent):
+    if target_info.cuda_capability_geq(10, 0):
+        if precision_config.b_mx_scale is not None:
+            return block_m <= 64 and is_persistent
+        else:
+            return block_m < 64 and is_persistent
+    elif target_info.cuda_capability_geq(9, 0):
+        layout = None if not isinstance(precision_config.b_mx_scale,
+                                        Tensor) else precision_config.b_mx_scale.storage.layout
+        return isinstance(layout, HopperMXScaleLayout)
+
+    return False
 
 
 def compute_grid_size(routing_data, batch_size, m, n, block_m, block_n):
@@ -29,11 +43,16 @@ def compute_block_n(n: int, arch, precision_config):
         # https://github.com/triton-lang/triton/blob/814b862166c756d9f33238844f4ac047e0243388/python/triton_kernels/triton_kernels/matmul_details/_matmul.py#L265
         block_n = 2 * layout.num_warps * 2 * 8
         return block_n, block_n
-    elif precision_config.max_num_imprecise_acc is None and n > 128:
-        return 256, 256
+    if precision_config.max_num_imprecise_acc is None and n > 128:
+        block_n, block_n_tma = 256, 256
     else:
         target = min(128, triton.next_power_of_2(n))
-        return max(8, target), max(16, target)
+        block_n, block_n_tma = max(8, target), max(16, target)
+    if isinstance(layout, BlackwellMXScaleLayout):
+        # Blackwell scale swizzle requires BLOCK_N to be a multiple of 128.
+        block_n = max(128, block_n)
+        block_n_tma = max(128, block_n_tma)
+    return block_n, block_n_tma
 
 
 def compute_block_k(m: int, k: int | None, is_persistent: bool, lhs_dtype, rhs_dtype, precision_config, has_y_acc_in):
@@ -93,6 +112,8 @@ def compute_num_stages(
     x_transpose,
     epilogue_effective_itemsize,
     has_y_acc_in,
+    mx_block_size=None,
+    epilogue_reduction_n=1,
     *,
     epilogue_subtile,
     occupancy_target,
@@ -120,9 +141,14 @@ def compute_num_stages(
             # https://docs.nvidia.com/cuda/parallel-thread-execution/#packing-format-used-for-matrix-a-and-b-by-kind-mxf8f6f4-in-shared-memory
             stage_size += block_k * block_n * weight_size
 
+    if precision_config.a_mx_scale is not None:
+        scale_block_size = mx_block_size or int(MXFP_BLOCK_SIZE)
+        stage_size += block_m * (block_k // scale_block_size)
+
     if precision_config.b_mx_scale is not None:
         # mx scales
-        stage_size += block_n * (block_k // int(MXFP_BLOCK_SIZE))
+        scale_block_size = mx_block_size or int(MXFP_BLOCK_SIZE)
+        stage_size += block_n * (block_k // scale_block_size)
 
     if is_persistent:
         # Per-stage wait barrier
@@ -133,17 +159,37 @@ def compute_num_stages(
         else:
             acc_size = out_itemsize
         if target_info.cuda_capability_geq(10, 0) and epilogue_subtile is not None:
-            acc_block_n = block_n // epilogue_subtile
+            acc_block_n = block_n // epilogue_subtile // epilogue_reduction_n
         else:
-            acc_block_n = block_n
+            acc_block_n = block_n // epilogue_reduction_n
         # pipelined TMA store local to global, or
         # pipelined layout conversion before store of the accumulator
         # note: layout conversion has some padding
-        smem_capacity -= int((block_m + 4) * acc_block_n * acc_size)
+        epilogue_smem = int((block_m + 4) * acc_block_n * acc_size)
+        if compute_swap_xw(precision_config, block_m, is_persistent):
+            # The fp32 accumulator stays in TMEM for the Blackwell SWAP_XW
+            # persistent path. Fused reductions such as swiglu still need smem
+            # for the unreduced output tile before the narrower TMA-store tile.
+            if epilogue_reduction_n > 1:
+                epilogue_smem += int(block_m * block_n * out_itemsize)
+        smem_capacity -= epilogue_smem
         if x_transpose:
             smem_capacity -= block_m * block_k * (max(8, lhs_dtype.bitwidth) // 8)
 
-    num_stages = min(smem_capacity // int(stage_size), 4)
+    # Persistent fp32 kernels need extra smem headroom (metadata/barriers/TMA state)
+    # that is not fully captured by the simple stage_size model above.
+    if is_persistent and (lhs_dtype == FP32 or rhs_dtype == FP32):
+        smem_capacity -= 32 * 1024
+    if is_persistent and not has_native_mxfp and epilogue_reduction_n > 1:
+        # Hopper fused reductions materialize an additional reduced-N output
+        # tile in smem.
+        smem_capacity -= int(block_m * acc_block_n * out_itemsize)
+    smem_capacity = max(smem_capacity, 0)
+    max_stages = 5 if rhs_dtype == FP4 else 4  # maybe 5 everywhere; just haven't tested
+    num_stages = min(smem_capacity // int(stage_size), max_stages)
+    # Keep one stage of headroom for persistent fp32 to avoid launch-time OOR.
+    if is_persistent and (lhs_dtype == FP32 or rhs_dtype == FP32):
+        num_stages = min(num_stages, 3)
     if num_stages == 0:
         num_stages = 1
     return num_stages

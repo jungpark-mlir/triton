@@ -32,6 +32,14 @@ def is_async_copy_enabled(arch):
     return (arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy
 
 
+def is_fpsan_supported(arch):
+    return arch in ["gfx942", "gfx950", "gfx1250"]
+
+
+def is_consan_supported(arch):
+    return arch in ["gfx1250"]
+
+
 @dataclass(frozen=True)
 class HIPOptions:
     num_warps: int = 4
@@ -121,6 +129,11 @@ class HIPBackend(BaseBackend):
         return f"hip:{options.arch}"
 
     def parse_options(self, opts) -> Any:
+        # Enable debug mode for ConSan, so device-side assertions are not optimized out
+        if any(mode in opts.get("instrumentation_mode", "") for mode in ["consan"]):
+            opts["debug"] = True
+            opts["sanitize_overflow"] = False
+
         args = {'arch': knobs.runtime.override_arch or self.target.arch}
 
         if opts.get("num_ctas", 1) > 1 and not amd.supports_multi_cta_launch(self.target.arch):
@@ -165,14 +178,27 @@ class HIPBackend(BaseBackend):
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.load_dialects(ctx)
 
+    # is_within_2gb() needs to check for a torch subobject and this var tracks torch
+    # availability state: None - not tested, True - torch is present. Anything else -
+    # no torch available. First call to is_within_2gb() checks torch availability
+    # and caches it.
+    _torch_available: None | bool = None
+
     @staticmethod
     def is_within_2gb(arg):
-        import torch
+        if HIPBackend._torch_available is None:
+            try:
+                import torch
+                HIPBackend._torch_available = True
+            except ImportError:
+                HIPBackend._torch_available = False
+        elif HIPBackend._torch_available:
+            import torch
 
         MAX_INT_32 = 2**31 - 1
         if hasattr(arg, "ptr_range"):
             return arg.ptr_range() <= MAX_INT_32
-        if isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage"):
+        if HIPBackend._torch_available and isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage"):
             return arg.untyped_storage().size() <= MAX_INT_32
         return False
 
@@ -195,7 +221,6 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
-        passes.ttir.add_rewrite_tensor_pointer(pm)
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
@@ -236,7 +261,7 @@ class HIPBackend(BaseBackend):
 
         use_async_copy = is_async_copy_enabled(options.arch)
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
-
+        amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
         amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
         amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
         if use_async_copy:
@@ -264,13 +289,15 @@ class HIPBackend(BaseBackend):
                 knobs.amd.use_buffer_atomics,
                 knobs.amd.buffer_ops_analyze_small_tensor_range,
             )
+            amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
 
         amd.passes.ttgpuir.add_fold_true_cmpi(pm)
         amd.passes.ttgpuir.add_prepare_if_combining(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        if options.instrumentation_mode == "fpsan":
+        if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):
+            amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
@@ -287,11 +314,13 @@ class HIPBackend(BaseBackend):
         passes.common.add_sccp(pm)
         passes.ttir.add_loop_aware_cse(pm)
         passes.gluon.add_canonicalizer(pm)
+        passes.ttir.add_loop_unroll(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
 
-        if options.instrumentation_mode == "fpsan":
+        if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):
+            amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
 
         pm.run(mod, 'gluon_to_ttgir')
@@ -310,10 +339,20 @@ class HIPBackend(BaseBackend):
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
 
+        # Reserve LDS space for ConSan captures before allocation computes offsets.
+        if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
+            amd.passes.ttgpuir.add_prepare_consan_captures(pm)
         amd.passes.ttgpuir.add_allocate_shared_memory(pm)
+        # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after shared
+        if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
+            passes.ttgpuir.add_concurrency_sanitizer(pm)
+            passes.gluon.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
+        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
+        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
         ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
         ##    of the value of kernel arg `allow_flush_denorm`.
@@ -384,20 +423,24 @@ class HIPBackend(BaseBackend):
         amd.set_bool_control_constant(llvm_mod, "__oclc_wavefrontsize64", options.warp_size == 64)
 
         # Set kernel attributes first given this may affect later optimizations.
+        # The kernel is the only non-declaration function with external linkage;
+        # instrumentation helpers (e.g. ConSan) use internal linkage.
         fns = [fn for fn in llvm_mod.get_functions() if not fn.is_declaration()]
-        # The public kernel should be kernel 0.
-        fns[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
+        kernel_fn = next((fn for fn in fns if fn.is_external_linkage()), None)
+        if not kernel_fn:
+            raise RuntimeError("Could not find kernel function")
+        kernel_fn.set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
         cluster_dim = metadata["num_ctas"]
-        fns[0].add_fn_attr("amdgpu-cluster-dims", f"{cluster_dim},1,1")
+        kernel_fn.add_fn_attr("amdgpu-cluster-dims", f"{cluster_dim},1,1")
         # warp-specialization mutates num_warps
         total_warps_num = options.num_warps
         total_num_warps = src.get_int_attr("ttg.total-num-warps")
         if total_num_warps is not None:
             total_warps_num = total_num_warps
-        fns[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
+        kernel_fn.add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
         if "memory-bound-attention" in options.schedule_hint.split(','):
-            fns[0].add_fn_attr("amdgpu-sched-strategy", "iterative-ilp")
-        fns[0].add_fn_attr("uniform-work-group-size", "true")
+            kernel_fn.add_fn_attr("amdgpu-sched-strategy", "iterative-ilp")
+        kernel_fn.add_fn_attr("uniform-work-group-size", "true")
         # LLVM AMDGPU backend supports the attribute "amdgpu-waves-per-eu"="<min>[, <max>]".
         # This attribute may be attached to a kernel function definition and is an optimization hint.
         # <min> parameter specifies the requested minimum number of waves per EU, and optional <max> parameter
@@ -407,12 +450,12 @@ class HIPBackend(BaseBackend):
         # implies the default behavior (no limits).
         # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
         # and may improve scheduling.
-        fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
+        kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
-        fns[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
+        kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:
-            fns[0].add_fn_target_feature("+xnack")
-            fns[0].add_fn_asan_attr()
+            kernel_fn.add_fn_target_feature("+xnack")
+            kernel_fn.add_fn_asan_attr()
 
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments
@@ -420,7 +463,7 @@ class HIPBackend(BaseBackend):
         # TODO(tyb0807): Disabled when using MIR swap/dump because the value is
         # not serializable to/from MIR YAML
         if options.arch != "gfx1250" and not (knobs.amd.swap_mir or knobs.amd.dump_mir):
-            amd.set_all_fn_arg_inreg(fns[0])
+            amd.set_all_fn_arg_inreg(kernel_fn)
 
         if knobs.compilation.enable_asan:
             default_libdir = Path(__file__).parent / 'lib'
@@ -442,16 +485,18 @@ class HIPBackend(BaseBackend):
         # optimize_module from calls to @llvm.amdgcn.workgroup.id.x/y/z(). We cannot rely on this because a
         # dispatch dimensions might be used even if there is no program_id() call for it.
         if amd.has_architected_sgprs(options.arch):
-            fns[0].remove_fn_attr("amdgpu-no-workgroup-id-x")
-            fns[0].remove_fn_attr("amdgpu-no-workgroup-id-y")
-            fns[0].remove_fn_attr("amdgpu-no-workgroup-id-z")
+            kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-x")
+            kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-y")
+            kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-z")
 
         if knobs.amd.scalarize_packed_fops:
-            amd.add_scalarize_packed_fops_llvm_pass(fns[0])
+            amd.add_scalarize_packed_fops_llvm_pass(kernel_fn)
 
         # Get some metadata
         metadata["num_warps"] = total_warps_num
         metadata["shared"] = src.get_int_attr("ttg.shared")
+        metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
+        metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
 

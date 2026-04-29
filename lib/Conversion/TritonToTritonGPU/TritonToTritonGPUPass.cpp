@@ -194,18 +194,6 @@ private:
     res.insert(res.begin() + axis, 1);
     return res;
   }
-
-  // Example:    order = [   0, 2, 1, 3], dim = 2
-  //          resOrder = [2, 0, 3, 1, 4]
-  SmallVector<unsigned> insertOrder(ArrayRef<unsigned> order,
-                                    unsigned axis) const {
-    SmallVector<unsigned> resOrder(order.begin(), order.end());
-    for (unsigned i = 0; i < resOrder.size(); ++i)
-      if (resOrder[i] >= axis)
-        ++resOrder[i];
-    resOrder.insert(resOrder.begin(), axis);
-    return resOrder;
-  }
 };
 
 struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
@@ -300,7 +288,6 @@ struct TritonCatPattern : public OpConversionPattern<triton::CatOp> {
     auto lhsTotalElemsPerThread = triton::gpu::getTotalElemsPerThread(lhsType);
     auto rhsTotalElemsPerThread = triton::gpu::getTotalElemsPerThread(rhsType);
     auto retTotalElemsPerThread = triton::gpu::getTotalElemsPerThread(retType);
-    auto retShape = retType.getShape();
     auto retOrder = retEncoding.getOrder();
     auto retThreadsPerWarp = retEncoding.getThreadsPerWarp();
     auto retWarpsPerCTA = retEncoding.getWarpsPerCTA();
@@ -556,8 +543,6 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.insert< // TODO: view should have custom pattern that views the
                    // layout
       // clang-format off
-      GenericOpPattern<triton::AdvanceOp>,
-      GenericOpPattern<triton::MakeTensorPtrOp>,
       GenericOpPattern<triton::ReshapeOp>,
       GenericOpPattern<triton::BitcastOp>,
       GenericOpPattern<triton::FpToFpOp>,
