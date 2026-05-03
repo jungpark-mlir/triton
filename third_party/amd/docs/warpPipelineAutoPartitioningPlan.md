@@ -2,6 +2,11 @@
 
 Author: Jungwook Park
 
+> **STATUS: INCOMPLETE DESIGN — WORK IN PROGRESS.**
+> This document is an evolving plan, not a finalized design. Sections are
+> still being added, revised, or removed. Do not treat any part of it as a
+> committed design decision yet.
+
 Note: This is an initial planning document for compiler-driven warp-pipeline
 partitioning and scheduling in the standard Triton lowering path. The primary
 target architecture is gfx1250.
@@ -422,6 +427,310 @@ The minimum the MVP needs:
 Sections 7 and 8 become important as the pass moves from a single-pattern MVP
 to a more general scheduler. Section 6 should be revisited as soon as the MVP
 needs to make slicing or prefetch-depth decisions.
+
+## Scheduling as an Optimization Problem
+
+This chapter steps back from specific algorithms and treats warp-pipeline
+partitioning and scheduling as a constrained optimization problem. The goal is
+to make the problem structure explicit so the solver choice has a clear
+rationale. The concrete MVP algorithm in the next chapter is one instance of
+this framework.
+
+### 1. Design Considerations
+
+When a kernel author partitions a loop manually (see
+[warpPipelineUserGuide.md](warpPipelineUserGuide.md)), they make several
+interdependent decisions:
+
+- stage count `K`, typically 2, occasionally 3 or 4;
+- op-to-stage assignment `f: Op -> {0, ..., K-1}`;
+- stage priority `p_s` in `{none, 0, 1, 2, 3}`;
+- dot slicing factor `N` in `{1, 2, 4}`;
+- buffer depth `B` in `{2, 3, ...}`, usually fixed by the kernel;
+- the accept/reject decision itself (memory-bound loops are rejected).
+
+These decisions interact. Slicing changes op granularity and therefore `f`.
+Increasing `B` relaxes same-slot LDS hazards but raises LDS footprint and
+register pressure. Priority interacts with both memory-stage VALU pressure and
+compute-stage issue rate.
+
+The manual decision tree in the User Guide already captures a strong prior:
+
+- reject if memory-bound;
+- start with `K = 2`;
+- split compute from memory;
+- balance stage duration;
+- minimize cross-stage data;
+- put address math with memory;
+- prefer fewer stages.
+
+The solver's job is to reproduce these decisions from inputs when the inputs
+support them, and to handle inputs the human prior does not cover cleanly.
+
+### 2. Problem Formulation
+
+Given:
+
+- operation set `V`;
+- dependence graph `E` with per-edge class (hard, soft, phase-shifted);
+- per-op cost vector `c_v = (compute, memory, valu, boundary, live_reg)`;
+- hardware profile `H` (WMMA throughput, wait model, boundary cycles, ...);
+- register budget `R_max` per pipeline group;
+- LDS budget `L_max`.
+
+Decision variables:
+
+- `K in {2, 3, 4}`;
+- binary `x_{v,s}` with `sum_s x_{v,s} = 1` for each `v`;
+- `N in {1, 2, 4}` per dot candidate;
+- `p_s in P = {none, 0, 1, 2, 3}` per stage.
+
+Hard constraints:
+
+- **Dependence order**: every hard edge `u -> v` respects assigned stage order,
+  or is resolved by a stage boundary and buffering.
+- **Ring legality**: phase-shifted LDS hazards do not collide under the
+  two-group ring schedule (adjacent and wrap-around).
+- **Register budget**: `sum_s max_live(s) <= R_max` per pipeline group.
+- **LDS budget**: multi-buffer footprint `<= L_max`.
+- **Boundary legality**: waits/barriers only at boundaries; every op must be
+  classifiable.
+- **Op coverage**: every loop op belongs to exactly one stage; the loop has at
+  least two stages.
+
+Primary objective:
+
+Minimize predicted time per iteration, which for a `K`-stage schedule is
+dominated by the longest stage plus boundary overhead:
+
+```text
+T_iter ≈ max_s stage_cost(s) + boundary_cost(K)
+```
+
+Minimizing `T_iter` is equivalent to balancing stage costs and reducing
+barrier/fence overhead. For compute-bound kernels this reduces to maximizing
+WMMA/MFMA utilization:
+
+```text
+mfma_util ≈ compute_cycles / T_iter
+```
+
+Secondary objectives (used as tie-breakers or weighted penalties):
+
+- minimize cross-stage live values (register pressure proxy);
+- minimize local-fencing barrier count;
+- prefer smaller `K`;
+- prefer `N = 1` unless slicing improves balance or pressure.
+
+Profitability gate (not strictly a constraint, but the pass must stop here
+when violated):
+
+- `T_iter_pipelined < T_iter_serial` by some margin;
+- `occupancy_post >= occupancy_floor`.
+
+### 3. Findings and Problem Structure
+
+- The search space is small for common kernels: a GEMM mainloop usually has
+  fewer than about 30 classifiable ops, `K in {2, 4}`, `N in {1, 2}`.
+- Dependencies form a partial order. Once role classification is fixed, each
+  op's legal stage range is narrow.
+- The objective is piecewise-linear (max of linear stage costs), which is
+  compatible with LP/MILP and with DP.
+- Several human heuristics are effectively constraints, not preferences,
+  after classification is done: "LDS operand loads before compute" is a hard
+  stage-order constraint given roles.
+- The hardest decisions are `K`, `N`, and the accept/reject gate. The
+  op-to-stage assignment is often mechanical once those are resolved.
+- The weakest signal is the cost model. Instruction-count heuristics are
+  adequate for relative ranking but not for absolute profitability, which
+  motivates an empirical calibration track.
+
+This structure suggests that most of the solver's value is in three focused
+decisions (`K`, `N`, `p_s`) plus a clean profitability gate. The rest is
+dependency-respecting placement.
+
+### 4. Solver Options
+
+Ordered from simplest to most elaborate. All assume the classifications,
+dependence graph, and cost model from the previous chapters.
+
+#### 4.1 Closed-Form Two-Stage Balance (Formula)
+
+For compute-bound two-stage GEMM, a short pseudocode captures the human
+heuristic:
+
+```text
+if memory_cost > compute_cost:
+    reject or try increasing B
+elif compute_cost > 2 * memory_cost:
+    K=2, N=2, prio=(1, 0)
+else:
+    K=2, N=1, prio=(1, 0)
+```
+
+Pros: trivial to implement, matches the manual rule, interpretable.
+Cons: only covers a single kernel class.
+
+#### 4.2 Rule-Based Expert System
+
+Pattern match known shapes (GEMM, MXFP GEMM) and apply fixed stage templates.
+
+Pros: predictable, easy to debug.
+Cons: does not generalize; each new kernel class needs a new rule.
+
+#### 4.3 Greedy List Scheduling
+
+Walk the dependence graph in topological order and assign each op to the
+earliest legal stage that keeps stages balanced within a target ratio.
+
+Pros: fast, `O(|V|)`, interpretable, extends to attention-like shapes.
+Cons: can get stuck in local optima; balance target is a hyperparameter.
+
+#### 4.4 Dynamic Programming over Linear Op Sequence
+
+After classification and local reordering, the loop body is a linear sequence
+of role-typed "chunks". Splitting it into exactly `K` contiguous stages is a
+classic DP:
+
+```text
+best[i][k] = min over j<i of best[j][k-1] + stage_cost(ops[j:i])
+```
+
+Pros: exact for contiguous stages; polynomial; integrates slicing by adding
+alternative node types for sliced dots.
+Cons: assumes a linearly-orderable body, which holds almost always after
+classification but is not guaranteed.
+
+#### 4.5 Integer Linear Programming (MILP)
+
+Encode constraints and objective as linear inequalities and solve exactly.
+
+Pros: optimal; can express dependence, register, LDS, balance, and boundary
+count constraints; handles non-contiguous stage layouts.
+Cons: compile-time cost; nonlinear parts (max-of-stage-costs, occupancy step
+function) need auxiliary variables; fragile if the constraint set grows.
+
+Acceptable when kept small (`|V| <= 50`) and used only for complex kernels.
+
+#### 4.6 Beam Search / Branch-and-Bound
+
+Enumerate a small set of candidate schedules, pruned by the cost model.
+
+Pros: good balance of quality and speed; combines well with DP for the
+contiguous case and with local search for refinement.
+Cons: needs reasonable pruning thresholds.
+
+#### 4.7 Local Search / Simulated Annealing
+
+Start from a feasible schedule (greedy or DP) and swap ops between stages to
+improve cost.
+
+Pros: escapes greedy local optima; simple to implement.
+Cons: stochastic; needs deterministic seeding for reproducibility.
+
+#### 4.8 Learned Cost Model With Classical Solver
+
+Keep the solver classical (DP, beam, or MILP) but replace the
+instruction-count cost model with a small learned predictor trained on
+measured kernels.
+
+Pros: targets the weakest signal in the system (cost prediction); stays
+interpretable and deterministic; training data is the easiest ML data to
+collect.
+Cons: needs calibration infrastructure; needs care to avoid overfitting.
+
+#### 4.9 Imitation Learning on Manual Schedules
+
+Train a model to replicate human-produced warp-pipeline partitions from the
+existing Gluon examples. Output can be either direct op-to-stage labels (GNN
+on the dependence graph) or a sequence of partitioning actions (transformer
+on a linearized loop body).
+
+Pros: captures expert priors directly; good source of initial candidates for
+a classical verifier.
+Cons: small training set (tens of kernels); feature engineering cost; unclear
+generalization.
+
+Best use: propose schedules that a classical solver then verifies and scores.
+
+#### 4.10 Reinforcement Learning
+
+Treat the compiler as an agent that chooses `K`, `N`, `p_s`, and each
+op-to-stage action, with reward derived from measured kernel time.
+
+Pros: can, in principle, exceed human heuristics.
+Cons: high engineering cost; expensive training signal (compile + run +
+measure); credit assignment is hard; deployment risk.
+
+Best use: research track, not as a replacement for the classical path.
+
+### 5. Recommendation
+
+Use a tiered approach so each phase delivers a concrete improvement:
+
+| Phase | Solver | Scope |
+|---|---|---|
+| 1 | closed-form two-stage balance + rule-based classification | GEMM-like MVP |
+| 2 | greedy list scheduling + DP over linear op order | MXFP GEMM, simple attention |
+| 3 | beam search with cost-model pruning, optional local search | harder kernels; enables slicing and four-stage |
+| 4 | learned cost model (small ML, classical solver) | calibration-driven accuracy |
+| R | imitation / RL research track | future exploration |
+
+Rationale:
+
+- Phase 1 mirrors the manual decision tree. It is easy to implement, verify,
+  and debug, and it covers the most valuable common pattern.
+- Phase 2 scales to attention and MXFP without a heavyweight solver. DP gives
+  a principled way to pick `K` and to evaluate slicing as an alternative node
+  type on linear op sequences.
+- Phase 3 introduces global search for kernels where local decisions are
+  inadequate. Beam search fits the small branching factor; local search
+  refines ties.
+- Phase 4 attacks the real uncertainty, cost prediction. Replacing only the
+  cost model with ML preserves interpretability and reproducibility. Training
+  data comes from autotune sweeps, not end-to-end schedule labels.
+- Imitation and RL are research tracks. They are not a replacement for the
+  classical path.
+
+Keep the classical path (Phases 1 to 3) always reachable. Any ML component
+must fall back to the classical path on failure.
+
+### 6. Further Considerations and Ideas
+
+- **Compile-time budget.** The auto pass must not dominate compile time. A
+  per-loop wall-clock budget should gate solver choice, with a hard fallback
+  to "no warp-pipeline".
+- **Interpretability.** Emit every nontrivial decision as a remark. Schedules
+  chosen by ML must still be explainable by cost-model numbers.
+- **Reproducibility.** Any stochastic component (annealing, RL) must seed
+  from a deterministic hash of the kernel so results are bit-for-bit
+  reproducible.
+- **Safety and fallback.** If the solver cannot verify profitability, it must
+  fall back to "no warp-pipeline" rather than produce a fragile schedule.
+- **Training data.** Mining `third_party/amd/python/examples/gluon/*.py`
+  gives only tens of kernels. Autogenerating variants (tile shape, buffer
+  count, priority pair, slice count) and measuring them produces the first
+  real dataset. This is also valuable for calibrating the classical cost
+  model even if ML is not adopted.
+- **Feature representation for ML.** The dependence graph plus per-op feature
+  vector is naturally a GNN input. A transformer over a linearized loop body
+  is another option. Both should be considered if ML is adopted; neither is
+  required before Phase 4.
+- **Joint search with autotune.** Autotune already explores tile shape and
+  `num_warps`. Extending it to warp-pipeline knobs (stage count, slice count,
+  priority pair) is a low-risk way to validate the solver rankings before any
+  ML work.
+- **Interaction with existing conversion.** The solver output must be
+  expressible as `triton.warp_pipeline.border` and priority metadata. Any
+  decision that cannot be expressed in this representation should be rejected
+  or deferred to a later extension.
+- **Calibration loop.** Measured regressions should feed back as calibration
+  data for the cost model, not as one-off patches to the solver. Keep the
+  learning surface small and close to the inputs, not to the decisions.
+- **Problem reduction as research.** It is worth checking empirically whether
+  the three decisions `K`, `N`, and the accept/reject gate capture most of
+  the performance variance. If so, a much simpler solver (a classifier over
+  those three) may be sufficient, with op placement mechanical.
 
 ## Scheduling Algorithm
 
