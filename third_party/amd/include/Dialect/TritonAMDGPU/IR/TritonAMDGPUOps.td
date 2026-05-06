@@ -769,7 +769,7 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
 
     For "all warps participate", omit the attribute (preferred) or pass
     a full bitmask `K = num_warps`; an explicit `warp_used_hint = 0` is
-    rejected.  A hint-less op is a merge-flush boundary, while
+    rejected by the verifier.  A hint-less op is a merge-flush boundary, while
     `K = num_warps` is a normal hinted op.
 
     Implicit op-merging (TDM->LLVM lowering): adjacent hinted copies
