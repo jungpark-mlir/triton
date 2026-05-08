@@ -5,7 +5,7 @@ on AMD gfx1250.  `H` selects which warps participate in a single TDM
 transfer; cleared warps become hardware no-ops.  The data deposited
 in shared memory is unchanged -- only the work split changes.
 
-Worked example: `vector_add_tdm_kernel` issues two independent partial
+Worked example: `vector_add_tdm_kernel` issues two independent predicated
 TDM copies into distinct shared buffers and then sums them.
 
 ================================================================
@@ -76,9 +76,11 @@ If `K` (number of active warps) is parameterised:
 What this file actually tests
 ================================================================
 
-  * Compile-only test on the AMDGCN asm: every parametrisation yields
-    two `tensor_load_to_lds` instructions (one per `async_load`).
-  * Runtime test on gfx1250 compares against a torch-on-CPU reference.
+  * Compile-only predicated-copy test on the AMDGCN asm: every
+    parametrisation yields two `tensor_load_to_lds` instructions (one per
+    independent `async_load`).
+  * Runtime predicated-copy test on gfx1250 compares against a torch-on-CPU
+    reference.
 
 Runtime tests are skipped on non-gfx1250 hosts.
 """
@@ -107,11 +109,12 @@ def vector_add_tdm_kernel(
     HINT_A: ttgl.constexpr,
     HINT_B: ttgl.constexpr,
 ):
-    """Two-tile vector add via TDM, parametrised on hints A and B.
+    """Two-tile vector add via independent predicated TDM copies.
 
     `HINT == 0` is mapped to the kwarg-free `async_load` (the verifier
     rejects an explicit `warp_used_hint = 0`).  Each load issues an
-    independent partial TDM copy into its own shared buffer.
+    independent predicated TDM copy into its own shared buffer; this file does
+    not test merging adjacent predicated copies.
     """
     num_warps: ttgl.constexpr = ttgl.num_warps()
     BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [num_warps, 1], [1, 0])
@@ -140,10 +143,14 @@ def vector_add_tdm_kernel(
     a_buf = ttgl.allocate_shared_memory(a_desc.dtype, a_desc.block_shape, a_desc.layout)
     b_buf = ttgl.allocate_shared_memory(b_desc.dtype, b_desc.block_shape, b_desc.layout)
 
+    # This test is about predicated copy correctness, not copy merging. Keep
+    # the two TDM copies separated so the merge pass cannot fuse them.
     if HINT_A == 0:
         ttgl.amd.gfx1250.tdm.async_load(a_desc, [off_m, off_n], a_buf)
     else:
         ttgl.amd.gfx1250.tdm.async_load(a_desc, [off_m, off_n], a_buf, warp_used_hint=HINT_A)
+    ttgl.amd.gfx1250.tdm.async_wait(0)
+
     if HINT_B == 0:
         ttgl.amd.gfx1250.tdm.async_load(b_desc, [off_m, off_n], b_buf)
     else:
@@ -196,7 +203,10 @@ _COMPILE_BLOCK_SHAPES = [(64, 64), (32, 128)]
     ids=[_param_id(p) for p in _HINT_PARAMS],
 )
 def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B):
-    """Compile-only: each `async_load` lowers to one `tensor_load_to_lds`."""
+    """Compile-only predicated-copy test.
+
+    Each independent `async_load` should lower to one `tensor_load_to_lds`.
+    """
     NUM_WARPS = 8
     signature = {
         "a_ptr": "*fp16",
@@ -242,7 +252,7 @@ _RUNTIME_BLOCK_SHAPES = [(64, 64), (128, 64)]
     ids=[_param_id(p) for p in _HINT_PARAMS],
 )
 def test_runtime_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B):
-    """Runtime: c = a + b vs torch CPU reference."""
+    """Runtime predicated-copy test: c = a + b vs torch CPU reference."""
     M, N = 256, 512
     NUM_WARPS = 8
 
