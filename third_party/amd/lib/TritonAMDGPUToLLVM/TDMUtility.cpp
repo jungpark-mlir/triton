@@ -1268,11 +1268,41 @@ void emitTDMGatherScatter(RewriterBase &rewriter, Location loc,
 
 namespace {
 
-// Wraps the verifier's coset check so the merge analysis (which tests the
-// *union* of member hints) shares a single source of truth.
+uint32_t getWarpUsedHintI0(uint32_t hint) {
+  assert(hint != 0 && "hint must be non-zero");
+  return llvm::countr_zero(hint);
+}
+
+SmallVector<int32_t, 5> getWarpUsedHintBasisBits(uint32_t hint) {
+  uint32_t i0 = getWarpUsedHintI0(hint);
+  uint32_t support = 0;
+  for (uint32_t mask = hint; mask != 0; mask &= mask - 1) {
+    unsigned w = llvm::countr_zero(mask);
+    support |= static_cast<uint32_t>(w ^ i0);
+  }
+
+  SmallVector<int32_t, 5> basisBits;
+  for (uint32_t s = support; s != 0; s &= s - 1)
+    basisBits.push_back(static_cast<int32_t>(llvm::countr_zero(s)));
+  return basisBits;
+}
+
+// Local copy of the axis-aligned coset rule.  Individual op hints are checked
+// by the verifier; merge analysis uses this for the union of member hints.
 bool isAxisAlignedCoset(uint32_t hint, int numWarps) {
-  return !triton::amdgpu::AsyncTDMCopyGlobalToLocalOp::validateWarpUsedHint(
-      hint, static_cast<int64_t>(numWarps));
+  if (!llvm::isPowerOf2_64(numWarps) || numWarps >= 32 || hint == 0)
+    return false;
+
+  uint32_t numWarpsMask = (uint32_t{1} << numWarps) - 1;
+  if ((hint & ~numWarpsMask) != 0)
+    return false;
+
+  unsigned K = llvm::popcount(hint);
+  if (!llvm::isPowerOf2_32(K))
+    return false;
+
+  unsigned logK = llvm::Log2_32(K);
+  return getWarpUsedHintBasisBits(hint).size() == logK;
 }
 
 using TDMCopyGlobalToLocalOp = triton::amdgpu::AsyncTDMCopyGlobalToLocalOp;
@@ -1297,7 +1327,7 @@ bool canMergeWith(TDMCopyGlobalToLocalOp first,
 
 // Compute `selectorBits` and reorder `info.members` into selector order so
 // `members[s]` is the member whose hint projects to selector value s.
-// `selectorBits` = unionInfo.basisBits \ first member's basisBits.
+// `selectorBits` = union hint basis bits \ first member's basis bits.
 // `info.members` is initially in program order; `lastInProgramOrder` is
 // captured before the reorder.  `hints[i]` corresponds to the program-order
 // member at info.members[i] on entry.
@@ -1305,9 +1335,9 @@ void deriveSelectorOrder(TDMMergeGroupInfo &info, ArrayRef<uint32_t> hints,
                          int numWarps) {
   size_t N = hints.size();
   assert(info.members.size() == N);
-  WarpHintInfo firstInfo = extractWarpHintInfo(hints.front(), numWarps);
-  for (int32_t bit : info.unionInfo.basisBits)
-    if (!llvm::is_contained(firstInfo.basisBits, bit))
+  auto firstBasisBits = getWarpUsedHintBasisBits(hints.front());
+  for (int32_t bit : getWarpUsedHintBasisBits(info.unionHint))
+    if (!llvm::is_contained(firstBasisBits, bit))
       info.selectorBits.push_back(bit);
   assert(info.selectorBits.size() == llvm::Log2_32(static_cast<unsigned>(N)) &&
          "selector bits must enumerate the log2(N) per-wave choices");
@@ -1317,8 +1347,8 @@ void deriveSelectorOrder(TDMMergeGroupInfo &info, ArrayRef<uint32_t> hints,
   // Reorder members: place each program-order member at its selector slot.
   SmallVector<Operation *> reordered(N, nullptr);
   for (size_t i = 0; i < N; ++i) {
-    uint32_t i0_i = static_cast<uint32_t>(llvm::countr_zero(hints[i]));
-    uint32_t delta = i0_i ^ info.unionInfo.i0;
+    uint32_t i0_i = getWarpUsedHintI0(hints[i]);
+    uint32_t delta = i0_i ^ getWarpUsedHintI0(info.unionHint);
     unsigned selVal = 0;
     for (size_t bi = 0; bi < info.selectorBits.size(); ++bi)
       if ((delta >> info.selectorBits[bi]) & 1u)
@@ -1371,7 +1401,7 @@ void emitMergeGroup(MutableArrayRef<Operation *> batch, int numWarps,
     if (p2 >= 2) {
       TDMMergeGroupInfo info;
       info.members.assign(batch.begin(), batch.begin() + p2);
-      info.unionInfo = extractWarpHintInfo(finalUnion, numWarps);
+      info.unionHint = finalUnion;
       deriveSelectorOrder(info, ArrayRef<uint32_t>(hints).take_front(p2),
                           numWarps);
       LLVM_DEBUG({
@@ -1455,22 +1485,21 @@ void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
   size_t numGroups = numDims > 2 ? 4 : 2;
 
   // Decode each member's hint (presence/no-barrier guaranteed by analysis).
-  SmallVector<WarpHintInfo, 4> infoPerMember;
-  infoPerMember.reserve(N);
+  SmallVector<uint32_t, 4> hintPerMember;
+  hintPerMember.reserve(N);
   for (size_t i = 0; i < N; ++i) {
     auto memberOp =
         cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(groupInfo.members[i]);
     auto hintAttr = memberOp.getWarpUsedHintAttr();
     assert(hintAttr && "merge member must carry a warp_used_hint");
     assert(!memberOp.getBarrier() && "merge member must not carry an mbarrier");
-    infoPerMember.push_back(extractWarpHintInfo(
-        static_cast<uint32_t>(hintAttr.getInt()), numWarps));
+    hintPerMember.push_back(static_cast<uint32_t>(hintAttr.getInt()));
   }
 
   // Use K_member (uniform across members), not K_union, so each member's
   // tileShape = blockShape / warpsPerCTA matches its own log2(K) basisBits.
   auto [warpsPerCTA, numTDMInstructions] = distributeTDMWarpsAlignToPartition(
-      blockShape, static_cast<int>(infoPerMember[0].K), encoding);
+      blockShape, static_cast<int>(llvm::popcount(hintPerMember[0])), encoding);
   assert(numTDMInstructions == 1 &&
          "verifier guarantees single-instruction emission for hinted ops");
   (void)numTDMInstructions;
@@ -1492,13 +1521,14 @@ void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
                            offsetPerMember[i].end()),
         dstPtrsPerMember[i], predPerMember[i], multicastMask,
         /*barrierPtr=*/Value(), sharedLayout, ctaId, /*isStore=*/!isLoad,
-        warpsPerCTA, infoPerMember[i]);
+        warpsPerCTA, hintPerMember[i]);
   }
 
   // Anchor warpId on the union i0 and pack selectorBits into a [0, N) selector.
   auto [_laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-  Value warpIdShifted = groupInfo.unionInfo.i0 != 0
-                            ? b.xor_(warpId, b.i32_val(groupInfo.unionInfo.i0))
+  uint32_t unionI0 = getWarpUsedHintI0(groupInfo.unionHint);
+  Value warpIdShifted = unionI0 != 0
+                            ? b.xor_(warpId, b.i32_val(unionI0))
                             : warpId;
   Value selectorVal = b.i32_val(0);
   for (size_t bi = 0; bi < groupInfo.selectorBits.size(); ++bi) {

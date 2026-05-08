@@ -1,21 +1,16 @@
-"""User-facing manual + test suite for partial TDM copies and adjacent-copy
-merging on gfx1250.
+"""User-facing manual + test suite for adjacent TDM-copy merging on gfx1250.
 
-This is the canonical reference for two Gluon-level features on AMD
-gfx1250:
-
-  1. **Partial TDM copy** -- `async_load(..., warp_used_hint=H)` selects
-     which warps participate in a single TDM transfer.
-  2. **Implicit merging** -- adjacent `async_load`s with compatible
-     hints fuse into one hardware intrinsic during lowering, with no
-     IR/op annotation; user code is unchanged.
+This is the canonical reference for **implicit merging** of adjacent
+`async_load`s with compatible `warp_used_hint` values on AMD gfx1250.
+General predicated/partial-copy coverage lives with the TDM copy tests;
+this file keeps only merge-specific coverage.
 
 Worked examples by shape:
 
-  * Partial warps, one descriptor   -> `vector_add_tdm_kernel`, rows
-                                       where one HINT is 0
   * Two descriptors merged          -> `vector_add_tdm_kernel`,
                                        merge-eligible rows
+  * Two descriptors not merged      -> `vector_add_tdm_kernel`,
+                                       merge-rule violation rows
   * Four descriptors fused          -> `vector_add_tdm_kernel_4way`
   * Cache-modifier vs merge         -> `vector_add_tdm_kernel_cache`
 
@@ -33,22 +28,6 @@ Manual: terminology
   * **candidate batch** (merge-only term): consecutive `async_load`s
     the merge analyser considers for fusion.  From the batch head it
     picks the largest power-of-two N with a legal-coset union.
-
-================================================================
-Manual: when to reach for `warp_used_hint`
-================================================================
-
-Default `async_load(desc, idx, buf)` slices the tile across all
-`num_warps` warps.  Reach for `warp_used_hint=H` to:
-
-  * Free warps for unrelated work when the tile is small.
-  * Stage independent back-to-back tiles that the lowering can fuse
-    (merging requires every member to carry a hint).
-  * Partition warps by role (producer/consumer pipelines).
-
-`H` is an `i32` bitmask: bit `i` set => warp `i` participates.  Omit
-or pass `None` for "all warps"; an explicit `warp_used_hint=0` is
-rejected by the verifier.
 
 ================================================================
 Manual: constructing a legal hint
@@ -79,7 +58,7 @@ hints (bit 7 on the left, bit 0 on the right):
 Common rejected patterns (DO NOT pass these):
 
   +-------------+----------------------------------------------------+
-  | 0           | rejected: must select at least one warp; pass None |
+  | 0           | rejected: merge candidates must carry a real hint  |
   | 0b00000111  | rejected: K=3 is not a power of two                |
   | 0b00010001  | rejected: warps 0 and 4 cannot form a coset alone  |
   +-------------+----------------------------------------------------+
@@ -184,12 +163,18 @@ from triton._internal_testing import is_hip_gfx1250
 from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
 
+
+def _use_tdm_hint(request):
+    if isinstance(request, bool):
+        return request
+    return not request.config.getoption("--tdm-disable-hint")
+
+
 # ===========================================================================
-# Worked example #1: 2-way partial copy (with optional merge)
+# Worked example #1: 2-way merge
 # ===========================================================================
-# Covers `warp_used_hint` on a single load, mergeable adjacent pairs,
-# and the "decline to merge" path (mixed hint+no-hint, or non-coset
-# union).
+# Covers mergeable adjacent pairs and the "decline to merge" path for
+# merge-rule violations such as a non-coset union.
 #
 #     ttgl.amd.gfx1250.tdm.async_load(a_desc, [m, n], a_buf,
 #                                     warp_used_hint=HINT_A)
@@ -213,13 +198,13 @@ def vector_add_tdm_kernel(
     BLOCK_N: ttgl.constexpr,
     HINT_A: ttgl.constexpr,
     HINT_B: ttgl.constexpr,
+    USE_HINT: ttgl.constexpr,
 ):
     """Two-tile vector add via TDM, parametrised on hints A and B.
 
-    `HINT == 0` is mapped to the kwarg-free `async_load` (the verifier
-    rejects an explicit `warp_used_hint = 0`).  The two loads sit
-    back-to-back so the merge analyser can consider them; actual
-    fusion depends on rules 1-7 documented at the top of this file.
+    The two hinted loads sit back-to-back so the merge analyser can
+    consider them; actual fusion depends on rules 1-7 documented at
+    the top of this file.
     """
     num_warps: ttgl.constexpr = ttgl.num_warps()
     BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [num_warps, 1], [1, 0])
@@ -249,15 +234,12 @@ def vector_add_tdm_kernel(
     b_buf = ttgl.allocate_shared_memory(b_desc.dtype, b_desc.block_shape, b_desc.layout)
 
     # Two adjacent TDM copies into distinct shared buffers with the same
-    # encoding (rule 6).  Fuses iff both carry merge-legal hints.
-    if HINT_A == 0:
-        ttgl.amd.gfx1250.tdm.async_load(a_desc, [off_m, off_n], a_buf)
-    else:
-        ttgl.amd.gfx1250.tdm.async_load(a_desc, [off_m, off_n], a_buf, warp_used_hint=HINT_A)
-    if HINT_B == 0:
-        ttgl.amd.gfx1250.tdm.async_load(b_desc, [off_m, off_n], b_buf)
-    else:
-        ttgl.amd.gfx1250.tdm.async_load(b_desc, [off_m, off_n], b_buf, warp_used_hint=HINT_B)
+    # encoding (rule 6).  Fuses iff the hints satisfy the merge rules.
+    if not USE_HINT:
+        HINT_A = None
+        HINT_B = None
+    ttgl.amd.gfx1250.tdm.async_load(a_desc, [off_m, off_n], a_buf, warp_used_hint=HINT_A)
+    ttgl.amd.gfx1250.tdm.async_load(b_desc, [off_m, off_n], b_buf, warp_used_hint=HINT_B)
 
     # `async_wait(0)` = "wait for everything", correct under any merge
     # outcome.
@@ -276,20 +258,12 @@ def vector_add_tdm_kernel(
 
 # ---------------------------------------------------------------------------
 # Hint cookbook for `vector_add_tdm_kernel`.  Layout:
-# (HINT_A, HINT_B, expected_merge, id).  Bit `i` => warp `i`.  `0` =
-# "no hint" (kernel maps to kwarg-free load; an explicit zero is
-# rejected by the verifier).  `expected_merge=False` rows fail rule 1
-# (unhinted) or rule 3 (illegal union).
+# (HINT_A, HINT_B, expected_merge, id).  Bit `i` => warp `i`.
+# `expected_merge=False` rows fail a merge rule while still using valid
+# predicated copies.
 # ---------------------------------------------------------------------------
 
 _HINT_PARAMS = [
-    # baseline: no hints (singleton fast-path)
-    (0b00000000, 0b00000000, False, "no_hint"),
-    # mixed hint + no-hint: rule 1 forbids merging
-    (0b11111111, 0b00000000, False, "full_a_unhinted_b"),
-    (0b00001111, 0b00000000, False, "lo4_a_unhinted_b"),
-    (0b11110000, 0b00000000, False, "hi4_a_unhinted_b"),
-    (0b01010101, 0b00000000, False, "strided_a_unhinted_b"),
     # minimal mergeable pair: K=1 each, union {0,1}
     (0b00000001, 0b00000010, True, "merge_single_warp_pair"),
     # split warps in half: K=4 each, union covers all 8 warps.  Useful
@@ -331,9 +305,10 @@ _COMPILE_BLOCK_SHAPES = [(64, 64), (32, 128)]
     [_param_args(p) for p in _HINT_PARAMS],
     ids=[_param_id(p) for p in _HINT_PARAMS],
 )
-def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge):
+def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge, request):
     """Compile-only: asserts 1 fused vs 2 separate `tensor_load_to_lds`."""
     NUM_WARPS = 8
+    use_tdm_hint = _use_tdm_hint(request)
     signature = {
         "a_ptr": "*fp16",
         "b_ptr": "*fp16",
@@ -344,12 +319,14 @@ def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge
         "BLOCK_N": "constexpr",
         "HINT_A": "constexpr",
         "HINT_B": "constexpr",
+        "USE_HINT": "constexpr",
     }
     constexprs = {
         "BLOCK_M": BLOCK_M,
         "BLOCK_N": BLOCK_N,
         "HINT_A": HINT_A,
         "HINT_B": HINT_B,
+        "USE_HINT": use_tdm_hint,
     }
     k = triton.compile(
         gluon._runtime.GluonASTSource(
@@ -363,7 +340,10 @@ def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge
 
     amdgcn = k.asm["amdgcn"]
     n_tdm = len(re.findall(r"tensor_load_to_lds", amdgcn))
-    if expected_merge:
+    if not use_tdm_hint:
+        assert n_tdm == 2, (f"expected two unhinted tensor_load_to_lds for "
+                            f"HINT_A=0b{HINT_A:08b}, HINT_B=0b{HINT_B:08b}, got {n_tdm}\n{amdgcn}")
+    elif expected_merge:
         assert n_tdm == 1, (f"expected fused single tensor_load_to_lds for "
                             f"HINT_A=0b{HINT_A:08b}, HINT_B=0b{HINT_B:08b}, got {n_tdm}\n{amdgcn}")
     else:
@@ -385,10 +365,11 @@ _RUNTIME_BLOCK_SHAPES = [(64, 64), (128, 64)]
     [_param_args(p) for p in _HINT_PARAMS],
     ids=[_param_id(p) for p in _HINT_PARAMS],
 )
-def test_runtime_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge):
+def test_runtime_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge, request):
     """Runtime: c = a + b vs torch CPU reference; merging is perf-only."""
     M, N = 256, 512
     NUM_WARPS = 8
+    use_tdm_hint = _use_tdm_hint(request)
 
     # Keep all torch math on CPU: torch's HIP runtime often lacks
     # kernels for gfx1250 (rand/add/zeros_like hit hipErrorInvalidImage).
@@ -411,6 +392,7 @@ def test_runtime_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge
         BLOCK_N,
         HINT_A,
         HINT_B,
+        use_tdm_hint,
         num_warps=NUM_WARPS,
     )
 
@@ -445,6 +427,7 @@ def vector_add_tdm_kernel_4way(
     HINT_B: ttgl.constexpr,
     HINT_C: ttgl.constexpr,
     HINT_D: ttgl.constexpr,
+    USE_HINT: ttgl.constexpr,
 ):
     """Sum four tiles via four adjacent TDM copies.
 
@@ -475,6 +458,11 @@ def vector_add_tdm_kernel_4way(
     d_buf = ttgl.allocate_shared_memory(d_desc.dtype, d_desc.block_shape, d_desc.layout)
 
     # See `_HINT_PARAMS_4WAY` below for legal hint quadruples.
+    if not USE_HINT:
+        HINT_A = None
+        HINT_B = None
+        HINT_C = None
+        HINT_D = None
     ttgl.amd.gfx1250.tdm.async_load(a_desc, [off_m, off_n], a_buf, warp_used_hint=HINT_A)
     ttgl.amd.gfx1250.tdm.async_load(b_desc, [off_m, off_n], b_buf, warp_used_hint=HINT_B)
     ttgl.amd.gfx1250.tdm.async_load(c_desc, [off_m, off_n], c_buf, warp_used_hint=HINT_C)
@@ -511,9 +499,10 @@ _HINT_PARAMS_4WAY = [
     [_param_args(p) for p in _HINT_PARAMS_4WAY],
     ids=[_param_id(p) for p in _HINT_PARAMS_4WAY],
 )
-def test_compile_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, HINT_D):
+def test_compile_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, HINT_D, request):
     """Compile-only: every quadruple must fuse to a single intrinsic."""
     NUM_WARPS = 8
+    use_tdm_hint = _use_tdm_hint(request)
     signature = {
         "a_ptr": "*fp16",
         "b_ptr": "*fp16",
@@ -528,6 +517,7 @@ def test_compile_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, H
         "HINT_B": "constexpr",
         "HINT_C": "constexpr",
         "HINT_D": "constexpr",
+        "USE_HINT": "constexpr",
     }
     constexprs = {
         "BLOCK_M": BLOCK_M,
@@ -536,6 +526,7 @@ def test_compile_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, H
         "HINT_B": HINT_B,
         "HINT_C": HINT_C,
         "HINT_D": HINT_D,
+        "USE_HINT": use_tdm_hint,
     }
     k = triton.compile(
         gluon._runtime.GluonASTSource(
@@ -548,9 +539,10 @@ def test_compile_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, H
     )
     amdgcn = k.asm["amdgcn"]
     n_tdm = len(re.findall(r"tensor_load_to_lds", amdgcn))
-    assert n_tdm == 1, (f"expected fused single tensor_load_to_lds for "
-                        f"HINT_A=0b{HINT_A:08b}, HINT_B=0b{HINT_B:08b}, "
-                        f"HINT_C=0b{HINT_C:08b}, HINT_D=0b{HINT_D:08b}, got {n_tdm}\n{amdgcn}")
+    expected_tdm = 1 if use_tdm_hint else 4
+    assert n_tdm == expected_tdm, (f"expected {expected_tdm} tensor_load_to_lds for "
+                                  f"HINT_A=0b{HINT_A:08b}, HINT_B=0b{HINT_B:08b}, "
+                                  f"HINT_C=0b{HINT_C:08b}, HINT_D=0b{HINT_D:08b}, got {n_tdm}\n{amdgcn}")
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="TDM is only tested on gfx1250.")
@@ -560,11 +552,12 @@ def test_compile_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, H
     [_param_args(p) for p in _HINT_PARAMS_4WAY],
     ids=[_param_id(p) for p in _HINT_PARAMS_4WAY],
 )
-def test_runtime_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, HINT_D):
+def test_runtime_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, HINT_D, request):
     """Runtime: out = a+b+c+d; checks the 4-way fused intrinsic routes
     each member's bytes to its own buffer."""
     M, N = 256, 512
     NUM_WARPS = 8
+    use_tdm_hint = _use_tdm_hint(request)
 
     torch.manual_seed(0)
     a_cpu = torch.rand((M, N), dtype=torch.float16)
@@ -592,6 +585,7 @@ def test_runtime_vector_add_tdm_4way(BLOCK_M, BLOCK_N, HINT_A, HINT_B, HINT_C, H
         HINT_B,
         HINT_C,
         HINT_D,
+        use_tdm_hint,
         num_warps=NUM_WARPS,
     )
     expected = a_cpu + b_cpu + c_cpu + d_cpu
@@ -620,6 +614,7 @@ def vector_add_tdm_kernel_cache(
     HINT_B: ttgl.constexpr,
     CACHE_A: ttgl.constexpr,
     CACHE_B: ttgl.constexpr,
+    USE_HINT: ttgl.constexpr,
 ):
     """Two-tile vector add with explicit cache modifiers per copy.
 
@@ -644,6 +639,9 @@ def vector_add_tdm_kernel_cache(
     a_buf = ttgl.allocate_shared_memory(a_desc.dtype, a_desc.block_shape, a_desc.layout)
     b_buf = ttgl.allocate_shared_memory(b_desc.dtype, b_desc.block_shape, b_desc.layout)
 
+    if not USE_HINT:
+        HINT_A = None
+        HINT_B = None
     ttgl.amd.gfx1250.tdm.async_load(a_desc, [off_m, off_n], a_buf, warp_used_hint=HINT_A, cache_modifier=CACHE_A)
     ttgl.amd.gfx1250.tdm.async_load(b_desc, [off_m, off_n], b_buf, warp_used_hint=HINT_B, cache_modifier=CACHE_B)
     ttgl.amd.gfx1250.tdm.async_wait(0)
@@ -677,9 +675,10 @@ _CACHE_PARAMS = [
     [_param_args(p) for p in _CACHE_PARAMS],
     ids=[_param_id(p) for p in _CACHE_PARAMS],
 )
-def test_compile_vector_add_tdm_cache(BLOCK_M, BLOCK_N, CACHE_A, CACHE_B, expected_merge):
+def test_compile_vector_add_tdm_cache(BLOCK_M, BLOCK_N, CACHE_A, CACHE_B, expected_merge, request):
     """Compile-only: asserts rule 7 (matching cache modifiers)."""
     NUM_WARPS = 8
+    use_tdm_hint = _use_tdm_hint(request)
     HINT_A = 0b00001111  # warps {0,1,2,3}
     HINT_B = 0b11110000  # warps {4,5,6,7}; union covers all 8 warps
     signature = {
@@ -694,6 +693,7 @@ def test_compile_vector_add_tdm_cache(BLOCK_M, BLOCK_N, CACHE_A, CACHE_B, expect
         "HINT_B": "constexpr",
         "CACHE_A": "constexpr",
         "CACHE_B": "constexpr",
+        "USE_HINT": "constexpr",
     }
     constexprs = {
         "BLOCK_M": BLOCK_M,
@@ -702,6 +702,7 @@ def test_compile_vector_add_tdm_cache(BLOCK_M, BLOCK_N, CACHE_A, CACHE_B, expect
         "HINT_B": HINT_B,
         "CACHE_A": CACHE_A,
         "CACHE_B": CACHE_B,
+        "USE_HINT": use_tdm_hint,
     }
     k = triton.compile(
         gluon._runtime.GluonASTSource(
@@ -714,7 +715,10 @@ def test_compile_vector_add_tdm_cache(BLOCK_M, BLOCK_N, CACHE_A, CACHE_B, expect
     )
     amdgcn = k.asm["amdgcn"]
     n_tdm = len(re.findall(r"tensor_load_to_lds", amdgcn))
-    if expected_merge:
+    if not use_tdm_hint:
+        assert n_tdm == 2, (f"expected two unhinted tensor_load_to_lds for "
+                            f"CACHE_A={CACHE_A!r}, CACHE_B={CACHE_B!r}, got {n_tdm}\n{amdgcn}")
+    elif expected_merge:
         assert n_tdm == 1, (f"expected fused single tensor_load_to_lds for "
                             f"CACHE_A={CACHE_A!r}, CACHE_B={CACHE_B!r}, got {n_tdm}\n{amdgcn}")
     else:
@@ -731,11 +735,11 @@ if __name__ == "__main__":
     for p in _HINT_PARAMS:
         ha, hb, em, ident = p
         print(f"-- {ident}: HINT_A=0b{ha:08b}, HINT_B=0b{hb:08b}, expected_merge={em}")
-        test_runtime_vector_add_tdm(64, 64, ha, hb, em)
+        test_runtime_vector_add_tdm(64, 64, ha, hb, em, True)
         print("   OK")
     print("[4-way: vector_add_tdm_kernel_4way]")
     for p in _HINT_PARAMS_4WAY:
         ha, hb, hc, hd, ident = p
         print(f"-- {ident}: A=0b{ha:08b} B=0b{hb:08b} C=0b{hc:08b} D=0b{hd:08b}")
-        test_runtime_vector_add_tdm_4way(64, 64, ha, hb, hc, hd)
+        test_runtime_vector_add_tdm_4way(64, 64, ha, hb, hc, hd, True)
         print("   OK")

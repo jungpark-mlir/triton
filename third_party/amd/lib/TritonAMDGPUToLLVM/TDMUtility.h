@@ -124,8 +124,8 @@ struct TDMMergeGroupInfo {
   // Last member in program order; used to anchor the fused intrinsic's
   // insertion point so any pure ops between members dominate it.
   Operation *lastInProgramOrder = nullptr;
-  WarpHintInfo unionInfo; // decoded union of member hints
-  // Selector basis = unionInfo.basisBits \ first member's basisBits.  log2(N)
+  uint32_t unionHint = 0; // bitwise union of member warp_used_hint masks
+  // Selector basis = union basis bits \ first member's basis bits.  log2(N)
   // warp-id bit positions, used by emitTDMLoadStoreMerged to pick a member.
   SmallVector<int32_t, 5> selectorBits;
 };
