@@ -42,6 +42,25 @@ SmallVector<Value> unpackTDMDescriptor(RewriterBase &rewriter, Location loc,
 SmallVector<Value> scalarizeTDMDescriptor(RewriterBase &rewriter, Location loc,
                                           ArrayRef<Value> vectors);
 
+// Updates TDM descriptor fields in place.
+// Mirrors the parameter semantics of `amdg.update_tensor_descriptor`.
+//
+// - addOffsets (incremental): bumps global_addr by
+//   sum(addOffsets[i]*stride[i]) scaled by element size.  Empty = skip.
+// - setBounds  (rewrite):     overwrites tensor_dim absolutely.  Empty = skip.
+// - dest       (rewrite):     overwrites lds_addr.  Null = skip.
+// - pred       (rewrite):     overwrites pred.  Null = skip.
+// - barrier    (rewrite):     enables barrier signaling and writes barrier
+//                             addr.  Null = skip.
+//
+// Currently 2D-only; 3D-5D support TBD.
+void updateTensorDescriptor(RewriterBase &rewriter, Location loc,
+                            Type elementType, ArrayRef<int64_t> blockShape,
+                            Value &group0, Value &group1,
+                            ArrayRef<Value> addOffsets,
+                            ArrayRef<Value> setBounds, Value dest, Value pred,
+                            Value barrier);
+
 // Create a partially filled TDM descriptor (shared address and pred zeroed;
 // caller fills them later).  Returns 2 vector groups for 1D-2D, 4 for 3D-5D.
 SmallVector<Value> createTDMDescriptor(RewriterBase &rewriter, Location loc,
