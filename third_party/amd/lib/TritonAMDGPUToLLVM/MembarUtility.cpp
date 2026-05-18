@@ -122,18 +122,16 @@ static RankedTensorType getDistributedType(Operation *op) {
 // distributed encoding.
 static std::pair<SmallVector<unsigned>, int64_t> getWarpInfo(Operation *op) {
   if (auto tdm = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
-    // A warp hint changes which hardware warps write the tile, but local_load
-    // has no matching hint/predicate in its type. Keep the barrier unless a
-    // future analysis can prove the reader is predicated the same way.
+    // Hinted TDM writes only a subset of hardware warps. local_load has no
+    // matching reader-side predicate, so keep the barrier.
     if (tdm.getWarpUsedHintAttr())
       return {{}, 0};
 
     auto descTy = tdm.getDesc().getType();
     auto smemTy = tdm.getResult().getType();
-    // Partitioned shared encodings can use a partition-aware TDM warp
-    // distribution that differs from the default descriptor-shape distribution
-    // below. Keep this conservative until the filter computes the same
-    // encoding-aware distribution as TDM lowering.
+    // Partitioned shared TDM can use an encoding-aware warp distribution that
+    // differs from the default below. Keep this conservative until the filter
+    // uses the same mapping as lowering.
     if (isa<triton::gpu::PartitionedSharedEncodingAttr>(smemTy.getEncoding()))
       return {{}, 0};
 
