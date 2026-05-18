@@ -129,6 +129,14 @@ static std::pair<SmallVector<unsigned>, int64_t> getWarpInfo(Operation *op) {
       return {{}, 0};
 
     auto descTy = tdm.getDesc().getType();
+    auto smemTy = tdm.getResult().getType();
+    // Partitioned shared encodings can use a partition-aware TDM warp
+    // distribution that differs from the default descriptor-shape distribution
+    // below. Keep this conservative until the filter computes the same
+    // encoding-aware distribution as TDM lowering.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(smemTy.getEncoding()))
+      return {{}, 0};
+
     auto blockShape = SmallVector<int64_t>(descTy.getBlockType().getShape());
     int numWarps = triton::gpu::lookupNumWarps(tdm);
     int numDims = blockShape.size();

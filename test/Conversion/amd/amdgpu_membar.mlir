@@ -378,6 +378,49 @@ tt.func @warp_local_hinted_tdm_keeps_barrier(
 
 // -----
 
+// Warp-local barrier suppression currently stays conservative for partitioned
+// shared layouts. TDM lowering may use a partition-aware warp distribution, so
+// the filter must not compare against the default TDM distribution until it
+// computes the same encoding-aware mapping.
+#blocked_partitioned = #ttg.blocked<{sizePerThread = [8, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#inner_partitioned = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#shared_partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner_partitioned}>
+#smem_partitioned = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "hip:gfx1250"} {
+
+// CHECK-LABEL: warp_local_partitioned_keeps_barrier
+tt.func @warp_local_partitioned_keeps_barrier(
+    %desc: !tt.tensordesc<64x64xf16, #shared_partitioned>,
+    %pred: i32) {
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
+
+  %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_partitioned, #smem_partitioned, mutable> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<64x64xf16, #shared_partitioned> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
+
+  %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
+  // CHECK: amdg.async_tdm_wait
+  // CHECK-NEXT: ttg.barrier local
+
+  %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_partitioned, #smem_partitioned, mutable> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<64x64xf16, #shared_partitioned> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
+
+  %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_partitioned, #smem_partitioned, mutable> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
+  // CHECK: amdg.async_tdm_copy_global_to_local
+  // CHECK: ttg.barrier local
+  // CHECK: ttg.local_load
+  %load = ttg.local_load %slot0_r : !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable> -> tensor<64x64xf16, #blocked_partitioned>
+
+  tt.return
+}
+
+}
+
+// -----
+
 // Warp-local barrier suppression — mismatched warpsPerCTA negative test.
 //
 // TDM distributes warps as [4, 1] across the 64x64 tile, but the local_load's
