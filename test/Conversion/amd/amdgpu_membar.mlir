@@ -29,6 +29,7 @@ tt.func @pipelined_async_copy_local_to_global(%A: !tt.ptr<f16>) {
   // CHECK: tt.return
   tt.return
 }
+
 // Same as above but different order of ops
 // CHECK-LABEL: pipelined_async_copy_local_to_global_2
 tt.func @pipelined_async_copy_local_to_global_2(%A: !tt.ptr<f16>) {
@@ -327,6 +328,48 @@ tt.func @warp_local_padded(
   // CHECK-NOT: ttg.barrier local
   // CHECK: ttg.local_load
   %load = ttg.local_load %slot0_r : !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable> -> tensor<64x64xf16, #blocked_wl>
+
+  tt.return
+}
+
+}
+
+// -----
+
+// Warp-local barrier suppression must not apply when the TDM writer uses
+// warp_used_hint. The hint predicates inactive writer warps, but local_load has
+// no corresponding reader-side hint, so matching-looking warpsPerCTA is not
+// enough to prove warp-local ownership.
+#blocked_hint = #ttg.blocked<{sizePerThread = [8, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared_hint = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#smem_hint = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "hip:gfx1250"} {
+
+// CHECK-LABEL: warp_local_hinted_tdm_keeps_barrier
+tt.func @warp_local_hinted_tdm_keeps_barrier(
+    %desc: !tt.tensordesc<64x64xf16, #shared_hint>,
+    %pred: i32) {
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_hint, #smem_hint, mutable>
+
+  %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_hint, #smem_hint, mutable> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<64x64xf16, #shared_hint> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
+
+  %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
+  // CHECK: amdg.async_tdm_wait
+  // CHECK-NEXT: ttg.barrier local
+
+  %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_hint, #smem_hint, mutable> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred {warp_used_hint = 1 : i32} : !tt.tensordesc<64x64xf16, #shared_hint> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
+
+  %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_hint, #smem_hint, mutable> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
+  // CHECK: amdg.async_tdm_copy_global_to_local
+  // CHECK: ttg.barrier local
+  // CHECK: ttg.local_load
+  %load = ttg.local_load %slot0_r : !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable> -> tensor<64x64xf16, #blocked_hint>
 
   tt.return
 }

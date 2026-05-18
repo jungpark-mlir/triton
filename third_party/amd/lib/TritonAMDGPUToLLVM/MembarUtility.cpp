@@ -103,20 +103,16 @@ bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
 // Get the distributed tensor type (register side) from an op.
 static RankedTensorType getDistributedType(Operation *op) {
   return llvm::TypeSwitch<Operation *, RankedTensorType>(op)
-      .Case<triton::gpu::LocalLoadOp>(
-          [](auto op) {
-            return cast<RankedTensorType>(op.getResult().getType());
-          })
+      .Case<triton::gpu::LocalLoadOp>([](auto op) {
+        return cast<RankedTensorType>(op.getResult().getType());
+      })
       .Case<triton::gpu::LocalStoreOp>(
-          [](auto op) {
-            return cast<RankedTensorType>(op.getSrc().getType());
-          })
-      .Case<triton::gpu::LocalAllocOp>(
-          [](auto op) -> RankedTensorType {
-            if (op.getSrc())
-              return cast<RankedTensorType>(op.getSrc().getType());
-            return RankedTensorType();
-          })
+          [](auto op) { return cast<RankedTensorType>(op.getSrc().getType()); })
+      .Case<triton::gpu::LocalAllocOp>([](auto op) -> RankedTensorType {
+        if (op.getSrc())
+          return cast<RankedTensorType>(op.getSrc().getType());
+        return RankedTensorType();
+      })
       .Default([](Operation *) { return RankedTensorType(); });
 }
 
@@ -126,9 +122,14 @@ static RankedTensorType getDistributedType(Operation *op) {
 // distributed encoding.
 static std::pair<SmallVector<unsigned>, int64_t> getWarpInfo(Operation *op) {
   if (auto tdm = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
+    // A warp hint changes which hardware warps write the tile, but local_load
+    // has no matching hint/predicate in its type. Keep the barrier unless a
+    // future analysis can prove the reader is predicated the same way.
+    if (tdm.getWarpUsedHintAttr())
+      return {{}, 0};
+
     auto descTy = tdm.getDesc().getType();
-    auto blockShape =
-        SmallVector<int64_t>(descTy.getBlockType().getShape());
+    auto blockShape = SmallVector<int64_t>(descTy.getBlockType().getShape());
     int numWarps = triton::gpu::lookupNumWarps(tdm);
     int numDims = blockShape.size();
     SmallVector<int> warpsRaw(numDims);
@@ -151,8 +152,7 @@ static std::pair<SmallVector<unsigned>, int64_t> getWarpInfo(Operation *op) {
 // reshape+trans, local_load sees a 3D view with warpsPerCTA = [4, 1, 1].
 // Both distribute all 4 warps along the row/batch dimension.
 // After normalization: [4] == [4] -> match.
-static SmallVector<unsigned>
-normalizeWarpsPerCTA(SmallVector<unsigned> warps) {
+static SmallVector<unsigned> normalizeWarpsPerCTA(SmallVector<unsigned> warps) {
   while (warps.size() > 1 && warps.back() == 1)
     warps.pop_back();
   return warps;
@@ -161,7 +161,8 @@ normalizeWarpsPerCTA(SmallVector<unsigned> warps) {
 // Returns true if both ops distribute warps identically over same-sized tiles,
 // proving each warp accesses a disjoint set of shared memory addresses on both
 // sides. The tile element count check guards against false positives when
-// different-shaped allocations reuse the same physical memory (dealloc/realloc).
+// different-shaped allocations reuse the same physical memory
+// (dealloc/realloc).
 static bool hasMatchingWarpDistribution(Operation *op1, Operation *op2) {
   auto [warps1, elems1] = getWarpInfo(op1);
   auto [warps2, elems2] = getWarpInfo(op2);
