@@ -1,11 +1,11 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TargetInfo.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Conversion/TritonGPUToLLVM/ElementwiseOpToLLVMBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
@@ -15,20 +15,27 @@
 
 using namespace mlir;
 
+using mlir::getElementTypeOrSelf;
 using mlir::triton::gpu::appendOrGetExternFuncOp;
 using mlir::triton::gpu::ElementwiseOpConversion;
 using mlir::triton::gpu::ElementwiseOpConversionBase;
-using mlir::triton::gpu::getElementType;
 using mlir::triton::gpu::getFunctionType;
 using mlir::triton::gpu::MultipleOperandsRange;
+using triton::amdgpu::ISAFamily;
 
 using ConverterT = std::function<SmallVector<Value>(
     Location, ConversionPatternRewriter &, const SmallVector<Value> &)>;
 
 namespace {
-bool isCDNA4(AMD::ISAFamily family) { return family == AMD::ISAFamily::CDNA4; }
-bool isCDNA4OrHigher(AMD::ISAFamily family) {
-  return family == AMD::ISAFamily::CDNA4 || family == AMD::ISAFamily::GFX1250;
+
+static Value cvtFp32ToFp16RTNE_oneValue(Location loc, RewriterBase &rewriter,
+                                        const Value &v) {
+  return LLVM::FPTruncOp::create(rewriter, loc, f16_ty, v);
+}
+
+bool isCDNA4(ISAFamily family) { return family == ISAFamily::CDNA4; }
+bool isCDNA4OrHigher(ISAFamily family) {
+  return family == ISAFamily::CDNA4 || family == ISAFamily::GFX1250;
 }
 
 //===----------------------------------------------------------------------===//
@@ -269,7 +276,7 @@ cvtScalePkUpcastFromFp8(Location loc, ConversionPatternRewriter &rewriter,
   return ret;
 }
 
-// Convert Ocp Fp8/Bf8 to Fp16/Bf16/Fp32 on CDNA4
+// Convert Ocp Fp8/Bf8 to Fp16/Bf16/Fp32 on gfx1250+
 template <typename ConvertOp>
 static SmallVector<Value>
 cvtScalePk8UpcastFromFp8(Location loc, ConversionPatternRewriter &rewriter,
@@ -313,8 +320,10 @@ cvtScalePk8UpcastFromFp8(Location loc, ConversionPatternRewriter &rewriter,
   }
   auto vIn = b.bitcast(vI8In, vInTy);
 
+  // Create fp8(1.0) as scale
   Value scale = b.i32_val(127);
-  IntegerAttr opscale = rewriter.getI32IntegerAttr(0b1000);
+  // OpScale 0 = use bits [0:7] from scale
+  IntegerAttr opscale = rewriter.getI32IntegerAttr(0);
 
   auto result = ConvertOp::create(rewriter, loc, vResTy, vIn, scale, opscale);
   SmallVector<Value> ret(inSize);
@@ -337,7 +346,6 @@ cvtScalePk4DowncastToFp8(Location loc, ConversionPatternRewriter &rewriter,
   Value v2I16Vec = b.undef(v2I16Ty);
   Value scale = b.f32_val(1);
 
-  Value result;
   if constexpr (std::is_same_v<ConvertOp, ROCDL::CvtScaleF32PkFp8F32Op> ||
                 std::is_same_v<ConvertOp, ROCDL::CvtScaleF32PkBf8F32Op>) {
     v2I16Vec =
@@ -419,8 +427,6 @@ cvtScalePk8DowncastToFp8(Location loc, ConversionPatternRewriter &rewriter,
     inVec = b.insert_element(vFPInTy, inVec, v[i], b.i32_val(i));
   }
 
-  Type v4I8Ty = vec_ty(i8_ty, 4);
-
   auto resVec = ConvertOp::create(rewriter, loc, vFPResTy, inVec, b.f32_val(1));
   auto outVec = b.bitcast(resVec, vFPOutTy);
 
@@ -489,7 +495,7 @@ Fp16_to_Fp8E5M2_RTNE_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                 v);
 }
 
-ConverterT Fp16_to_Fp8E5M2_RTNE(AMD::ISAFamily isaFamily) {
+ConverterT Fp16_to_Fp8E5M2_RTNE(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Fp16_to_Fp8E5M2_RTNE_HW
                                     : Fp16_to_Fp8E5M2_RTNE_SW;
 }
@@ -719,7 +725,7 @@ Fp16_to_Fp8E4M3FN_RTNE_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                 v);
 }
 
-ConverterT Fp16_to_Fp8E4M3FN_RTNE(AMD::ISAFamily isaFamily) {
+ConverterT Fp16_to_Fp8E4M3FN_RTNE(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Fp16_to_Fp8E4M3FN_RTNE_HW
                                     : Fp16_to_Fp8E4M3FN_RTNE_SW;
 }
@@ -773,7 +779,6 @@ static SmallVector<Value> cvtPkFp32ToF8(Location loc,
                                         const SmallVector<Value> &v) {
   assert(v.size() == 4);
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  Type v2I16Ty = vec_ty(i16_ty, 2);
   Value result = b.undef(i32_ty);
 
   result = ConvertOp::create(rewriter, loc, i32_ty, v[0], v[1], result,
@@ -840,7 +845,7 @@ Fp32_to_Fp8E4M3FN_RTNE_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                 v);
 }
 
-ConverterT Fp32_to_Fp8E4M3FN_RTNE(AMD::ISAFamily isaFamily) {
+ConverterT Fp32_to_Fp8E4M3FN_RTNE(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Fp32_to_Fp8E4M3FN_RTNE_HW
                                     : Fp32_to_Fp8E4M3FN_RTNE_SW;
 }
@@ -936,7 +941,7 @@ Fp32_to_Fp8E5M2_RTNE_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                 v);
 }
 
-ConverterT Fp32_to_Fp8E5M2_RTNE(AMD::ISAFamily isaFamily) {
+ConverterT Fp32_to_Fp8E5M2_RTNE(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Fp32_to_Fp8E5M2_RTNE_HW
                                     : Fp32_to_Fp8E5M2_RTNE_SW;
 }
@@ -961,9 +966,9 @@ Fp32_to_Fp8E5M2FNUZ_SW(Location loc, ConversionPatternRewriter &rewriter,
   return result;
 }
 
-ConverterT Fp32_to_Fp8E5M2FNUZ(AMD::ISAFamily isaFamily) {
-  return isaFamily == AMD::ISAFamily::CDNA3 ? Fp32_to_Fp8E5M2FNUZ_HW
-                                            : Fp32_to_Fp8E5M2FNUZ_SW;
+ConverterT Fp32_to_Fp8E5M2FNUZ(ISAFamily isaFamily) {
+  return isaFamily == ISAFamily::CDNA3 ? Fp32_to_Fp8E5M2FNUZ_HW
+                                       : Fp32_to_Fp8E5M2FNUZ_SW;
 }
 
 // Fp32 -> Nanoo Fp8 on CDNA3
@@ -986,8 +991,9 @@ Fp32_to_Fp8E4M3FNUZ_SW(Location loc, ConversionPatternRewriter &rewriter,
   return result;
 }
 
-static ConverterT Fp32_to_Fp8E4M3FNUZ(AMD::ISAFamily isaFamily) {
-  return isCDNA4(isaFamily) ? Fp32_to_Fp8E4M3FNUZ_SW : Fp32_to_Fp8E4M3FNUZ_HW;
+static ConverterT Fp32_to_Fp8E4M3FNUZ(ISAFamily isaFamily) {
+  return isaFamily == ISAFamily::CDNA3 ? Fp32_to_Fp8E4M3FNUZ_HW
+                                       : Fp32_to_Fp8E4M3FNUZ_SW;
 }
 
 // Nanoo Bf8 -> Fp32 on CDNA3+
@@ -1026,9 +1032,9 @@ Fp16_to_Fp8E5M2FNUZ_HW(Location loc, ConversionPatternRewriter &rewriter,
   return cvtPkFp32ToF8<ROCDL::CvtPkBf8F32Op>(loc, rewriter, f32Vec);
 }
 
-ConverterT Fp16_to_Fp8E5M2FNUZ(AMD::ISAFamily isaFamily) {
-  return isaFamily == AMD::ISAFamily::CDNA3 ? Fp16_to_Fp8E5M2FNUZ_HW
-                                            : Fp16_to_Fp8E5M2FNUZ_SW;
+ConverterT Fp16_to_Fp8E5M2FNUZ(ISAFamily isaFamily) {
+  return isaFamily == ISAFamily::CDNA3 ? Fp16_to_Fp8E5M2FNUZ_HW
+                                       : Fp16_to_Fp8E5M2FNUZ_SW;
 }
 
 static Value Fp8E4M3FN_to_Fp16_oneValue(Location loc,
@@ -1096,7 +1102,7 @@ Fp8E4M3FN_to_Fp16_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                v);
 }
 
-ConverterT Fp8E4M3FN_to_Fp16(AMD::ISAFamily isaFamily) {
+ConverterT Fp8E4M3FN_to_Fp16(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Fp8E4M3FN_to_Fp16_HW
                                     : Fp8E4M3FN_to_Fp16_SW;
 }
@@ -1142,7 +1148,7 @@ Fp8E5M2_to_Fp16_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                v);
 }
 
-ConverterT Fp8E5M2_to_Fp16(AMD::ISAFamily isaFamily) {
+ConverterT Fp8E5M2_to_Fp16(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Fp8E5M2_to_Fp16_HW : Fp8E5M2_to_Fp16_SW;
 }
 
@@ -1253,7 +1259,7 @@ static SmallVector<Value> Fp32_to_F16_RTNE(Location loc,
                                            ConversionPatternRewriter &rewriter,
                                            Type inElemTy, Type outElemTy,
                                            MultipleOperandsRange operands,
-                                           AMD::ISAFamily isaFamily) {
+                                           ISAFamily isaFamily) {
   // For CDNA4 we can potentially use packed v_cvt_pk_[b]f16_f32 instructions.
   if (isCDNA4OrHigher(isaFamily)) {
     SmallVector<Value> inVals;
@@ -1329,14 +1335,14 @@ Fp8E5M2FNUZ_to_Fp16_HW(Location loc, ConversionPatternRewriter &rewriter,
 
   // Convert fp32 to fp16
   for (size_t i = 0; i < 4; i++)
-    ret[i] = LLVM::AMD::cvtFp32ToFp16RTNE_oneValue(loc, rewriter, ret[i]);
+    ret[i] = cvtFp32ToFp16RTNE_oneValue(loc, rewriter, ret[i]);
 
   return ret;
 }
 
-ConverterT Fp8E5M2FNUZ_to_Fp16(AMD::ISAFamily isaFamily) {
-  return isaFamily == AMD::ISAFamily::CDNA3 ? Fp8E5M2FNUZ_to_Fp16_HW
-                                            : Fp8E5M2FNUZ_to_Fp16_SW;
+ConverterT Fp8E5M2FNUZ_to_Fp16(ISAFamily isaFamily) {
+  return isaFamily == ISAFamily::CDNA3 ? Fp8E5M2FNUZ_to_Fp16_HW
+                                       : Fp8E5M2FNUZ_to_Fp16_SW;
 }
 
 // OCP Bf8/Fp8 -> Bf16
@@ -1433,7 +1439,7 @@ Fp8E5M2_to_Bf16_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                 v);
 }
 
-ConverterT Fp8E5M2_to_Bf16(AMD::ISAFamily isaFamily) {
+ConverterT Fp8E5M2_to_Bf16(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Fp8E5M2_to_Bf16_HW : Fp8E5M2_to_Bf16_SW;
 }
 
@@ -1526,7 +1532,7 @@ Bf16_to_Fp8E5M2_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                  v);
 }
 
-static ConverterT Bf16_to_Fp8E5M2(AMD::ISAFamily isaFamily) {
+static ConverterT Bf16_to_Fp8E5M2(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Bf16_to_Fp8E5M2_HW : Bf16_to_Fp8E5M2_SW;
 }
 
@@ -1554,7 +1560,7 @@ Bf16_to_Fp8E4M3FN_RTNE_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                  v);
 }
 
-ConverterT Bf16_to_Fp8E4M3FN(AMD::ISAFamily isaFamily) {
+ConverterT Bf16_to_Fp8E4M3FN(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Bf16_to_Fp8E4M3FN_RTNE_HW
                                     : Bf16_to_Fp8E4M3FN_RTNE_SW;
 }
@@ -1578,7 +1584,7 @@ Fp8E4M3FN_to_Bf16_HW(Location loc, ConversionPatternRewriter &rewriter,
                                                                 v);
 }
 
-ConverterT Fp8E4M3FN_to_Bf16(AMD::ISAFamily isaFamily) {
+ConverterT Fp8E4M3FN_to_Bf16(ISAFamily isaFamily) {
   return isCDNA4OrHigher(isaFamily) ? Fp8E4M3FN_to_Bf16_HW
                                     : Fp8E4M3FN_to_Bf16_SW;
 }
@@ -1646,7 +1652,7 @@ Fp8E4M3FNUZ_to_Bf16_SW(Location loc, ConversionPatternRewriter &rewriter,
           b.extract_element(bf16_ty, out0, b.i32_val(1))};
 }
 
-static ConverterT Fp8E4M3FNUZ_to_Bf16(AMD::ISAFamily isaFamily) {
+static ConverterT Fp8E4M3FNUZ_to_Bf16(ISAFamily isaFamily) {
   return isCDNA4(isaFamily) ? Fp8E4M3FNUZ_to_Bf16_SW : Fp8E4M3FNUZ_to_Bf16_HW;
 }
 
@@ -1672,7 +1678,7 @@ Bf16_to_Fp8E4M3FNUZ_SW(Location loc, ConversionPatternRewriter &rewriter,
   return result;
 }
 
-static ConverterT Bf16_to_Fp8E4M3FNUZ(AMD::ISAFamily isaFamily) {
+static ConverterT Bf16_to_Fp8E4M3FNUZ(ISAFamily isaFamily) {
   return isCDNA4(isaFamily) ? Bf16_to_Fp8E4M3FNUZ_SW : Bf16_to_Fp8E4M3FNUZ_HW;
 }
 
@@ -1709,7 +1715,7 @@ Bf16_to_Fp8E5M2FNUZ_SW(Location loc, ConversionPatternRewriter &rewriter,
   return result;
 }
 
-static ConverterT Bf16_to_Fp8E5M2FNUZ(AMD::ISAFamily isaFamily) {
+static ConverterT Bf16_to_Fp8E5M2FNUZ(ISAFamily isaFamily) {
   return isCDNA4(isaFamily) ? Bf16_to_Fp8E5M2FNUZ_SW : Bf16_to_Fp8E5M2FNUZ_HW;
 }
 
@@ -1786,14 +1792,14 @@ Fp8E4M3FNUZ_to_Fp16_HW(Location loc, ConversionPatternRewriter &rewriter,
 
   // Convert fp32 to fp16
   for (size_t i = 0; i < 4; i++)
-    ret[i] = LLVM::AMD::cvtFp32ToFp16RTNE_oneValue(loc, rewriter, ret[i]);
+    ret[i] = cvtFp32ToFp16RTNE_oneValue(loc, rewriter, ret[i]);
 
   return ret;
 }
 
-static ConverterT Fp8E4M3FNUZ_to_Fp16(AMD::ISAFamily isaFamily) {
-  return isaFamily == AMD::ISAFamily::CDNA3 ? Fp8E4M3FNUZ_to_Fp16_HW
-                                            : Fp8E4M3FNUZ_to_Fp16_SW;
+static ConverterT Fp8E4M3FNUZ_to_Fp16(ISAFamily isaFamily) {
+  return isaFamily == ISAFamily::CDNA3 ? Fp8E4M3FNUZ_to_Fp16_HW
+                                       : Fp8E4M3FNUZ_to_Fp16_SW;
 }
 
 static SmallVector<Value>
@@ -1820,9 +1826,9 @@ Fp16_to_Fp8E4M3FNUZ_HW(Location loc, ConversionPatternRewriter &rewriter,
   return cvtPkFp32ToF8<ROCDL::CvtPkFp8F32Op>(loc, rewriter, f32Vec);
 }
 
-static ConverterT Fp16_to_Fp8E4M3FNUZ(AMD::ISAFamily isaFamily) {
-  return isaFamily == AMD::ISAFamily::CDNA3 ? Fp16_to_Fp8E4M3FNUZ_HW
-                                            : Fp16_to_Fp8E4M3FNUZ_SW;
+static ConverterT Fp16_to_Fp8E4M3FNUZ(ISAFamily isaFamily) {
+  return isaFamily == ISAFamily::CDNA3 ? Fp16_to_Fp8E4M3FNUZ_HW
+                                       : Fp16_to_Fp8E4M3FNUZ_SW;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1834,7 +1840,7 @@ struct FpToFpOpConversion
     : public ElementwiseOpConversionBase<triton::FpToFpOp, FpToFpOpConversion> {
   explicit FpToFpOpConversion(LLVMTypeConverter &typeConverter,
                               ModuleAxisInfoAnalysis &axisAnalysisPass,
-                              AMD::ISAFamily isaFamily,
+                              ISAFamily isaFamily,
                               PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
         isaFamily(isaFamily) {}
@@ -1848,7 +1854,6 @@ struct FpToFpOpConversion
   FailureOr<ConverterT>
   getConversionFunc(Type srcTy, Type dstTy,
                     std::optional<RoundingMode> roundingMode) const {
-    auto F8E4M3B15TyID = TypeID::get<Float8E4M3B11FNUZType>();
     auto F8E4M3FNUZTyID = TypeID::get<Float8E4M3FNUZType>();
     auto F8E5M2FNUZTyID = TypeID::get<Float8E5M2FNUZType>();
     auto F8E5M2TyID = TypeID::get<Float8E5M2Type>();
@@ -1856,7 +1861,6 @@ struct FpToFpOpConversion
     auto F16TyID = TypeID::get<Float16Type>();
     auto BF16TyID = TypeID::get<BFloat16Type>();
     auto F32TyID = TypeID::get<Float32Type>();
-    auto F64TyID = TypeID::get<Float64Type>();
 
     auto undefRounding = static_cast<RoundingMode>(-1);
 
@@ -1932,26 +1936,26 @@ struct FpToFpOpConversion
          isRTZ) ||
         (isa<Float32Type, Float16Type>(srcElementType) &&
          isa<Float8E4M3FNUZType, Float8E5M2FNUZType>(dstElementType) &&
-         isaFamily != AMD::ISAFamily::CDNA3)) {
+         isaFamily != ISAFamily::CDNA3)) {
       return 2;
     }
 
     // special upcast for CDNA4
     // nanoo fp8 -> bf16 on CDNA4 (numElements = 2)
-    if ((isaFamily == AMD::ISAFamily::CDNA4) &&
+    if ((isaFamily == ISAFamily::CDNA4) &&
         isa<Float8E4M3FNUZType>(srcElementType) && dstElementType.isBF16()) {
       return 2;
     }
 
     // special downcast cases for GFX1250+
-    if ((isaFamily == AMD::ISAFamily::GFX1250) &&
+    if ((isaFamily == ISAFamily::GFX1250) &&
         ((isa<Float32Type, Float16Type, BFloat16Type>(srcElementType))) &&
         ((isa<Float8E4M3FNType, Float8E5M2Type>(dstElementType))) && isRTNE) {
       return 8;
     }
 
     // special upcast cases for GFX1250+
-    if ((isaFamily == AMD::ISAFamily::GFX1250) &&
+    if ((isaFamily == ISAFamily::GFX1250) &&
         ((isa<Float8E5M2Type, Float8E4M3FNType>(srcElementType))) &&
         ((isa<Float16Type, BFloat16Type, Float32Type>(dstElementType)))) {
       return 8;
@@ -1966,8 +1970,8 @@ struct FpToFpOpConversion
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto srcElementType = getElementType(op.getSrc());
-    auto dstElementType = getElementType(op.getResult());
+    auto srcElementType = getElementTypeOrSelf(op.getSrc());
+    auto dstElementType = getElementTypeOrSelf(op.getResult());
 
     auto roundingMode = op.getRounding();
     if (srcElementType.isF32() &&
@@ -1999,7 +2003,7 @@ struct FpToFpOpConversion
         !(isCDNA4OrHigher(isaFamily) &&
           (llvm::isa<Float8E4M3FNType, Float8E4M3FNUZType, Float8E5M2Type,
                      Float8E5M2FNUZType>(dstElementType))) &&
-        !(isaFamily == AMD::ISAFamily::CDNA3 &&
+        !(isaFamily == ISAFamily::CDNA3 &&
           (llvm::isa<Float8E4M3FNUZType, Float8E5M2FNUZType>(
               dstElementType))) &&
         !(!isCDNA4OrHigher(isaFamily) &&
@@ -2012,7 +2016,7 @@ struct FpToFpOpConversion
         (isDstFP32 &&
          !(isCDNA4OrHigher(isaFamily) &&
            (llvm::isa<Float8E4M3FNType, Float8E5M2Type>(srcElementType))) &&
-         !(isaFamily == AMD::ISAFamily::CDNA3 &&
+         !(isaFamily == ISAFamily::CDNA3 &&
            (llvm::isa<Float8E4M3FNUZType, Float8E5M2FNUZType>(
                srcElementType))));
 
@@ -2042,7 +2046,7 @@ struct FpToFpOpConversion
         inVals = convertFp32ToFp16RTNE(loc, rewriter, inVals, f16_ty);
       else {
         for (Value &v : inVals)
-          v = LLVM::AMD::cvtFp32ToFp16RTNE_oneValue(loc, rewriter, v);
+          v = cvtFp32ToFp16RTNE_oneValue(loc, rewriter, v);
       }
     }
 
@@ -2087,7 +2091,7 @@ struct FpToFpOpConversion
   }
 
 private:
-  AMD::ISAFamily isaFamily;
+  ISAFamily isaFamily;
 };
 
 template <typename OP>
@@ -2099,6 +2103,33 @@ Value EmitDualBF16ElementwiseOp(Location loc,
   auto result = OP::create(rewriter, loc, f32_ty, v0, v1);
   return convertFp32ToBf16(loc, rewriter, result, RoundingMode::RTNE);
 }
+
+// Override pattern that packs adjacent elementwise ops into vector LLVM ops.
+// The default elementwise patterns remain target-agnostic.
+template <typename SourceOp, typename LLVMOp>
+struct PackedArithOpConversion
+    : ElementwiseOpConversionBase<SourceOp,
+                                  PackedArithOpConversion<SourceOp, LLVMOp>> {
+  using Base =
+      ElementwiseOpConversionBase<SourceOp,
+                                  PackedArithOpConversion<SourceOp, LLVMOp>>;
+  using OpAdaptor = typename Base::OpAdaptor;
+
+  using Base::Base;
+
+  SmallVector<Value> createDestOps(SourceOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    if (operands.size() < 2 || !(elemTy.isF32() || elemTy.isBF16()))
+      return {};
+
+    Value va = packLLVector(loc, {operands[0][0], operands[1][0]}, rewriter);
+    Value vb = packLLVector(loc, {operands[0][1], operands[1][1]}, rewriter);
+    Value vr = LLVMOp::create(rewriter, loc, va.getType(), va, vb);
+    return unpackLLVector(loc, vr, rewriter);
+  }
+};
 
 struct FDivOpConversion
     : ElementwiseOpConversionBase<arith::DivFOp, FDivOpConversion> {
@@ -2119,7 +2150,7 @@ struct FMulOpConversion
 
   explicit FMulOpConversion(LLVMTypeConverter &typeConverter,
                             ModuleAxisInfoAnalysis &axisAnalysisPass,
-                            AMD::ISAFamily isaFamily,
+                            ISAFamily isaFamily,
                             PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
         isaFamily(isaFamily) {}
@@ -2128,10 +2159,10 @@ struct FMulOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    auto lhsElemTy = getElementType(op.getLhs());
-    auto rhsElemTy = getElementType(op.getRhs());
+    auto lhsElemTy = getElementTypeOrSelf(op.getLhs());
+    auto rhsElemTy = getElementTypeOrSelf(op.getRhs());
     if (lhsElemTy.isBF16() && rhsElemTy.isBF16()) {
-      if (isRDNA(isaFamily)) {
+      if (triton::amdgpu::isRDNA(isaFamily)) {
         // To avoid casting to/from fp32, we compute a dot product with one
         // element of each vector set to zero.
         auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -2154,7 +2185,7 @@ struct FMulOpConversion
   }
 
 private:
-  AMD::ISAFamily isaFamily;
+  ISAFamily isaFamily;
 };
 
 struct FAddOpConversion
@@ -2165,8 +2196,8 @@ struct FAddOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    auto lhsElemTy = getElementType(op.getLhs());
-    auto rhsElemTy = getElementType(op.getRhs());
+    auto lhsElemTy = getElementTypeOrSelf(op.getLhs());
+    auto rhsElemTy = getElementTypeOrSelf(op.getRhs());
     if (lhsElemTy.isBF16() && rhsElemTy.isBF16()) {
       return {EmitDualBF16ElementwiseOp<LLVM::FAddOp>(loc, rewriter, operands)};
     } else {
@@ -2184,8 +2215,8 @@ struct FSubOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    auto lhsElemTy = getElementType(op.getLhs());
-    auto rhsElemTy = getElementType(op.getRhs());
+    auto lhsElemTy = getElementTypeOrSelf(op.getLhs());
+    auto rhsElemTy = getElementTypeOrSelf(op.getRhs());
     if (lhsElemTy.isBF16() && rhsElemTy.isBF16()) {
       return {EmitDualBF16ElementwiseOp<LLVM::FSubOp>(loc, rewriter, operands)};
     } else {
@@ -2216,8 +2247,8 @@ struct SIToFPOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    Type inElemTy = getElementType(op.getIn());
-    Type outElemTy = getElementType(op.getOut());
+    Type inElemTy = getElementTypeOrSelf(op.getIn());
+    Type outElemTy = getElementTypeOrSelf(op.getOut());
     if (outElemTy.isBF16() && inElemTy.isInteger(8) && operands.size() >= 4) {
       SmallVector<Value> inVals = {operands[0][0], operands[1][0],
                                    operands[2][0], operands[3][0]};
@@ -2242,7 +2273,7 @@ struct FPToSIOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    auto inElemTy = getElementType(op.getIn());
+    auto inElemTy = getElementTypeOrSelf(op.getIn());
     if (inElemTy.isBF16()) {
       auto value = convertBf16ToFp32(loc, rewriter, operands[0][0]);
       return {LLVM::FPToSIOp::create(rewriter, loc, elemTy, value)};
@@ -2260,9 +2291,9 @@ struct ExtFOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    auto inElemTy = getElementType(op.getIn());
+    auto inElemTy = getElementTypeOrSelf(op.getIn());
     if (inElemTy.isBF16()) {
-      auto outElemTy = getElementType(op.getOut());
+      auto outElemTy = getElementTypeOrSelf(op.getOut());
       assert(outElemTy.isF32() && "unsupported conversion");
       return {convertBf16ToFp32(loc, rewriter, operands[0][0])};
     } else {
@@ -2277,7 +2308,7 @@ struct TruncFOpConversion
 
   explicit TruncFOpConversion(LLVMTypeConverter &typeConverter,
                               ModuleAxisInfoAnalysis &axisAnalysisPass,
-                              AMD::ISAFamily isaFamily,
+                              ISAFamily isaFamily,
                               PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
         isaFamily(isaFamily) {}
@@ -2286,8 +2317,8 @@ struct TruncFOpConversion
                                    ConversionPatternRewriter &rewriter,
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
-    auto outElemTy = getElementType(op.getOut());
-    auto inElemTy = getElementType(op.getIn());
+    auto outElemTy = getElementTypeOrSelf(op.getOut());
+    auto inElemTy = getElementTypeOrSelf(op.getIn());
     if (inElemTy.isF32() && (outElemTy.isBF16() || outElemTy.isF16())) {
       return Fp32_to_F16_RTNE(loc, rewriter, inElemTy, outElemTy, operands,
                               isaFamily);
@@ -2296,7 +2327,7 @@ struct TruncFOpConversion
   }
 
 private:
-  AMD::ISAFamily isaFamily;
+  ISAFamily isaFamily;
 };
 
 struct ExpOpConversionApprox
@@ -2452,7 +2483,7 @@ struct SqrtOpConversion
     // llvm.amdgcn.sqrt.f32 provides direct access to v_sqrt_f32, which provides
     // 1ULP accuracy and flushs denorms.
     Value intrinsicsOutput =
-        ROCDL::ROCDLSqrt::create(rewriter, loc, elemTy, operands[0]);
+        ROCDL::ROCDLSqrt::create(rewriter, loc, elemTy, scaledSrc);
 
     if (!ftz) {
       // In case of non-ftz, we need to calibrate the results by scaling down by
@@ -2550,6 +2581,16 @@ void populateElementwiseOpToLLVMPatterns(
       typeConverter, axisInfoAnalysis, benefit);
   patterns.add<ElementwiseOpConversion<triton::PreciseSqrtOp, LLVM::SqrtOp>>(
       typeConverter, axisInfoAnalysis, benefit);
+
+  if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
+    auto gfx1250Benefit = benefit.getBenefit() + 1;
+    patterns.add<PackedArithOpConversion<arith::SubFOp, LLVM::FSubOp>>(
+        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+    patterns.add<PackedArithOpConversion<arith::AddFOp, LLVM::FAddOp>>(
+        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+    patterns.add<PackedArithOpConversion<arith::MulFOp, LLVM::FMulOp>>(
+        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+  }
 
   patterns.add<FDivOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FSubOpConversion>(typeConverter, axisInfoAnalysis, benefit);

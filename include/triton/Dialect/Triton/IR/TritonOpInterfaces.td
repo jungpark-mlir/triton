@@ -69,7 +69,6 @@ def DotOpInterface : OpInterface<"DotOpInterface"> {
         auto aTy = cast<ShapedType>($_op.getA().getType());
         auto bTy = cast<ShapedType>($_op.getB().getType());
         auto cTy = cast<ShapedType>($_op->getOperand(2).getType());
-        auto dTy = cast<ShapedType>($_op.getD().getType());
         auto aShape = aTy.getShape();
         auto bShape = bTy.getShape();
         auto cShape = cTy.getShape();
@@ -111,6 +110,41 @@ def TT_DescriptorStoreLikeOpInterface : OpInterface<"DescriptorStoreLikeOpInterf
       /*retType=*/"::mlir::OpOperand&",
       /*methodName=*/"getSrcMutable",
       /*args=*/(ins)>,
+  ];
+}
+
+def TT_DescriptorLoadLikeOpInterface : OpInterface<"DescriptorLoadLikeOpInterface", [TT_DescriptorOpInterface]> {
+  let description = [{
+    Common marker interface for operations that load from tensor descriptors.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+}
+
+def PredicatedOpInterface : OpInterface<"PredicatedOpInterface"> {
+  let description = [{
+    Common interface for operations that carry a predicate or mask operand that
+    can be combined with a pipeline predicate.
+  }];
+
+  let cppNamespace = "::mlir::triton";
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/"Return the current predicate or mask operand.",
+      /*retType=*/"::mlir::Value",
+      /*methodName=*/"getPredicateOperand",
+      /*args=*/(ins)>,
+    InterfaceMethod<
+      /*desc=*/"Update the predicate or mask operand.",
+      /*retType=*/"void",
+      /*methodName=*/"setPredicateOperand",
+      /*args=*/(ins "::mlir::Value":$pred)>,
+    InterfaceMethod<
+      /*desc=*/"Return a type whose shape determines the predicate operand type.",
+      /*retType=*/"::mlir::Type",
+      /*methodName=*/"getPredicateOperandTypeLike",
+      /*args=*/(ins)>
   ];
 }
 

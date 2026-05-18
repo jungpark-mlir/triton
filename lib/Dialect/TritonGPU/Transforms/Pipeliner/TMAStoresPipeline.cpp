@@ -51,7 +51,6 @@ static void createTMAAsyncCopy(scf::ForOp forOp, const TMAStore &store,
                                Value alloc) {
   OpBuilder builder(store.op);
   Location loc = store.op->getLoc();
-  RankedTensorType ty = store.src.getType();
 
   // Put wait before the local_store make the store truly async. We know
   // that we are the only user of the CopyLocalToGlobal.
@@ -67,7 +66,9 @@ static void createTMAAsyncCopy(scf::ForOp forOp, const TMAStore &store,
                                    reduceOp.getIndices(), alloc);
   } else {
     auto scatterOp = cast<tt::DescriptorScatterOp>(store.op);
-    ttng::AsyncTMAScatterOp::create(builder, loc, desc, scatterOp.getXOffsets(),
+    Value xOffsets =
+        ttng::sextI16ToI32Indices(scatterOp.getXOffsets(), builder, loc);
+    ttng::AsyncTMAScatterOp::create(builder, loc, desc, xOffsets,
                                     scatterOp.getYOffset(), alloc);
   }
 
