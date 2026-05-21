@@ -483,11 +483,102 @@ membar state.
 Cons: larger surface change touching `BlockInfo`, `update`, fixed-point join
 logic, and call-site translation.
 
+### AMD Pipeliner Producer Plan
+
+The first producer should be the AMD pipeliner path that creates the problematic
+sync-read followed by async-write schedule. In particular, the Gluon/TDM
+`kernelB` shape loads from LDS and then issues the next TDM async copy in the
+same warp-pipeline stage:
+
+```text
+stage0:
+  read phase:
+    local_load buffer[phase % NUM_BUFFERS]
+  write phase:
+    async_tdm_copy_global_to_local buffer[(phase + NUM_BUFFERS - 1) % NUM_BUFFERS]
+
+stage1:
+  compute using the loaded values
+```
+
+That stage should use tokenized LDS loads and acknowledge the previous
+iteration's token before issuing the next async write phase:
+
+```python
+prev_a_ltok = ttgl.init_local_token()
+prev_b_ltok = ttgl.init_local_token()
+
+for ...:
+    with ttgl.amd.warp_pipeline_stage("stage0"):
+        phase, a, b, next_a_ltok, next_b_ltok = lds_load_with_tokens(...)
+
+        ttgl.local_read_ack(prev_a_ltok)
+        ttgl.local_read_ack(prev_b_ltok)
+
+        issue_loads(write_phase, ...)
+
+        prev_a_ltok = next_a_ltok
+        prev_b_ltok = next_b_ltok
+
+ttgl.local_read_ack(prev_a_ltok)
+ttgl.local_read_ack(prev_b_ltok)
+```
+
+The important placement rule is that `local_read_ack` sits after the LDS read
+that produces the next token but before the async write phase that may recycle
+the previous token's buffer. The first ack consumes a neutral init token, so the
+loop does not need a runtime branch. The epilogue ack discharges the final
+token, unless the pipeliner chooses to avoid tokenizing tail-only loads with no
+later async recycle phase.
+
+This producer change is intentionally separate from dynamic-index disjointness:
+buffer slot proofs may still remove barriers in some cases, but the token/ack
+contract is the explicit correctness mechanism for the sync-to-async phase
+boundary.
+
 ### Recommended Order
 
-Land the IR additions and verifier first. Use Sketch A to validate the contract
-on AMD. Move to Sketch B once the contract is stable or another backend needs
-the same suppression.
+Land in this order:
+
+1. Add `!ttg.local_token`, tokenized `ttg.local_load`,
+   `ttg.local_token_init`, `ttg.local_read_ack`, and verifier coverage.
+2. Implement AMD-scoped membar handling using Sketch A, including token-state
+   tracking for `local_read_ack`.
+3. Wire tokenized loads and acks into the AMD pipeliner producer, starting with
+   the Gluon/TDM `kernelB` schedule.
+4. Add lit coverage for parsing/verifier behavior, membar barrier placement,
+   and AMD warp-pipeline IR shape.
+5. Validate with runtime GEMM coverage: Triton GEMM and the existing Gluon f16
+   warp-pipeline GEMM using `--kernelB`.
+
+Move to Sketch B once the contract is stable or another backend needs the same
+suppression.
+
+### Validation Plan
+
+Lit tests should cover both the IR contract and the AMD behavior:
+
+- Verifier tests for legal direct tokens, neutral init tokens, one-iteration
+  loop-carried tokens, and rejected multi-iteration carries or invalid uses.
+- Membar tests showing tokenized `local_load` no longer creates an inferred
+  sync-to-async WAR barrier before the async write, while `local_read_ack`
+  inserts a `local_barrier` if no earlier barrier discharged the token.
+- AMD warp-pipeline tests showing the `kernelB`-style stage contains tokenized
+  LDS loads, unconditional `local_read_ack` ops, and no extra false-positive
+  barrier before the TDM async write.
+
+Runtime validation should include:
+
+```bash
+lit -v test/Conversion/amd/amdgpu_membar.mlir
+lit -v test/TritonGPU/amd/amd-convert-warp-pipeline.mlir
+
+python third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py --kernelB
+```
+
+Also run the existing Triton GEMM coverage that exercises the AMD pipeliner, so
+the token path is checked in both ordinary Triton-generated pipelines and the
+Gluon/TDM `kernelB` producer.
 
 ## Supplementary Details
 
