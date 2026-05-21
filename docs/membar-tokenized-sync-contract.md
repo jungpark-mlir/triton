@@ -1,294 +1,407 @@
 # Tokenized Sync Contract for Membar
 
-## Motivation
+## Main Idea
 
-Membar currently treats every synchronous shared-memory read as a pending
-dependency against every later shared-memory write. For a pipelined kernel
-where a `ttg.local_load` is followed by an `async_copy` writing into shared
-memory, this produces a CTA-wide barrier on the WAR edge:
+Membar currently treats a synchronous shared-memory read as a pending WAR
+hazard against later shared-memory writes. In pipelined code, that can force a
+`local_barrier` before a later async write even when the compiler already knows
+where the read lifetime ends.
+
+This proposal makes that lifetime explicit:
+
+```text
+tokenized local_load -> !ttg.local_token -> ttg.local_read_ack -> async write phase
+```
+
+A tokenized `ttg.local_load` opts out of membar's inferred sync-to-async WAR
+tracking. Instead, it creates a `!ttg.local_token` obligation. The producer must
+acknowledge that obligation with `ttg.local_read_ack` before entering any async
+write phase that may recycle the shared memory read by the load.
+
+`ttg.local_read_ack` is not an alias proof between a specific `local_load` and a
+specific async copy. It acknowledges the obligation created by the tokenized
+load. If no previous `local_barrier` has already discharged that obligation,
+membar inserts a `local_barrier` at the ack. If the obligation was already
+discharged, the ack is a no-op.
+
+## How It Works
+
+Without this contract, membar sees this shape as a WAR hazard:
 
 ```mlir
 %val = ttg.local_load %read_view
 %tok = ttg.async_copy_global_to_local %src into %write_view
-//  ^ membar inserts a CTA barrier before this op
+//  ^ membar inserts a local_barrier before this op
 ```
 
-The barrier is unnecessary when the IR already carries an explicit ordering
-protocol that guarantees the read is complete before the async write
-overwrites the source.
+With this contract, the producer writes the phase boundary explicitly:
 
-The intended contract is:
+```mlir
+%val, %ltok = ttg.local_load %read_view
 
-> If a sync op returns a transfer token, membar stops protecting that sync op
-> against later async ops. The IR producer is responsible for inserting the
-> proper token wait before any async op that could conflict.
+// Work that uses %val.
 
-This moves sync-to-async ordering from implicit membar alias analysis to an
-explicit IR protocol expressed by a new SSA token type and a new wait op.
+ttg.local_read_ack %ltok
+%atok = ttg.async_copy_global_to_local %src into %write_view
+```
 
-## The Contract
+The state model is:
 
-The contract is deliberately narrow.
+```text
+after tokenized local_load:
+  sync-facing reads:        read_view
+  async-facing reads:       <none for this local_load>
+  local-token obligations:  %ltok unresolved
 
-1. It only applies to specific tokenized sync ops with well-defined semantics,
-   initially `ttg.local_load` extended to optionally produce
-   `!ttg.local_token`.
-2. It only suppresses sync-to-async dependencies (a tokenized sync read
-   followed by a later async write into shared memory).
-3. It does not suppress sync-to-sync, async-to-sync, or async-to-async
-   dependencies.
-4. The token's only legal uses are `ttg.sync_transfer_wait` consumers, enforced
-   by an MLIR op verifier. The producer of the IR places the wait before any
-   aliasing async write.
+after local_read_ack:
+  sync-facing reads:        read_view
+  local-token obligations:  %ltok discharged
+  local_barrier inserted only if no earlier local_barrier discharged it
 
-A tokenized sync read is still a real shared-memory read. It is only excluded
-from the subset of pending-read state that is used to block later async writes.
+at async_copy:
+  no inferred sync-to-async WAR against this local_load
+  correctness is through the preceding local_read_ack
+```
 
-## Proposed IR Additions
+If the ack is placed after the async copy, the IR violates the token contract:
+the async phase may recycle shared memory before the obligation is discharged.
+Membar intentionally does not recover by rediscovering the old sync-to-async
+WAR dependency, because avoiding that inference is the purpose of the contract.
 
-This proposal adds two new IR constructs and a result on an existing op.
+## Why It Is Correct
 
-### `!ttg.local_token` (new SSA type)
+Correctness comes from making the end of the local-read lifetime explicit in
+IR. A tokenized `ttg.local_load` does not rely on membar to prove that a later
+async write is safe by alias analysis. Instead, it creates this obligation:
 
-A token type representing an in-flight synchronous shared-memory read. It is
-distinct from `!ttg.async_token`:
+```text
+before an async-write phase may recycle this shared memory,
+the !ttg.local_token must be acknowledged
+```
+
+`ttg.local_read_ack` discharges that exact obligation:
+
+```text
+local_read_ack(token):
+  if a local_barrier since the tokenized load already discharged the obligation:
+    no-op
+  else:
+    insert a local_barrier here
+  mark the token obligation discharged
+```
+
+This keeps responsibilities clear:
+
+- Membar no longer asks whether a later async write aliases the tokenized
+  `local_load`.
+- The producer identifies the block-level phase boundary where the local-read
+  obligation must end.
+- `local_read_ack` makes that boundary correct by inserting a `local_barrier`
+  if needed.
+- The producer owns performance by placing the ack where it is usually benign,
+  for example near an existing `local_barrier`.
+
+The tokenized load is still a real shared-memory read. It remains visible to
+sync-facing dependency tracking, so sync-to-sync hazards are unchanged.
+
+## Design
+
+### IR Additions
+
+This proposal adds:
+
+1. A new `!ttg.local_token` type.
+2. A new `ttg.local_read_ack` op.
+3. A neutral `ttg.local_token_init` op for loop seeds.
+4. An optional result token on `ttg.local_load`.
+
+#### `!ttg.local_token`
+
+`!ttg.local_token` is a TritonGPU block/CTA-scoped compiler token representing
+a pending local-read obligation. It is not a runtime hardware token, and it is
+not per-thread or per-element.
 
 | Token | Producer | Meaning |
 |---|---|---|
-| `!ttg.async_token` | `ttg.async_copy_global_to_local`, `async_wait`, ... | An async DMA is in flight; consumed by `async_wait`. |
-| `!ttg.local_token` (new) | Tokenized `ttg.local_load` | A synchronous shared-memory read is in progress; consumed by `ttg.sync_transfer_wait`. |
+| `!ttg.async_token` | `ttg.async_copy_global_to_local`, `async_wait`, ... | Async DMA is in flight; consumed by `async_wait`. |
+| `!ttg.local_token` | Tokenized `ttg.local_load` | Local-read obligation is pending; acknowledged by `ttg.local_read_ack`. |
+| `!ttg.local_token` | `ttg.local_token_init` | Neutral loop seed with no local-read obligation. |
 
-A separate type prevents accidental cross-use. `async_wait` does not consume
-`local_token`, and `sync_transfer_wait` does not consume `async_token`.
+The separate type prevents accidental cross-use: `async_wait` does not consume
+`!ttg.local_token`, and `local_read_ack` does not consume `!ttg.async_token`.
 
-### `ttg.sync_transfer_wait` (new op)
+#### `ttg.local_token_init`
 
 ```mlir
-ttg.sync_transfer_wait %tok : !ttg.local_token
+%tok = ttg.local_token_init : !ttg.local_token
 ```
 
-A no-op-lowering marker that consumes one or more `local_token` values. Its
-job is to be visible to membar as the point where a tokenized read is
-considered drained.
+`ttg.local_token_init` creates a neutral local token with no associated
+local-read obligation. It exists to seed loop-carried token variables without
+using `None`, peeling only for token setup, or introducing a runtime branch
+around `ttg.local_read_ack`.
 
-Lowering: emits no machine instruction. The wait is a compile-time IR marker;
-the actual hardware ordering is provided by ordinary instruction order on the
-warps that issued the load.
+The op lowers to no machine instruction and carries no shared-memory effect.
 
-Membar effect: when membar processes this op, it removes the tokenized read
-slice from async-facing pending-read state.
+Acknowledging this token is always a no-op:
 
-### `ttg.local_load` result token
+```text
+local_read_ack(local_token_init):
+  no local_barrier
+  no obligation to discharge
+```
 
-`ttg.local_load` is extended with an optional result token. The new shape is:
+The initializer does not suppress any membar dependency by itself. Only a
+tokenized `ttg.local_load` creates a local-read obligation.
+
+#### `ttg.local_read_ack`
 
 ```mlir
-// Existing: result is just the loaded tensor.
+ttg.local_read_ack %tok : !ttg.local_token
+```
+
+`ttg.local_read_ack` consumes one or more `!ttg.local_token` values. For tokens
+produced by tokenized reads, it acknowledges their local-read obligations. For
+neutral `ttg.local_token_init` seeds, it simply consumes the token. The op
+itself lowers to no machine instruction. During membar insertion, it may
+materialize a `local_barrier` at that point if an acknowledged token has not
+already been discharged.
+
+The op carries no-operand shared-memory effects:
+
+```text
+MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
+```
+
+#### Tokenized `ttg.local_load`
+
+Existing form:
+
+```mlir
 %val = ttg.local_load %src : ... -> tensor<...>
-
-// New: result is also an !ttg.local_token.
-%val, %tok = ttg.local_load %src : ... -> tensor<...>, !ttg.local_token
 ```
 
-The token result is opt-in. Only producers that follow the contract emit it.
-Existing users of `ttg.local_load` are unchanged.
-
-## Why a Result Token Is Distinct From The Existing Input Token
-
-`TTG_LocalLoadOp` already declares an optional input of `TTG_AsyncToken`,
-used by the prefetch and pipeliner paths to thread an `async_wait` token into
-the load (so the load is ordered after a specific async producer). The two
-token slots have opposite roles:
+New opt-in form:
 
 ```mlir
-//                consumer-side input          producer-side result
-//                (existing)                   (new)
-%val_a = ttg.local_load %src token %wait                                 // existing
-%val_b, %tok = ttg.local_load %src                                        // new
+%val, %ltok = ttg.local_load %src : ... -> tensor<...>, !ttg.local_token
 ```
+
+The result token is distinct from the existing optional input
+`!ttg.async_token` on `ttg.local_load`:
 
 | Slot | Direction | Type | Role |
 |---|---|---|---|
-| Input `token` (existing) | Operand | `!ttg.async_token` | "Wait for the async producer before this load runs." |
-| Result token (new) | Result | `!ttg.local_token` | "Downstream consumers must `sync_transfer_wait` before any aliasing async write." |
+| Input `token` | Operand | `!ttg.async_token` | Wait for an async producer before this load runs. |
+| Result token | Result | `!ttg.local_token` | Acknowledge this local read before a later async phase may recycle its memory. |
 
-The two are independent. A tokenized `local_load` may use both: an input
-`async_token` to order against a prior `async_wait`, and a result `local_token`
-to order against a later async write.
+A `ttg.local_load` may use both forms at once: an input async token orders the
+load after an async producer; the result local token creates an obligation for a
+later async phase.
 
-## MLIR Op Verifier
+### Block-Level Semantics
 
-The contract is enforced as a local MLIR op verifier. Two rules are sufficient.
+`!ttg.local_token` is block-scoped and matches membar's op-level shared-memory
+slice abstraction. The token type itself is compile-time bookkeeping.
 
-Rule 1: `local_token` only flows into `sync_transfer_wait`.
-Verifier on the producing op (tokenized `ttg.local_load`):
+A `local_barrier` is Triton's local-memory fence followed by a CTA-scoped
+execution barrier. Because `ttg.local_read_ack` may cause membar to insert one,
+the ack op must only be placed where a `local_barrier` would be legal. It must
+not be placed in divergent per-lane control. Producers should treat it as a
+block-level phase-boundary op.
+
+This proposal is intentionally CTA-scoped. Warp-local refinements can be layered
+later, but the initial contract uses the synchronization granularity that membar
+already uses for shared-memory hazards.
+
+### Verifier Rules
+
+The verifier enforces local structural rules. It does not try to prove the
+producer made a profitable placement.
+
+Rule 1: `!ttg.local_token` has restricted uses.
 
 ```text
-For each result of type !ttg.local_token:
-  every use must be a ttg.sync_transfer_wait operand.
+For each tokenized local_load result of type !ttg.local_token:
+  each use must be either:
+    - a ttg.local_read_ack operand, or
+    - an scf.yield operand that feeds the immediately-enclosing scf.for
+      iter_arg accepted by Rule 3.
+
+For each ttg.local_token_init result:
+  each use must be either:
+    - a ttg.local_read_ack operand, or
+    - the initial value of an scf.for iter_arg accepted by Rule 3.
+
+For each block argument of type !ttg.local_token:
+  each use must be a ttg.local_read_ack operand.
+
+For each scf.for result of type !ttg.local_token:
+  each use must be a ttg.local_read_ack operand.
 ```
 
-This guarantees that every `local_token` value is consumed by a
-`sync_transfer_wait` somewhere in the function. Dropping the wait is a verifier
-error, not a silent miscompile.
-
-Rule 2: `sync_transfer_wait` operands are well-typed.
-Verifier on `ttg.sync_transfer_wait`:
+Rule 2: `ttg.local_read_ack` operands are well-typed.
 
 ```text
 Each operand must be of type !ttg.local_token.
-Each operand must be defined by a tokenized read op
-  (currently only ttg.local_load with a result token).
 ```
 
-Together, the two rules pin down the producer/consumer pairing of the token
-flow.
+Rule 2 intentionally does not require the operand to be defined directly by a
+tokenized read. In the pipelined case, the ack consumes a loop-carried block
+argument whose value came from the previous iteration's tokenized read. Rule 3
+owns that origin and placement check.
 
-What the verifier does not check: whether `sync_transfer_wait` is placed
-before the conflicting async write along every CFG path. That is a CFG-level
-property and is the producer's responsibility. The verifier ensures the wait
-exists in the function; placement is the contract that membar relies on. This
-split is intentional — it keeps the verifier local while making "the wait is
-missing" structurally impossible.
+Rule 3: the token may be acknowledged in the same region, or carried through at
+most one `scf.for` iteration.
 
-## Membar Model
+The operand of `local_read_ack` must satisfy one of three cases:
 
-Pending dependencies split by the kind of future operation they protect against:
+- Same-region: defined by a tokenized read or `ttg.local_token_init` whose
+  immediate parent is the same as the ack's immediate parent.
+- One-iteration carry: a block argument of the ack's immediately-enclosing
+  `scf.for` body, where the matching yield operand is defined in the for body,
+  not itself a block argument, and is produced by a tokenized read or
+  `ttg.local_token_init`.
+- Final loop result: an `scf.for` result defined in the same region as the ack,
+  where the matching yield operand is defined in the for body, not itself a
+  block argument, and is produced by a tokenized read or `ttg.local_token_init`.
+  This permits an epilogue ack for the final token produced by the loop body.
 
-```text
-sync-facing dependencies:
-  include ordinary reads and tokenized sync reads
-async-facing dependencies:
-  include ordinary reads
-  exclude tokenized sync reads
-```
+The one-iteration limit is a compiler policy, not a hardware claim. A producer
+could register-buffer local-load values across more iterations, but that grows
+loop-carried state and register pressure and is not useful for the intended
+pipeline shape.
 
-Consequences:
-
-- A later sync write still sees the tokenized `local_load` as a dependency
-  (sync-to-sync unchanged).
-- A later async write does not see the tokenized `local_load` as a reason to
-  insert a membar (sync-to-async suppressed by contract).
-- `ttg.sync_transfer_wait` is a sync point that flushes the tokenized read
-  out of any remaining async-facing state.
-- Async-to-sync is unchanged; async writes still go through the existing
-  wait/barrier path before a later sync read can consume their data.
-
-This keeps membar out of the business of evaluating async/sync aliasing for
-that one specific dependency direction.
-
-## Why This Is Different From General Alias Suppression
-
-This approach does not claim that the two shared-memory slices are disjoint.
-They may alias. It claims that aliasing, if present, is ordered by an explicit
-IR protocol outside membar's dependency inference.
-
-- Buffer index analysis and buffer coloring suppress barriers by proving or
-  declaring that two buffer slots are different.
-- Warp-local analysis suppresses barriers by proving the access is
-  warp-partitioned with no cross-warp dependency.
-- The tokenized sync contract suppresses one specific ordering edge because
-  another IR mechanism is responsible for that ordering.
-
-This is not a replacement for disjointness analysis. It is a separate contract
-for sync-to-async edges where the compiler has chosen explicit token ordering.
-
-## Correctness Boundaries
-
-### Sync-to-Async (affected)
+If a producer writes a chain where a token reaches `local_read_ack` only after
+multiple loop iterations, the IR is invalid under this contract. For example:
 
 ```mlir
-%val, %tok = ttg.local_load %read_view
-ttg.sync_transfer_wait %tok
-%next_tok = ttg.async_copy_global_to_local %src into %write_view
+%loop = scf.for ... iter_args(%older = %init0, %newer = %init1) {
+  ttg.local_read_ack %older
+
+  %val, %ltok = ttg.local_load %read_view
+  scf.yield %newer, %ltok
+}
 ```
 
-For a tokenized `local_load`, membar does not insert a barrier before the async
-write solely to protect the prior read. The producer is responsible for placing
-`sync_transfer_wait %tok` before the async write.
+This is a two-iteration carry. The ack operand `%older` is a loop block
+argument whose matching yielded value is `%newer`, itself a loop block
+argument, so Rule 3 rejects it. If this were allowed, membar would have to track
+the dynamic age of local-token obligations through the loop fixed point. This
+proposal intentionally avoids that model.
 
-### Sync-to-Sync (unchanged)
+### Placement Guidance
+
+Default placement:
 
 ```mlir
-%val, %tok = ttg.local_load %read_view
-ttg.local_store %new_value, %write_view
+%val, %ltok = ttg.local_load %read_view
+// use %val
+ttg.local_read_ack %ltok
+%atok = ttg.async_copy_global_to_local %src into %write_view
 ```
 
-A later synchronous write still sees the prior tokenized read as a normal
-pending dependency. Tokenization does not weaken sync-to-sync ordering.
-
-### Async-to-Sync (unchanged)
+Pipelined placement:
 
 ```mlir
-%tok = ttg.async_copy_global_to_local %src into %write_view
-ttg.async_wait %tok
-%val = ttg.local_load %read_view
+%init_ltok = ttg.local_token_init : !ttg.local_token
+%final_ltok = scf.for ... iter_args(%carried_ltok = %init_ltok)
+    -> (!ttg.local_token) {
+  ttg.local_read_ack %carried_ltok
+  %atok = ttg.async_copy_global_to_local %src into %write_view
+
+  %val, %ltok = ttg.local_load %read_view
+  scf.yield %ltok
+}
+
+// Discharge the token produced by the final loop iteration. If the final read
+// does not need a token obligation, the producer should avoid tokenizing that
+// tail load instead of leaving the token unacknowledged.
+ttg.local_read_ack %final_ltok
 ```
 
-The existing async wait/barrier model still owns visibility from async writes
-to later sync reads.
+In the pipelined shape, the ack at iteration `i + 1` discharges the obligation
+created by the load in iteration `i`, then the async phase in iteration `i + 1`
+can proceed without membar trying to infer a sync-to-async WAR dependency
+against that earlier load.
 
-### Async-to-Async (unchanged)
+This matches the common Gluon/TDM steady-state pipeline shape. A neutral token
+initializer lets the frontend write a uniform loop while keeping the IR simple:
+every `local_read_ack` is unconditional, and the first iteration acknowledges a
+token with no obligation.
 
-This document only describes sync ops that produce `!ttg.local_token`. Async-
-to-async ordering is governed by `!ttg.async_token` and `async_wait`.
+```python
+# Proposed frontend spelling; exact API names can change.
+prev_ltok = ttgl.init_local_token()
 
-### Does `local_store` Need a Result Token?
+for phase in range(0, num_main_iters):
+    ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * COPIES_PER_TILE)
+    ttgl.local_read_ack(prev_ltok)
 
-Not for the initial `local_load` contract.
+    payload, next_ltok = buffer.index(read_slot(phase)).load_with_token(
+        layout=OPERAND_LAYOUT)
+    ttgl.amd.gfx1250.tdm.async_load(
+        desc, [0, producer_offset(phase)], buffer.index(write_slot(phase)))
+    acc = do_compute(payload, acc)
 
-The motivating dependency is a WAR edge: `local_load` reads shared memory, then
-a later async copy writes shared memory. The token on `local_load` says "do not
-overwrite this shared-memory source until the load has been safely consumed."
+    prev_ltok = next_ltok
 
-Adding the same result token to `local_store` would not be symmetric.
-`local_store` is a write, so later async ops create different hazards:
+ttgl.local_read_ack(prev_ltok)
+```
 
-| Prior sync op | Later async op | Hazard | Needs `local_store` token? |
-|---|---|---|---|
-| `local_load` | async write to shared | WAR | Yes, this is the proposed contract |
-| `local_store` | async read from shared | RAW | Only if the async op consumes the stored data and no existing fence/wait protocol covers it |
-| `local_store` | async write to shared | WAW | Usually no; only matters if the first write's ordering is semantically observable |
+The first `local_read_ack` consumes the neutral token and inserts no
+`local_barrier`. After the first `load_with_token`, `prev_ltok` is the previous
+iteration's local-read token. The ack is then before the async copy that may
+recycle that previous read buffer, so the real token chain is one iteration long
+and is covered by this contract. The final `local_read_ack` consumes the token
+produced by the final loop iteration.
 
-The RAW case is the only plausible reason. For example, a local-to-global
-async transfer reading data just staged by `local_store`:
+This should lower to an unconditional block-level ack, not to a runtime branch.
+For example, the following shape is not the intended contract:
 
 ```mlir
-ttg.local_store %value, %shared
-ttng.fence_async_shared
-ttng.async_tma_copy_local_to_global %shared, %desc
+scf.if %has_token {
+  ttg.local_read_ack %tok
+}
 ```
 
-That ordering is already expressed with target-specific fences such as
-`fence_async_shared`. A `local_store` token would only be justified if we
-choose to replace those fences with a common token wait.
+With `ttg.local_token_init`, no `%has_token` condition is needed. Since
+`local_read_ack` may insert a `local_barrier`, it should appear
+unconditionally in the block-level loop body.
 
-The conservative design:
+If the final read has no later async-recycle phase to guard and an epilogue ack
+would only add a barrier, the producer should avoid creating a token for that
+tail load rather than producing an unacknowledged token.
 
-1. Add a result token only to the read op that needs the contract:
-   `ttg.local_load`.
-2. Do not add a symmetric token result to `ttg.local_store` unless a concrete
-   async-read consumer path appears that existing fence/wait semantics do not
-   express well.
-3. If such a path appears, define a separate `local_store` token contract with
-   store-visibility semantics, not by symmetry with `local_load`.
+Invalid placement:
+
+```mlir
+%val, %ltok = ttg.local_load %read_view
+%atok = ttg.async_copy_global_to_local %src into %write_view
+ttg.local_read_ack %ltok
+```
+
+The ack is too late. The async phase can recycle shared memory before the token
+obligation is discharged. Membar intentionally does not recover by inserting the
+old inferred WAR barrier.
 
 ## Implementation Sketches
 
-Two implementation paths are viable. They are not exclusive: (a) is a
-lower-risk landing point, (b) is the longer-term form. Both rely on the same
-IR additions and verifier.
+### Sketch A: AMD-Scoped Implementation
 
-### Sketch (a): AMD `MembarFilterFn` clause
+The AMD implementation has two pieces:
 
-The check lives entirely in the AMD backend filter, alongside
-`filterAsyncLocalLoadsDependencies`, `filterLDSMemoryBarriersDependencies`, and
-`filterWarpLocalAccesses`.
+1. The AMD membar filter suppresses the old inferred sync-to-async WAR edge for
+   tokenized `local_load` ops.
+2. AMD-owned handling for `ttg.local_read_ack` conditionally inserts a
+   `local_barrier` if the acknowledged token obligation has not already been
+   discharged.
+
+Filter clause:
 
 ```cpp
 bool filterTokenizedLocalLoadAgainstAsyncWrite(Operation *lhs, Operation *rhs,
                                                bool lhsIsRead, bool rhsIsRead) {
-  // Direction: prior sync read vs later async write only.
   if (!lhsIsRead || rhsIsRead)
     return false;
   auto load = dyn_cast<ttg::LocalLoadOp>(lhs);
@@ -296,129 +409,205 @@ bool filterTokenizedLocalLoadAgainstAsyncWrite(Operation *lhs, Operation *rhs,
     return false;
   if (!rhs->hasTrait<OpTrait::MemAsyncWriteOpTrait>())
     return false;
-  return true; // suppress the WAR barrier
-}
-
-bool membarFilter(Operation *op1, Operation *op2,
-                  bool lhsIsRead, bool rhsIsRead, ...) {
-  return filterAsyncLocalLoadsDependencies(op1, op2, allocation) ||
-         filterLDSMemoryBarriersDependencies(op1, op2) ||
-         filterWarpLocalAccesses(op1, op2) ||
-         filterTokenizedLocalLoadAgainstAsyncWrite(op1, op2,
-                                                   lhsIsRead, rhsIsRead);
+  return true; // sync-to-async ordering is owned by local_read_ack
 }
 ```
 
-The filter sees the LHS (tokenized `local_load`) and RHS (async write) at the
-same `isIntersected` callback. Per-pair structural check; no `BlockInfo`
-changes. The verifier guarantees the load's token is consumed by a
-`sync_transfer_wait` somewhere; placement before the async write is the
-producer's contract.
+Ack handling:
 
-Pros: scoped to AMD, no core membar surface change, follows the existing
-filter pattern.
-Cons: AMD-specific. Other backends do not benefit. The filter cannot easily
-distinguish "wait was placed before this async write" from "wait exists
-somewhere in the function." The verifier and the producer contract together
-cover that gap.
+```text
+on tokenized local_load:
+  create local-token obligation in AMD-side token state
 
-### Sketch (b): Common membar via async-facing read state
+on local_token_init:
+  create a discharged/no-obligation token state
 
-A second pending-read map in `BlockInfo` exposes the dependency-direction
-split directly:
+on local_barrier / membar sync:
+  mark outstanding local-token obligations discharged
+
+on ttg.local_read_ack(%tok):
+  if %tok obligation is unresolved:
+    insert local_barrier at the ack
+    mark outstanding local-token obligations discharged
+  else:
+    no-op
+  mark %tok obligation discharged
+```
+
+Pros: scoped to AMD, follows the existing filter pattern, and avoids changing
+core membar state.
+
+Cons: AMD-specific; other backends do not benefit. The filter alone is not
+enough; token-state tracking for `local_read_ack` is required.
+
+### Sketch B: Common Membar Token Obligations
+
+Common membar can model the contract directly in `BlockInfo`:
 
 ```cpp
 struct BlockInfo {
   using SliceMapT = std::map<AllocationSlice, std::set<Operation *>>;
 
-  SliceMapT syncReadSlices;        // visible to all later writes
+  SliceMapT syncReadSlices;        // visible to later sync writes
   SliceMapT syncWriteSlices;
-  SliceMapT asyncFacingReadSlices; // visible only to later async writes
+  SliceMapT asyncReadSlices;       // ordinary reads only; excludes tokenized local_load
+  DenseMap<Value, LocalTokenState> localTokenObligations;
 };
 ```
 
-Population rules in `MembarAnalysis::update`:
+Population rules:
 
-- Ordinary `local_load`: insert into `syncReadSlices` and
-  `asyncFacingReadSlices`.
-- Tokenized `local_load`: insert into `syncReadSlices` only.
-- `sync_transfer_wait`: erase the corresponding slice entries from
-  `asyncFacingReadSlices` (or simply clear the map; the verifier guarantees
-  every token reaches a wait).
+- Ordinary `local_load`: insert into `syncReadSlices` and `asyncReadSlices`.
+- Tokenized `local_load`: insert into `syncReadSlices` only, and create
+  `localTokenObligations[token] = unresolved`.
+- `local_token_init`: create `localTokenObligations[token] = discharged`, or
+  otherwise mark the token as a no-obligation seed.
+- `local_barrier` / `sync()`: mark outstanding token obligations discharged.
+- `local_read_ack`: insert a `local_barrier` if any acknowledged token is
+  unresolved, then mark acknowledged tokens discharged.
 
-`isIntersected` against a later op:
+`isIntersected` behavior:
 
 - Sync write: check `syncReadSlices` for WAR (unchanged).
-- Async write: check `asyncFacingReadSlices` for WAR.
+- Async write: check `asyncReadSlices` for WAR. Tokenized local loads are not
+  present there.
 - WAW and RAW unchanged.
 
-`join`, `operator==`, `sync()`, and `translateBlockInfoToCallsite` mirror the
-existing maps. `sync()` clears all three (a CTA barrier flushes everything,
-including async-facing reads).
+`join`, `operator==`, `sync()`, and `translateBlockInfoToCallsite` must account
+for `localTokenObligations`. A conservative merge treats unresolved as winning
+over discharged when paths join.
 
-Pros: all backends benefit. The dependency-direction split is explicit in the
-state, not in a per-pair filter. Cleaner semantics for future extensions (for
-example, tokenized variants of other sync ops).
-Cons: larger surface change — touches `BlockInfo`, `update`, fixed-point join
-logic, and the call-site translator. Higher initial risk.
+Pros: all backends benefit and the token obligation is represented directly in
+membar state.
 
-### Recommended order
+Cons: larger surface change touching `BlockInfo`, `update`, fixed-point join
+logic, and call-site translation.
 
-Land the IR additions and verifier first. Wire (a) on AMD to validate the
-end-to-end contract on real kernels. Move to (b) once the contract is stable
-and another backend wants the same suppression.
+### Recommended Order
 
-## Orthogonality With `MemWaitOpTrait` Handler
+Land the IR additions and verifier first. Use Sketch A to validate the contract
+on AMD. Move to Sketch B once the contract is stable or another backend needs
+the same suppression.
 
-Membar today inserts an unconditional CTA barrier after every op with
-`MemWaitOpTrait` (`async_wait`, `async_tdm_wait`, `async_tma_store_wait`) and
-calls `sync()`. The tokenized contract is orthogonal to this handler:
+## Supplementary Details
 
-- If a `MemWaitOpTrait` op sits between the tokenized `local_load` and the
-  later async write, the unconditional barrier already provides ordering and
-  `sync()` clears every pending slice, including the tokenized read. The
-  later `sync_transfer_wait` is then a no-op as far as membar state is
-  concerned, because there is nothing left to flush.
-- If no `MemWaitOpTrait` op sits between them, the tokenized contract is
-  responsible for the suppression and `sync_transfer_wait` is the only
-  ordering edge that matters.
+### Verifier Pseudocode
 
-The two mechanisms cover non-overlapping cases. The proposed contract does
-not require changing the `MemWaitOpTrait` handler. The async write tracking
-proposal in `membar-async-write-tracking.md` is a separate, independently
-motivated change.
+The verifier rules above can be implemented with a local structural check:
 
-## Difference From PR #9418
+```text
+For each local_read_ack operand:
+  require type !ttg.local_token
 
-PR #9418 added an AMD-specific annotation pass that stamped `local_load` ops
-whose token chains back to an `async_wait`, and a backend filter suppressed
-barriers for those annotated ops. It was rejected because correctness relied
-on an implicit assumption about how the pipeliner generates IR (always
-multi-buffered, `numBuffers >= 2`), which violated pass independence.
+  if defined by tokenized local_load or local_token_init:
+    require same parent op as the ack
 
-This proposal differs structurally:
+  else if it is a block argument:
+    require the ack parent is the immediately-enclosing scf.for
+    require the argument is not the induction variable
+    require the matching yield value is defined in the loop body
+    require the matching yield value is produced by tokenized local_load
+      or local_token_init
+
+  else if defined by scf.for:
+    require the scf.for has the same parent op as the ack
+    require the matching yield value is defined in the loop body
+    require the matching yield value is produced by tokenized local_load
+      or local_token_init
+
+  else:
+    reject
+```
+
+### Memory Effects On `local_read_ack`
+
+`ttg.local_read_ack` carries no-operand shared-memory effects:
+
+```text
+MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
+```
+
+This is intentionally fence-like. It preserves the op and prevents shared-memory
+ops from being moved across it. It does not create a tracked memory slice in the
+current membar implementation, which only records effects tied to a concrete
+`Value` operand:
+
+```text
+for (auto effectInstance : effectInstances)
+  if (auto value = effectInstance.getValue())
+    ... insert into syncReadSlices / syncWriteSlices ...
+```
+
+### Is A Core Membar Trait Needed?
+
+| Implementation | Core trait needed? | Why |
+|---|---|---|
+| AMD-scoped | No | AMD code can directly match `ttg.local_read_ack` and maintain AMD-side token state. |
+| Common membar | Yes | Core membar needs a stable signal such as `LocalReadAckOpTrait` to dispatch token-obligation logic without dialect-specific `isa<LocalReadAckOp>`. |
+
+### `local_store` Result Token
+
+No `local_store` result token is needed for the initial contract.
+
+The motivating hazard is a WAR edge: `local_load` reads shared memory, then a
+later async copy may write/recycle that memory. `local_store` is a write, so
+later async ops create different hazards:
+
+| Prior sync op | Later async op | Hazard | Needs `local_store` token? |
+|---|---|---|---|
+| `local_load` | async write to shared | WAR | Yes, this proposal. |
+| `local_store` | async read from shared | RAW | Only if existing fence/wait protocol cannot express the async read. |
+| `local_store` | async write to shared | WAW | Usually no; only observable if the first write is consumed before overwrite. |
+
+For local-to-global async transfers that read staged shared memory, ordering is
+already expressed with target-specific fences such as `ttng.fence_async_shared`.
+A future `local_store` token should be a separate store-visibility contract, not
+an automatic symmetry with `local_load`.
+
+### Orthogonality With `MemWaitOpTrait`
+
+Membar today inserts an unconditional `local_barrier` after every
+`MemWaitOpTrait` op (`async_wait`, `async_tdm_wait`, `async_tma_store_wait`) and
+calls `sync()`.
+
+If such a wait sits between a tokenized `local_load` and the later async write,
+that unconditional `local_barrier` already discharges the local-token
+obligation. A later `local_read_ack` is benign: it consumes the token and
+inserts no barrier.
+
+This is the common Gluon/TDM case: `tdm.async_wait` is a `MemWaitOpTrait` op, so
+its `local_barrier` usually discharges the previous iteration's local-read
+token before the following `local_read_ack`.
+
+If no `MemWaitOpTrait` op sits between them, `local_read_ack` is the explicit
+place where a `local_barrier` may be inserted if needed. This proposal does not
+require changing the `MemWaitOpTrait` handler. Async write tracking remains a
+separate proposal.
+
+### Difference From PR #9418
+
+PR #9418 used an AMD-specific annotation pass to stamp `local_load` ops whose
+token chains reached an `async_wait`, then suppressed barriers in the backend
+filter. It was rejected because correctness relied on an implicit assumption
+about how the pipeliner generated IR.
+
+This proposal makes the contract explicit in IR:
 
 | | PR #9418 | Tokenized Sync Contract |
 |---|---|---|
-| Where the contract lives | Hidden in pass-pipeline assumption (annotation pass + filter) | Visible in IR: `!ttg.local_token` SSA value, `ttg.sync_transfer_wait` consumer op |
-| What guarantees correctness | "The pipeliner always emits multi-buffered IR" | MLIR op verifier ensures the token is consumed by a wait |
-| Failure mode if a transform changes the IR | Silent miscompile (annotation lost or invalidated) | Verifier error or barrier reinserted |
-| Reviewer-visible scope | Implicit | Local op signatures and verifier rules |
+| Contract location | Hidden in pass-pipeline assumption | `!ttg.local_token`, `ttg.local_token_init`, and `ttg.local_read_ack` |
+| Correctness source | Assumption about pipeliner shape | Verifier plus explicit token obligation |
+| Failure mode | Silent invalid annotation/assumption | Verifier error or `local_read_ack` inserts `local_barrier` |
+| Reviewer-visible scope | Implicit | Op signatures and verifier rules |
 
-The reviewer concern that sank #9418 — that a barrier is suppressed based on
-an unstated IR-generation invariant — does not apply here. The invariant is
-expressed as IR.
-
-## Summary
+### Summary
 
 | Aspect | Tokenized Sync Contract |
 |---|---|
-| Mechanism | New `!ttg.local_token` result on `ttg.local_load`, consumed by new `ttg.sync_transfer_wait` |
-| Distinct from existing | Existing input `!ttg.async_token` on `local_load` is unchanged; result token is new |
-| Membar behavior | Tokenized sync reads are excluded from async-facing pending-read state; `sync_transfer_wait` is the flush point |
-| Suppresses | Sync read before later async write, when the read is tokenized |
-| Does not suppress | Sync-to-sync, async-to-sync, async-to-async |
-| Correctness source | MLIR op verifier ensures the token reaches a `sync_transfer_wait`; producer places it before any aliasing async write |
-| Implementation paths | (a) AMD `MembarFilterFn` clause; (b) common membar via `asyncFacingReadSlices` |
-| Orthogonality | Independent of the `MemWaitOpTrait` unconditional barrier handler and of async write tracking |
-| Difference from PR #9418 | Contract is explicit IR (token + wait + verifier), not an implicit pipeliner-generation assumption |
+| Mechanism | Tokenized `ttg.local_load` returns `!ttg.local_token`; `ttg.local_token_init` seeds loop-carried tokens; `ttg.local_read_ack` consumes them. |
+| Suppresses | Inferred sync-to-async WAR dependency from tokenized local loads to later async writes. |
+| Correctness source | Explicit local-token obligation discharged by `local_read_ack`; ack inserts `local_barrier` if needed. |
+| Does not suppress | Sync-to-sync, async-to-sync, async-to-async. |
+| Placement | Producer places ack before async phase that may recycle the loaded shared memory. |
+| Scope | CTA/block-level; `local_read_ack` is legal only where `local_barrier` is legal. |
+| Performance | Producer places ack where it is usually benign, often near an existing `local_barrier`. |
