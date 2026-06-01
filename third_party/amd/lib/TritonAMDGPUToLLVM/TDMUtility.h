@@ -5,6 +5,7 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/IR/Operation.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
 #include <optional>
 
 using mlir::triton::AMD::TargetInfo;
@@ -107,6 +108,89 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       const triton::LinearLayout &sharedLayout,
                       Attribute encoding, Value ctaId, int32_t auxBits,
                       std::optional<uint32_t> warpUsedHint = std::nullopt);
+
+// ---------------------------------------------------------------------------
+// Implicit op-merging support.
+//
+// TDM-to-LLVM lowering can merge adjacent compatible copies whenever the copies
+// already carry verifier-legal `warp_used_hint` masks.  This includes
+// user-authored hints and hints created by `prepareGeneratedTDMMergeHints`.
+//
+// `prepareGeneratedTDMMergeHints` is a narrower pre-pass that runs by default
+// (disable with TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS=0): it mutates only the
+// canonical adjacent hint-less indexed-destination form into hinted merge
+// candidates. It
+// is not the full mergeability contract; it only creates hints for one safe IR
+// shape. Then `computeTDMMergeGroups` builds a side-table from each merging
+// `async_tdm_copy_global_to_local` op to its group info (IR unchanged). The
+// conversion pattern dispatches on it: the first visited member emits a fused
+// intrinsic via `emitTDMLoadStoreMerged` and erases the whole group; singletons
+// fall back to `emitTDMLoadStore`.
+//
+// Mergeability rules (v1; all required):
+//   1. Every member has a verifier-legal `warp_used_hint`; hint-less ops
+//      flush the in-flight batch.
+//   2. No member has an `mbarrier` (fused intrinsic can't encode it);
+//      mbarrier-carrying ops flush.
+//   3. Members have pairwise-disjoint hints and their union is itself an
+//      axis-aligned coset. Members may have different K = popcount(hint).
+//   4. Group size N is 2, 3, or 4.
+//   5. Members are consecutive in one block; pure ops thread through,
+//      side-effecting non-TDM ops flush.
+//   6. Results have pairwise-distinct SSA destinations and same-rank
+//      descriptors that can be represented by a compatible hardware descriptor
+//      group form for the fused intrinsic.
+//   7. Members share the same `cache` modifier (one auxBits on the fused
+//      intrinsic).
+struct TDMMergeGroupInfo {
+  // Members in program order. |members| = |memberHints| = N.
+  SmallVector<Operation *> members;
+  SmallVector<uint32_t> memberHints;
+  // Last member in program order; used to anchor the fused intrinsic's
+  // insertion point so any pure ops between members dominate it.
+  Operation *lastInProgramOrder = nullptr;
+  uint32_t unionHint = 0; // bitwise union of member warp_used_hint masks
+};
+
+struct TDMMergeMemberInfo {
+  SmallVector<int64_t> shapePerCTA;
+  unsigned padInterval = 0;
+  unsigned padAmount = 0;
+  Type elementType;
+  triton::LinearLayout sharedLayout;
+  Attribute encoding;
+  Value multicastMask;
+  size_t numGroups = 0;
+};
+
+// Enabled by default (set TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS=0 to disable):
+// mutate only canonical adjacent hint-less copies with indexed destinations of
+// the form
+//   memdesc_index A; async_tdm_copy A; memdesc_index B; async_tdm_copy B; ...
+// into hinted merge candidates by moving the destination memdesc_index ops
+// before the copy group and assigning disjoint warp_used_hint masks.
+void prepareGeneratedTDMMergeHints(ModuleOp mod);
+
+// Walk `mod` and identify all merge groups; ops not in any group are
+// absent from the result.
+llvm::DenseMap<Operation *, TDMMergeGroupInfo>
+computeTDMMergeGroups(ModuleOp mod);
+
+// Emit one fused TDM intrinsic for a merge group. The site-local lowering
+// builds per-member descriptors and `select`s between them on an SGPR-uniform
+// per-wave selector. `auxBits` comes from any member (rule 7 makes it uniform);
+// no barrier (rule 2).
+void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
+                            const LLVMTypeConverter *typeConverter,
+                            ArrayRef<Value> originalDescPerMember,
+                            ArrayRef<SmallVector<Value>> descPerMember,
+                            ArrayRef<TDMMergeMemberInfo> memberInfo,
+                            int numWarps,
+                            ArrayRef<SmallVector<Value>> offsetPerMember,
+                            ArrayRef<SmallVector<Value>> dstPtrsPerMember,
+                            ArrayRef<Value> predPerMember, bool isLoad,
+                            Value ctaId, int32_t auxBits,
+                            const TDMMergeGroupInfo &groupInfo);
 
 // Returns (warpsPerCTA, numTDMInstructions) for a given shared encoding.
 // For PartitionedSharedEncodingAttr, computes a partition-aligned warp

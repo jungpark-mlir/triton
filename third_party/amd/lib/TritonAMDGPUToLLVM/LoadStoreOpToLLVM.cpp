@@ -1239,10 +1239,12 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
   AsyncTDMCopyGlobalToLocalOpConversion(
       LLVMTypeConverter &converter, const AMD::TargetInfo &targetInfo,
       ModuleAxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit,
-      const DataFlowSolver *uniformitySolver = nullptr)
+      const DataFlowSolver *uniformitySolver,
+      const llvm::DenseMap<Operation *, mlir::LLVM::AMD::TDMMergeGroupInfo>
+          &mergeGroups)
       : ConvertOpToLLVMPattern(converter, benefit),
-        LoadStoreConversionBase(targetInfo, axisAnalysisPass,
-                                uniformitySolver) {}
+        LoadStoreConversionBase(targetInfo, axisAnalysisPass, uniformitySolver),
+        mergeGroups(mergeGroups) {}
 
   LogicalResult
   matchAndRewrite(triton::amdgpu::AsyncTDMCopyGlobalToLocalOp op,
@@ -1311,6 +1313,90 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     auto shapePerCTA =
         triton::gpu::getShapePerCTA(encoding, tensorDescTy.getShape());
 
+    // Implicit merge dispatch: the first visited member emits the fused
+    // intrinsic for the whole group and erases the rest.
+    auto mergeIt = mergeGroups.find(op);
+    if (mergeIt != mergeGroups.end()) {
+      const auto &group = mergeIt->second;
+      size_t numMembers = group.members.size();
+
+      SmallVector<Value> originalDescPerMember(numMembers);
+      SmallVector<SmallVector<Value>> descPerMember(numMembers);
+      SmallVector<SmallVector<Value>> offsetPerMember(numMembers);
+      SmallVector<SmallVector<Value>> dstPtrsPerMember(numMembers);
+      SmallVector<Value> predPerMember(numMembers);
+      SmallVector<mlir::LLVM::AMD::TDMMergeMemberInfo> memberInfo;
+      memberInfo.reserve(numMembers);
+
+      for (size_t i = 0; i < numMembers; ++i) {
+        auto memberOp =
+            cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(group.members[i]);
+        originalDescPerMember[i] = memberOp.getDesc();
+
+        auto memberTensorDescTy = memberOp.getDesc().getType();
+        auto memberEncoding = memberTensorDescTy.getSharedLayout();
+        Type memberElementType = getTypeConverter()->convertType(
+            memberTensorDescTy.getElementType());
+        triton::LinearLayout memberSharedLayout =
+            isPaddedEncoding(memberEncoding)
+                ? paddedLinearLayout(memberTensorDescTy.getShape(),
+                                     memberEncoding)
+                : toLinearLayout(memberTensorDescTy.getShape(), memberEncoding);
+
+        unsigned memberPadInterval = 0;
+        unsigned memberPadAmount = 0;
+        if (auto padEnc = getPaddedEncoding(memberEncoding)) {
+          assert(padEnc.getIntervals().size() == 1 &&
+                 padEnc.getPaddings().size() == 1);
+          memberPadInterval = padEnc.getIntervals()[0];
+          memberPadAmount = padEnc.getPaddings()[0];
+        }
+
+        Value memberMulticastMask;
+        if (targetInfo.supportsMultiCTALaunch()) {
+          memberMulticastMask = LLVM::AMD::emitCtaMulticastMask(
+              rewriter, loc, targetInfo.getClusterCTAId(rewriter, loc),
+              memberSharedLayout);
+        }
+
+        auto memberShapePerCTA = triton::gpu::getShapePerCTA(
+            memberEncoding, memberTensorDescTy.getShape());
+        descPerMember[i] = mlir::LLVM::AMD::unpackTDMDescriptor(
+            rewriter, loc, rewriter.getRemappedValue(memberOp.getDesc()));
+
+        SmallVector<Value> indices;
+        for (Value idx : memberOp.getIndices())
+          indices.push_back(rewriter.getRemappedValue(idx));
+        offsetPerMember[i] = std::move(indices);
+
+        auto memberDstMemObj = LLVM::getSharedMemoryObjectFromStruct(
+            loc, rewriter.getRemappedValue(memberOp.getResult()),
+            memberElementType, rewriter);
+        dstPtrsPerMember[i] = llvm::to_vector(memberDstMemObj.getBases());
+
+        predPerMember[i] = memberOp.getPred()
+                               ? rewriter.getRemappedValue(memberOp.getPred())
+                               : Value();
+        memberInfo.push_back(
+            {llvm::to_vector(memberShapePerCTA), memberPadInterval,
+             memberPadAmount, memberElementType, memberSharedLayout,
+             memberEncoding, memberMulticastMask, descPerMember[i].size()});
+      }
+
+      auto mergedAuxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+          op.getCache(), /*isLoad*/ true, targetInfo);
+      rewriter.setInsertionPoint(group.lastInProgramOrder);
+      mlir::LLVM::AMD::emitTDMLoadStoreMerged(
+          rewriter, loc, getTypeConverter(), originalDescPerMember,
+          descPerMember, memberInfo, numWarps, offsetPerMember,
+          dstPtrsPerMember, predPerMember, /*isLoad=*/true, ctaId,
+          mergedAuxBits, group);
+
+      for (size_t i = numMembers; i-- > 0;)
+        rewriter.eraseOp(group.members[i]);
+      return success();
+    }
+
     std::optional<uint32_t> warpUsedHint;
     if (auto hintAttr = op.getWarpUsedHintAttr())
       warpUsedHint = static_cast<uint32_t>(hintAttr.getInt());
@@ -1328,6 +1414,10 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     rewriter.eraseOp(op);
     return success();
   }
+
+private:
+  const llvm::DenseMap<Operation *, mlir::LLVM::AMD::TDMMergeGroupInfo>
+      &mergeGroups;
 };
 
 struct AsyncTDMCopyLocalToGlobalOpConversion
@@ -2612,12 +2702,13 @@ private:
 } // namespace
 
 namespace mlir::triton::AMD {
-void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
-                                       const TargetInfo &targetInfo,
-                                       RewritePatternSet &patterns,
-                                       ModuleAxisInfoAnalysis &axisInfoAnalysis,
-                                       const DataFlowSolver *uniformitySolver,
-                                       PatternBenefit benefit) {
+void populateLoadStoreOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
+    RewritePatternSet &patterns, ModuleAxisInfoAnalysis &axisInfoAnalysis,
+    const DataFlowSolver *uniformitySolver,
+    const llvm::DenseMap<Operation *, mlir::LLVM::AMD::TDMMergeGroupInfo>
+        &tdmMergeGroups,
+    PatternBenefit benefit) {
   assert(uniformitySolver &&
          "load/store lowering must be populated with the dataflow uniformity "
          "solver so BufferEmitter never falls back to the legacy walker");
@@ -2626,10 +2717,14 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                BufferLoadToLocalOpConversion, BufferStoreOpConversion,
                BufferAtomicRMWOpConversion, AsyncCopyGlobalToLocalOpConversion,
                AsyncCopyLocalToGlobalOpConversion, BufferAtomicCASOpConversion,
-               AsyncTDMCopyGlobalToLocalOpConversion,
                AsyncTDMCopyLocalToGlobalOpConversion,
                AsyncTDMScatterOpConversion, AsyncTDMGatherOpConversion>(
       typeConverter, targetInfo, axisInfoAnalysis, benefit, uniformitySolver);
+  // AsyncTDMCopyGlobalToLocalOpConversion additionally consumes the TDM merge
+  // analysis side-table, so it is constructed separately from the shared batch.
+  patterns.add<AsyncTDMCopyGlobalToLocalOpConversion>(
+      typeConverter, targetInfo, axisInfoAnalysis, benefit, uniformitySolver,
+      tdmMergeGroups);
   patterns.add<TTGAsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<AsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<TDMPrefetchConversion>(typeConverter, targetInfo, benefit);

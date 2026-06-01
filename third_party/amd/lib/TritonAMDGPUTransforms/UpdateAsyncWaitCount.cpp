@@ -461,7 +461,13 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
       }
     }
 
-    // amdgpu.AsyncTDMWait should only count async tdm ops
+    // amdgpu.AsyncTDMWait should only count async tdm ops. If auto merge hints
+    // are enabled, prepare them before computing counts so source-level logical
+    // waits are translated to the number of physical TDM intrinsics that
+    // conversion will actually emit.
+    mlir::LLVM::AMD::prepareGeneratedTDMMergeHints(m);
+    auto tdmMergeGroups = mlir::LLVM::AMD::computeTDMMergeGroups(m);
+
     SmallVector<triton::amdgpu::AsyncTDMWait> waitTDMOps;
     getOperation()->walk([&](triton::amdgpu::AsyncTDMWait waitOp) {
       waitTDMOps.push_back(waitOp);
@@ -477,11 +483,20 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
       auto v = [&]() -> int {
         using namespace triton::amdgpu;
         if (auto copyOp = dyn_cast<AsyncTDMCopyGlobalToLocalOp>(op)) {
+          // Merged copies lower to a single fused intrinsic anchored at the
+          // last member; non-last members contribute zero intrinsics.
+          auto mergeIt = tdmMergeGroups.find(op);
+          if (mergeIt != tdmMergeGroups.end())
+            return op == mergeIt->second.lastInProgramOrder ? 1 : 0;
           auto smemTy = copyOp.getResult().getType();
           int numWarps = ttg::lookupNumWarps(op);
+          int effectiveWarps = numWarps;
+          if (auto hint = copyOp.getWarpUsedHintAttr())
+            effectiveWarps = static_cast<int>(llvm::popcount(
+                static_cast<uint32_t>(hint.getValue().getZExtValue())));
           auto [_, numInstr] =
               mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
-                  smemTy.getShape(), numWarps, smemTy.getEncoding());
+                  smemTy.getShape(), effectiveWarps, smemTy.getEncoding());
           return numInstr;
         } else if (auto copyOp = dyn_cast<AsyncTDMCopyLocalToGlobalOp>(op)) {
           auto smemTy = copyOp.getSrc().getType();
