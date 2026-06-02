@@ -490,10 +490,14 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
             return op == mergeIt->second.lastInProgramOrder ? 1 : 0;
           auto smemTy = copyOp.getResult().getType();
           int numWarps = ttg::lookupNumWarps(op);
-          int effectiveWarps = numWarps;
-          if (auto hint = copyOp.getWarpUsedHintAttr())
-            effectiveWarps = static_cast<int>(llvm::popcount(
-                static_cast<uint32_t>(hint.getValue().getZExtValue())));
+          std::optional<uint32_t> hint;
+          if (auto hintAttr = copyOp.getWarpUsedHintAttr())
+            hint = static_cast<uint32_t>(hintAttr.getValue().getZExtValue());
+          // Mirror emitTDMLoadStore: hinted copies emit a single instruction
+          // sized by K = popcount(hint), so count by effective warps to match
+          // the lowering exactly (a hint-less copy still uses numWarps).
+          int effectiveWarps =
+              mlir::LLVM::AMD::getTDMEffectiveWarps(numWarps, hint);
           auto [_, numInstr] =
               mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
                   smemTy.getShape(), effectiveWarps, smemTy.getEncoding());

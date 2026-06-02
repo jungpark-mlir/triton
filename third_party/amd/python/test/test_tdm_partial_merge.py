@@ -255,13 +255,15 @@ def vector_add_tdm_kernel(
         layout=SHARED_LAYOUT,
     )
 
-    ab_buf = ttgl.allocate_shared_memory(a_desc.dtype, [2] + a_desc.block_shape, a_desc.layout)
-    a_buf = ab_buf.index(0)
-    b_buf = ab_buf.index(1)
+    # One allocation per copy: distinct buffers let the membar analysis see the
+    # destinations as disjoint, so no workgroup barrier is inserted between the
+    # adjacent copies (a barrier would split the merge batch).  Fusion then
+    # depends only on the hint merge rules below.
+    a_stage = ttgl.allocate_shared_memory(a_desc.dtype, [1] + a_desc.block_shape, a_desc.layout)
+    b_stage = ttgl.allocate_shared_memory(b_desc.dtype, [1] + b_desc.block_shape, b_desc.layout)
+    a_buf = a_stage.index(0)
+    b_buf = b_stage.index(0)
 
-    # One allocation plus indexed views keeps the side-effecting local_alloc
-    # before the merge batch; memdesc_index ops are pure and may thread through.
-    # Fusion still depends on the hint merge rules below.
     if not USE_HINT:
         HINT_A = None
         HINT_B = None
@@ -540,10 +542,14 @@ def vector_add_tdm_kernel_3way(
     c_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=c_ptr, shape=(M, N), strides=(N, 1),
                                                          block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
 
-    abc_buf = ttgl.allocate_shared_memory(a_desc.dtype, [3] + a_desc.block_shape, a_desc.layout)
-    a_buf = abc_buf.index(0)
-    b_buf = abc_buf.index(1)
-    c_buf = abc_buf.index(2)
+    # One allocation per copy so membar sees disjoint destinations (no barrier
+    # between the adjacent copies to split the merge batch).
+    a_stage = ttgl.allocate_shared_memory(a_desc.dtype, [1] + a_desc.block_shape, a_desc.layout)
+    b_stage = ttgl.allocate_shared_memory(b_desc.dtype, [1] + b_desc.block_shape, b_desc.layout)
+    c_stage = ttgl.allocate_shared_memory(c_desc.dtype, [1] + c_desc.block_shape, c_desc.layout)
+    a_buf = a_stage.index(0)
+    b_buf = b_stage.index(0)
+    c_buf = c_stage.index(0)
 
     if not USE_HINT:
         HINT_A = None
@@ -711,11 +717,16 @@ def vector_add_tdm_kernel_4way(
     d_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=d_ptr, shape=(M, N), strides=(N, 1),
                                                          block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
 
-    abcd_buf = ttgl.allocate_shared_memory(a_desc.dtype, [4] + a_desc.block_shape, a_desc.layout)
-    a_buf = abcd_buf.index(0)
-    b_buf = abcd_buf.index(1)
-    c_buf = abcd_buf.index(2)
-    d_buf = abcd_buf.index(3)
+    # One allocation per copy so membar sees disjoint destinations (no barrier
+    # between the adjacent copies to split the merge batch).
+    a_stage = ttgl.allocate_shared_memory(a_desc.dtype, [1] + a_desc.block_shape, a_desc.layout)
+    b_stage = ttgl.allocate_shared_memory(b_desc.dtype, [1] + b_desc.block_shape, b_desc.layout)
+    c_stage = ttgl.allocate_shared_memory(c_desc.dtype, [1] + c_desc.block_shape, c_desc.layout)
+    d_stage = ttgl.allocate_shared_memory(d_desc.dtype, [1] + d_desc.block_shape, d_desc.layout)
+    a_buf = a_stage.index(0)
+    b_buf = b_stage.index(0)
+    c_buf = c_stage.index(0)
+    d_buf = d_stage.index(0)
 
     # See `_HINT_PARAMS_4WAY` below for legal hint quadruples.
     if not USE_HINT:
@@ -1038,9 +1049,12 @@ def vector_add_tdm_kernel_cache(
     b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=b_ptr, shape=(M, N), strides=(N, 1),
                                                          block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
 
-    ab_buf = ttgl.allocate_shared_memory(a_desc.dtype, [2] + a_desc.block_shape, a_desc.layout)
-    a_buf = ab_buf.index(0)
-    b_buf = ab_buf.index(1)
+    # One allocation per copy so membar sees disjoint destinations (no barrier
+    # between the adjacent copies to split the merge batch).
+    a_stage = ttgl.allocate_shared_memory(a_desc.dtype, [1] + a_desc.block_shape, a_desc.layout)
+    b_stage = ttgl.allocate_shared_memory(b_desc.dtype, [1] + b_desc.block_shape, b_desc.layout)
+    a_buf = a_stage.index(0)
+    b_buf = b_stage.index(0)
 
     if not USE_HINT:
         HINT_A = None

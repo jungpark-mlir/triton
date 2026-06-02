@@ -116,8 +116,14 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 // already carry verifier-legal `warp_used_hint` masks.  This includes
 // user-authored hints and hints created by `prepareGeneratedTDMMergeHints`.
 //
-// `prepareGeneratedTDMMergeHints` is a narrower pre-pass that runs by default
-// (disable with TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS=0): it mutates only the
+// TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS is a full kill-switch (default on;
+// set to 0 / "off" / "false" to disable).  When disabled, BOTH
+// `prepareGeneratedTDMMergeHints` (hint generation) and `computeTDMMergeGroups`
+// (merge analysis) become no-ops, so every TDM copy lowers standalone --
+// including ones that carry user-authored hints -- restoring pre-feature
+// codegen.
+//
+// `prepareGeneratedTDMMergeHints` is a narrower pre-pass: it mutates only the
 // canonical adjacent hint-less indexed-destination form into hinted merge
 // candidates. It
 // is not the full mergeability contract; it only creates hints for one safe IR
@@ -169,10 +175,12 @@ struct TDMMergeMemberInfo {
 //   memdesc_index A; async_tdm_copy A; memdesc_index B; async_tdm_copy B; ...
 // into hinted merge candidates by moving the destination memdesc_index ops
 // before the copy group and assigning disjoint warp_used_hint masks.
+// No-op when the kill-switch env var disables auto-merge.
 void prepareGeneratedTDMMergeHints(ModuleOp mod);
 
 // Walk `mod` and identify all merge groups; ops not in any group are
-// absent from the result.
+// absent from the result.  Returns an empty map when the kill-switch env var
+// disables auto-merge.
 llvm::DenseMap<Operation *, TDMMergeGroupInfo>
 computeTDMMergeGroups(ModuleOp mod);
 
@@ -191,6 +199,14 @@ void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
                             ArrayRef<Value> predPerMember, bool isLoad,
                             Value ctaId, int32_t auxBits,
                             const TDMMergeGroupInfo &groupInfo);
+
+// Effective warp count that drives TDM warp distribution and the resulting
+// physical instruction count.  A `warp_used_hint` restricts emission to
+// K = popcount(hint) warps (the rest become hardware no-ops), so the
+// distribution must be sized by K, not num_warps.  This is the single source
+// of truth shared by the lowering (`emitTDMLoadStore`) and the wait-count pass
+// so the counted intrinsics cannot drift from the emitted ones.
+int getTDMEffectiveWarps(int numWarps, std::optional<uint32_t> warpUsedHint);
 
 // Returns (warpsPerCTA, numTDMInstructions) for a given shared encoding.
 // For PartitionedSharedEncodingAttr, computes a partition-aligned warp

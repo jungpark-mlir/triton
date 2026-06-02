@@ -179,6 +179,11 @@ analyzeGatherScatterLayout(RankedTensorType indicesType) {
 
 } // namespace
 
+int getTDMEffectiveWarps(int numWarps, std::optional<uint32_t> warpUsedHint) {
+  return warpUsedHint ? static_cast<int>(llvm::popcount(*warpUsedHint))
+                      : numWarps;
+}
+
 std::pair<SmallVector<unsigned>, unsigned>
 distributeTDMWarpsAlignToPartition(ArrayRef<int64_t> blockShape, int numWarps,
                                    Attribute encoding) {
@@ -1193,7 +1198,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
   // of numWarps; verifier guarantees single-instruction emission (incl.
   // partitioned encodings).  Inactive warps become HW no-ops via
   // fillTDMDescriptor's free-variable-mask predication (XOR-anchored at i0).
-  int effectiveWarps = warpUsedHint ? llvm::popcount(*warpUsedHint) : numWarps;
+  int effectiveWarps = getTDMEffectiveWarps(numWarps, warpUsedHint);
 
   auto [warpsPerCTA, numTDMInstructions] =
       distributeTDMWarpsAlignToPartition(blockShape, effectiveWarps, encoding);
@@ -1534,20 +1539,6 @@ uint32_t getWarpUsedHintI0(uint32_t hint) {
   return llvm::countr_zero(hint);
 }
 
-SmallVector<int32_t, 5> getWarpUsedHintBasisBits(uint32_t hint) {
-  uint32_t i0 = getWarpUsedHintI0(hint);
-  uint32_t support = 0;
-  for (uint32_t mask = hint; mask != 0; mask &= mask - 1) {
-    unsigned w = llvm::countr_zero(mask);
-    support |= static_cast<uint32_t>(w ^ i0);
-  }
-
-  SmallVector<int32_t, 5> basisBits;
-  for (uint32_t s = support; s != 0; s &= s - 1)
-    basisBits.push_back(static_cast<int32_t>(llvm::countr_zero(s)));
-  return basisBits;
-}
-
 uint32_t getWarpUsedHintSupport(uint32_t hint) {
   uint32_t i0 = getWarpUsedHintI0(hint);
   uint32_t support = 0;
@@ -1562,24 +1553,6 @@ uint32_t getWarpUsedHintFreeMask(uint32_t hint, int numWarps) {
   assert(llvm::isPowerOf2_32(numWarps) && "numWarps must be power-of-two");
   uint32_t warpIdMask = (uint32_t{1} << llvm::Log2_32(numWarps)) - 1;
   return warpIdMask & ~getWarpUsedHintSupport(hint);
-}
-
-// Local copy of the axis-aligned coset rule.  Individual op hints are checked
-// by the verifier; merge analysis uses this for the union of member hints.
-bool isAxisAlignedCoset(uint32_t hint, int numWarps) {
-  if (!llvm::isPowerOf2_64(numWarps) || numWarps >= 32 || hint == 0)
-    return false;
-
-  uint32_t numWarpsMask = (uint32_t{1} << numWarps) - 1;
-  if ((hint & ~numWarpsMask) != 0)
-    return false;
-
-  unsigned K = llvm::popcount(hint);
-  if (!llvm::isPowerOf2_32(K))
-    return false;
-
-  unsigned logK = llvm::Log2_32(K);
-  return getWarpUsedHintBasisBits(hint).size() == logK;
 }
 
 uint32_t getGeneratedMergeHint(unsigned groupIdx, unsigned groupSize,
@@ -1776,7 +1749,7 @@ void emitMergeGroup(MutableArrayRef<Operation *> batch, int numWarps,
       accUnion |= hints[i];
       size_t headSize = i + 1;
       if (headSize >= 2 && headSize <= 4 &&
-          isAxisAlignedCoset(accUnion, numWarps)) {
+          mlir::triton::amdgpu::isAxisAlignedWarpHint(accUnion, numWarps)) {
         groupSize = headSize;
         finalUnion = accUnion;
       }
@@ -1870,12 +1843,22 @@ Value buildTDMMergeMemberActivePredicate(RewriterBase &rewriter, Location loc,
 
 } // namespace
 
-void prepareGeneratedTDMMergeHints(ModuleOp mod) {
-  // Auto merge-hint generation is enabled by default; set
-  // TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS=0 (or "off"/"false") to disable.
+// Controls only the *auto-generation* of merge hints for adjacent unhinted
+// copies.  Enabled by default; set TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS=0
+// (or "off"/"false") to disable.  When disabled the compiler stops synthesizing
+// hints, but merge-group formation itself is NOT gated: TDM copies that already
+// carry compatible warp_used_hint values (user-authored or previously
+// generated) still merge.  This matches the documented contract in
+// test_tdm_partial_merge.py -- the knob governs auto-generation, not whether
+// existing compatible hints fuse.
+static bool tdmAutoMergeEnabled() {
   auto enabled = mlir::triton::tools::isEnvValueBool(
       mlir::triton::tools::getStrEnv("TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS"));
-  if (enabled.has_value() && !enabled.value())
+  return !enabled.has_value() || enabled.value();
+}
+
+void prepareGeneratedTDMMergeHints(ModuleOp mod) {
+  if (!tdmAutoMergeEnabled())
     return;
   prepareGeneratedTDMMergeHintsImpl(mod);
 }

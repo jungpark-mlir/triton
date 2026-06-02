@@ -615,29 +615,49 @@ LogicalResult validateWarpUsedHint(AsyncTDMCopyGlobalToLocalOp op,
            << K << " must be a power of two (got hint "
            << llvm::formatv("{0:x}", hint) << ")";
 
-  // Axis-aligned check.  Anchor at i0 = lsb(hint) and OR the shifted
-  // warp indices: `support` is the bits that vary across the active
-  // set.  Legal iff popcount(support) == log2(K) -- pigeonhole forces
-  // the K shifted indices to hit every subset of `support`, i.e. the
-  // active set is selectable by a single mask check.
+  // Axis-aligned check delegated to the shared predicate (single source of
+  // truth, also used by the TDM merge analysis).  All the granular conditions
+  // above have passed, so a false result here means specifically that the
+  // active set is not axis-aligned.
+  if (!isAxisAlignedWarpHint(hint, numWarps)) {
+    unsigned logK = llvm::Log2_32(K);
+    return op.emitOpError("warp_used_hint = ")
+           << llvm::formatv("{0:x}", hint) << " is not axis-aligned: K = " << K
+           << " active warps must span exactly log2(K) = " << logK
+           << " warpId bit positions";
+  }
+
+  return success();
+}
+} // namespace
+
+// Single source of truth for the axis-aligned coset rule; keep in sync with
+// the granular diagnostics in validateWarpUsedHint above.
+bool isAxisAlignedWarpHint(uint32_t hint, int64_t numWarps) {
+  if (!llvm::isPowerOf2_64(numWarps) || numWarps >= 32 || hint == 0)
+    return false;
+
+  // Bits above num_warps - 1 must be zero (no warp at those positions).
+  uint32_t numWarpsMask = (uint32_t{1} << numWarps) - 1;
+  if ((hint & ~numWarpsMask) != 0)
+    return false;
+
+  unsigned K = llvm::popcount(hint);
+  if (!llvm::isPowerOf2_32(K))
+    return false;
+
+  // Anchor at i0 = lsb(hint) and OR the shifted warp indices: `support` is the
+  // bits that vary across the active set.  Legal iff popcount(support) ==
+  // log2(K) -- pigeonhole forces the K shifted indices to hit every subset of
+  // `support`, i.e. the active set is selectable by a single mask check.
   unsigned i0 = llvm::countr_zero(hint);
   uint32_t support = 0;
   for (uint32_t mask = hint; mask != 0; mask &= mask - 1) {
     unsigned w = llvm::countr_zero(mask);
     support |= static_cast<uint32_t>(w ^ i0);
   }
-  unsigned logK = llvm::Log2_32(K);
-  unsigned spanned = static_cast<unsigned>(llvm::popcount(support));
-  if (spanned != logK)
-    return op.emitOpError("warp_used_hint = ")
-           << llvm::formatv("{0:x}", hint) << " is not axis-aligned: K = " << K
-           << " active warps span " << spanned
-           << " warpId bit positions, but an axis-aligned hint "
-           << "spans exactly log2(K) = " << logK;
-
-  return success();
+  return static_cast<unsigned>(llvm::popcount(support)) == llvm::Log2_32(K);
 }
-} // namespace
 
 LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   auto tensorDescTy = getDesc().getType();
