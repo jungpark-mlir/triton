@@ -43,7 +43,8 @@ void populateLoadStoreOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, ModuleAxisInfoAnalysis &axisInfoAnalysis,
     const DataFlowSolver *uniformitySolver,
-    const llvm::DenseMap<Operation *, mlir::LLVM::AMD::TDMMergeGroupInfo>
+    const llvm::DenseMap<Operation *,
+                         std::shared_ptr<mlir::LLVM::AMD::TDMMergeGroupInfo>>
         &tdmMergeGroups,
     PatternBenefit benefit);
 

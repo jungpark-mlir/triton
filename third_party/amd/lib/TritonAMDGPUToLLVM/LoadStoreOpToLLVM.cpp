@@ -1240,7 +1240,8 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
       LLVMTypeConverter &converter, const AMD::TargetInfo &targetInfo,
       ModuleAxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit,
       const DataFlowSolver *uniformitySolver,
-      const llvm::DenseMap<Operation *, mlir::LLVM::AMD::TDMMergeGroupInfo>
+      const llvm::DenseMap<Operation *,
+                           std::shared_ptr<mlir::LLVM::AMD::TDMMergeGroupInfo>>
           &mergeGroups)
       : ConvertOpToLLVMPattern(converter, benefit),
         LoadStoreConversionBase(targetInfo, axisAnalysisPass, uniformitySolver),
@@ -1317,7 +1318,7 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     // intrinsic for the whole group and erases the rest.
     auto mergeIt = mergeGroups.find(op);
     if (mergeIt != mergeGroups.end()) {
-      const auto &group = mergeIt->second;
+      const auto &group = *mergeIt->second;
       size_t numMembers = group.members.size();
 
       SmallVector<Value> originalDescPerMember(numMembers);
@@ -1416,7 +1417,8 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
   }
 
 private:
-  const llvm::DenseMap<Operation *, mlir::LLVM::AMD::TDMMergeGroupInfo>
+  const llvm::DenseMap<Operation *,
+                       std::shared_ptr<mlir::LLVM::AMD::TDMMergeGroupInfo>>
       &mergeGroups;
 };
 
@@ -2706,7 +2708,8 @@ void populateLoadStoreOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, ModuleAxisInfoAnalysis &axisInfoAnalysis,
     const DataFlowSolver *uniformitySolver,
-    const llvm::DenseMap<Operation *, mlir::LLVM::AMD::TDMMergeGroupInfo>
+    const llvm::DenseMap<Operation *,
+                         std::shared_ptr<mlir::LLVM::AMD::TDMMergeGroupInfo>>
         &tdmMergeGroups,
     PatternBenefit benefit) {
   assert(uniformitySolver &&

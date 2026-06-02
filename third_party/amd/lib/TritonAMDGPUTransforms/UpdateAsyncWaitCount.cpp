@@ -487,7 +487,7 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
           // last member; non-last members contribute zero intrinsics.
           auto mergeIt = tdmMergeGroups.find(op);
           if (mergeIt != tdmMergeGroups.end())
-            return op == mergeIt->second.lastInProgramOrder ? 1 : 0;
+            return op == mergeIt->second->lastInProgramOrder ? 1 : 0;
           auto smemTy = copyOp.getResult().getType();
           int numWarps = ttg::lookupNumWarps(op);
           std::optional<uint32_t> hint;

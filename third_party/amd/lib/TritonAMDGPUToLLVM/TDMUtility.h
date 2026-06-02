@@ -6,6 +6,7 @@
 #include "mlir/IR/Operation.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include <memory>
 #include <optional>
 
 using mlir::triton::AMD::TargetInfo;
@@ -116,12 +117,13 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 // already carry verifier-legal `warp_used_hint` masks.  This includes
 // user-authored hints and hints created by `prepareGeneratedTDMMergeHints`.
 //
-// TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS is a full kill-switch (default on;
-// set to 0 / "off" / "false" to disable).  When disabled, BOTH
-// `prepareGeneratedTDMMergeHints` (hint generation) and `computeTDMMergeGroups`
-// (merge analysis) become no-ops, so every TDM copy lowers standalone --
-// including ones that carry user-authored hints -- restoring pre-feature
-// codegen.
+// TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS (default on; set to 0 / "off" /
+// "false" to disable) gates ONLY the automatic generation of hints
+// (`prepareGeneratedTDMMergeHints`).  When disabled, the compiler stops
+// synthesizing hints for adjacent unhinted copies, but `computeTDMMergeGroups`
+// is NOT gated: copies that already carry compatible `warp_used_hint` masks
+// (user-authored or previously generated) still merge.  To keep a hinted copy
+// standalone, make its hint incompatible (overlapping) with its neighbor's.
 //
 // `prepareGeneratedTDMMergeHints` is a narrower pre-pass: it mutates only the
 // canonical adjacent hint-less indexed-destination form into hinted merge
@@ -145,7 +147,11 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 //      side-effecting non-TDM ops flush.
 //   6. Results have pairwise-distinct SSA destinations and same-rank
 //      descriptors that can be represented by a compatible hardware descriptor
-//      group form for the fused intrinsic.
+//      group form for the fused intrinsic.  Distinctness is enforced on the
+//      SSA result *values* (canMergeWith) -- a conservative non-overlap proxy:
+//      distinct SSA values are guaranteed non-aliasing here because membar
+//      keeps copies into the same allocation apart (so they never co-occur in
+//      a batch), but the check does not itself prove buffer non-overlap.
 //   7. Members share the same `cache` modifier (one auxBits on the fused
 //      intrinsic).
 struct TDMMergeGroupInfo {
@@ -178,10 +184,14 @@ struct TDMMergeMemberInfo {
 // No-op when the kill-switch env var disables auto-merge.
 void prepareGeneratedTDMMergeHints(ModuleOp mod);
 
-// Walk `mod` and identify all merge groups; ops not in any group are
-// absent from the result.  Returns an empty map when the kill-switch env var
-// disables auto-merge.
-llvm::DenseMap<Operation *, TDMMergeGroupInfo>
+// Walk `mod` and identify all merge groups from copies that already carry
+// compatible hints; ops not in any group are absent from the result.  Not
+// gated by the auto-merge env var (that knob only controls hint generation),
+// so user-authored compatible hints still merge when it is disabled.
+//
+// Each group's info is stored once and shared by all its members (the map value
+// is a shared_ptr), so an N-member group keeps a single TDMMergeGroupInfo.
+llvm::DenseMap<Operation *, std::shared_ptr<TDMMergeGroupInfo>>
 computeTDMMergeGroups(ModuleOp mod);
 
 // Emit one fused TDM intrinsic for a merge group. The site-local lowering
