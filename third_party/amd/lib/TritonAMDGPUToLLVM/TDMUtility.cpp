@@ -1596,9 +1596,11 @@ bool isGeneratedMergeHintCandidate(TDMCopyGlobalToLocalOp op) {
   return !op.getWarpUsedHintAttr() && !op.getBarrier();
 }
 
-size_t getTDMDescriptorGroupCount(TDMCopyGlobalToLocalOp op) {
-  auto tensorDescTy = op.getDesc().getType();
-  return tensorDescTy.getShape().size() > 2 ? 4 : 2;
+// A copy is eligible to enter a merge group once it carries a hint and no
+// mbarrier (the fused intrinsic can encode neither a missing hint nor a
+// barrier).  Complementary to isGeneratedMergeHintCandidate on the hint attr.
+bool isMergeableTDMShape(TDMCopyGlobalToLocalOp op) {
+  return op.getWarpUsedHintAttr() && !op.getBarrier();
 }
 
 size_t getTDMDescriptorRank(TDMCopyGlobalToLocalOp op) {
@@ -1731,10 +1733,9 @@ void prepareGeneratedTDMMergeHintsImpl(ModuleOp mod) {
 bool canMergeWith(ArrayRef<Operation *> members,
                   TDMCopyGlobalToLocalOp candidate) {
   auto first = cast<TDMCopyGlobalToLocalOp>(members.front());
+  // Equal rank implies equal descriptor group count (groupCount = rank>2?4:2),
+  // so the rank check subsumes the group-count check.
   if (getTDMDescriptorRank(first) != getTDMDescriptorRank(candidate))
-    return false;
-  if (getTDMDescriptorGroupCount(first) !=
-      getTDMDescriptorGroupCount(candidate))
     return false;
   if (first.getCache() != candidate.getCache())
     return false;
@@ -1745,6 +1746,11 @@ bool canMergeWith(ArrayRef<Operation *> members,
   return true;
 }
 
+// Re-derives merge-group boundaries from the hints actually present on a run of
+// adjacent candidates.  This intentionally does NOT trust the prepare-phase
+// grouping (assignGeneratedMergeHints): the analysis must also handle
+// user-authored hints it never created, and copies whose hints fail the
+// disjoint/coset rules, so it recomputes the boundaries from scratch here.
 void emitMergeGroup(
     MutableArrayRef<Operation *> batch, int numWarps,
     DenseMap<Operation *, std::shared_ptr<TDMMergeGroupInfo>> &result) {
@@ -1816,10 +1822,8 @@ SmallVector<Value, 4> fillMergedTDMDescriptorMember(
   assert(desc.size() == info.numGroups &&
          "descPerMember must match the member descriptor group count");
 
-  SmallVector<unsigned> warpsPerCTA;
-  unsigned numTDMInstructions = 1;
   int effectiveWarps = static_cast<int>(llvm::popcount(hint));
-  std::tie(warpsPerCTA, numTDMInstructions) =
+  auto [warpsPerCTA, numTDMInstructions] =
       ::mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
           info.shapePerCTA, effectiveWarps, info.encoding);
   assert(numTDMInstructions == 1 &&
@@ -1914,7 +1918,7 @@ computeTDMMergeGroups(ModuleOp mod) {
 
     for (Operation &op : *block) {
       if (auto tdm = dyn_cast<TDMCopyGlobalToLocalOp>(&op)) {
-        if (tdm.getWarpUsedHintAttr() && !tdm.getBarrier()) {
+        if (isMergeableTDMShape(tdm)) {
           candidates.push_back(&op);
           continue;
         }
