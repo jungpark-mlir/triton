@@ -111,7 +111,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       std::optional<uint32_t> warpUsedHint = std::nullopt);
 
 // ---------------------------------------------------------------------------
-// Implicit op-merging support.
+// TDM copy merging support.
 //
 // TDM-to-LLVM lowering can merge adjacent compatible copies whenever the copies
 // already carry verifier-legal `warp_used_hint` masks.  This includes
@@ -123,27 +123,27 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 // synthesizing hints for adjacent unhinted copies, but `computeTDMMergeGroups`
 // is NOT gated: copies that already carry compatible `warp_used_hint` masks
 // (user-authored or previously generated) still merge.  To keep a hinted copy
-// standalone, make its hint incompatible (overlapping) with its neighbor's.
+// standalone, make its hint overlap its neighbor's hint.
 //
 // `prepareGeneratedTDMMergeHints` is a narrower pre-pass: it mutates only the
-// canonical adjacent hint-less indexed-destination form into hinted merge
+// canonical adjacent unhinted indexed-destination form into hinted merge
 // candidates.  It is not the full mergeability contract; it only creates hints
-// for one safe IR shape.  Then `computeTDMMergeGroups` builds a side-table from
-// each merging `async_tdm_copy_global_to_local` op to its group info (IR
-// unchanged).  The conversion pattern dispatches on it: the first visited
-// member emits a fused intrinsic via `emitTDMLoadStoreMerged` and erases the
-// whole group; singletons fall back to `emitTDMLoadStore`.
+// for one safe IR shape.  Then `computeTDMMergeGroups` builds a map from each
+// merging `async_tdm_copy_global_to_local` op to its group info (IR unchanged).
+// The conversion pattern dispatches on it: the first visited member emits a
+// fused intrinsic via `emitTDMLoadStoreMerged` and erases the whole group;
+// singletons fall back to `emitTDMLoadStore`.
 //
 // Mergeability rules (v1; all required):
-//   1. Every member has a verifier-legal `warp_used_hint`; hint-less ops
-//      flush the in-flight batch.
+//   1. Every member has a verifier-legal `warp_used_hint`; unhinted copies end
+//      the current run.
 //   2. No member carries an `mbarrier` (the fused intrinsic cannot encode one);
-//      mbarrier-carrying copies flush.
-//   3. Members have pairwise-disjoint hints (their union need not itself be an
-//      axis-aligned coset).  Members may have different K = popcount(hint).
+//      mbarrier-carrying copies end the current run.
+//   3. Members have pairwise-disjoint hints.  Their union does not need to be a
+//      valid `warp_used_hint`.  Members may have different K = popcount(hint).
 //   4. Group size N is 2, 3, or 4.
 //   5. Members are strictly consecutive in one block; any intervening op (TDM
-//      or not) flushes the in-flight batch.
+//      or not) ends the current run.
 //   6. Results have pairwise-distinct SSA destinations and same-rank
 //      descriptors representable by a compatible hardware descriptor group form
 //      for the fused intrinsic.  Distinctness is checked on the SSA result
@@ -172,7 +172,7 @@ struct TDMMergeMemberInfo {
 };
 
 // Enabled by default (set TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS=1 to disable):
-// mutate only canonical adjacent hint-less copies with indexed destinations of
+// mutate only canonical adjacent unhinted copies with indexed destinations of
 // the form
 //   memdesc_index A; async_tdm_copy A; memdesc_index B; async_tdm_copy B; ...
 // into hinted merge candidates by moving the destination memdesc_index ops
@@ -182,7 +182,7 @@ void prepareGeneratedTDMMergeHints(ModuleOp mod);
 
 // Walk `mod` and identify all merge groups from copies that already carry
 // compatible hints; ops not in any group are absent from the result.  Not
-// gated by the auto-merge env var (that knob only controls hint generation),
+// gated by the auto-merge env var (it only controls hint generation),
 // so user-authored compatible hints still merge when it is disabled.
 //
 // Each group's info is stored once and shared by all its members (the map value
@@ -190,13 +190,12 @@ void prepareGeneratedTDMMergeHints(ModuleOp mod);
 llvm::DenseMap<Operation *, std::shared_ptr<TDMMergeGroupInfo>>
 computeTDMMergeGroups(ModuleOp mod);
 
-// Emit one fused TDM intrinsic for a merge group. The site-local lowering
-// builds per-member descriptors and `select`s between them on an SGPR-uniform
-// per-wave selector. `auxBits` comes from any member (rule 7 makes it uniform);
-// no mbarrier (rule 2).
+// Emit one fused TDM intrinsic for a merge group. The conversion builds
+// per-member descriptors and `select`s between them on an SGPR-uniform per-wave
+// selector. `auxBits` comes from any member (rule 7 makes it uniform); no
+// mbarrier (rule 2).
 void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
                             const LLVMTypeConverter *typeConverter,
-                            ArrayRef<Value> originalDescPerMember,
                             ArrayRef<SmallVector<Value>> descPerMember,
                             ArrayRef<TDMMergeMemberInfo> memberInfo,
                             int numWarps,

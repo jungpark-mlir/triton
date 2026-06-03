@@ -1323,7 +1323,6 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
       const auto &group = *mergeIt->second;
       size_t numMembers = group.members.size();
 
-      SmallVector<Value> originalDescPerMember(numMembers);
       SmallVector<SmallVector<Value>> descPerMember(numMembers);
       SmallVector<SmallVector<Value>> offsetPerMember(numMembers);
       SmallVector<SmallVector<Value>> dstPtrsPerMember(numMembers);
@@ -1336,7 +1335,6 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
       for (size_t i = 0; i < numMembers; ++i) {
         auto memberOp =
             cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(group.members[i]);
-        originalDescPerMember[i] = memberOp.getDesc();
 
         auto memberTensorDescTy = memberOp.getDesc().getType();
         auto memberEncoding = memberTensorDescTy.getSharedLayout();
@@ -1360,8 +1358,7 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
         Value memberMulticastMask;
         if (targetInfo.supportsMultiCTALaunch()) {
           memberMulticastMask = LLVM::AMD::emitCtaMulticastMask(
-              rewriter, loc, targetInfo.getClusterCTAId(rewriter, loc),
-              memberSharedLayout);
+              rewriter, loc, ctaId, memberSharedLayout);
         }
 
         auto memberShapePerCTA = triton::gpu::getShapePerCTA(
@@ -1392,10 +1389,9 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
           op.getCache(), /*isLoad*/ true, targetInfo);
       rewriter.setInsertionPoint(group.lastInProgramOrder);
       mlir::LLVM::AMD::emitTDMLoadStoreMerged(
-          rewriter, loc, getTypeConverter(), originalDescPerMember,
-          descPerMember, memberInfo, numWarps, offsetPerMember,
-          dstPtrsPerMember, predPerMember, /*isLoad=*/true, ctaId,
-          mergedAuxBits, group);
+          rewriter, loc, getTypeConverter(), descPerMember, memberInfo,
+          numWarps, offsetPerMember, dstPtrsPerMember, predPerMember,
+          /*isLoad=*/true, ctaId, mergedAuxBits, group);
 
       for (size_t i = numMembers; i-- > 0;)
         rewriter.eraseOp(group.members[i]);
@@ -2729,7 +2725,7 @@ void populateLoadStoreOpToLLVMPatterns(
       typeConverter, targetInfo, axisInfoAnalysis, benefit, uniformitySolver);
   // AsyncTDMCopyGlobalToLocalOpConversion additionally consumes the
   // op-to-merge-group map built by computeTDMMergeGroups, so it is constructed
-  // separately from the shared batch.
+  // separately from the main pattern list.
   patterns.add<AsyncTDMCopyGlobalToLocalOpConversion>(
       typeConverter, targetInfo, axisInfoAnalysis, benefit, uniformitySolver,
       tdmMergeGroups);

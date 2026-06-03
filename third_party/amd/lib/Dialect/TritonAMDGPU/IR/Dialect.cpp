@@ -584,7 +584,7 @@ void ConcatOp::getCanonicalizationPatterns(mlir::RewritePatternSet &patterns,
 }
 
 namespace {
-// Axis-aligned coset rule for `warp_used_hint` (see triton-lang/triton#10056).
+// Axis-aligned warp hint rule (see triton-lang/triton#10056).
 // Legal iff the active warps form a regular axis-aligned bit pattern: after
 // anchoring at i0 (the lowest active warp), the varying warp-id bits span
 // exactly log2(K) positions, so the set is selectable by one mask test.  The
