@@ -29,9 +29,9 @@ Manual: terminology
     They are bit positions; the basis vectors are `1 << basis_bit`.
   * **axis-aligned coset** = active set written as `i0 XOR
     span(basis_bits)`.  Equivalent to "passes the verifier".
-  * **candidate batch** (merge-only term): consecutive `async_load`s
-    the merge analyser considers for fusion.  From the batch head it
-    picks the largest supported N (2, 3, or 4) with pairwise-disjoint hints.
+  * **current run**: consecutive `async_load`s the merge analyser considers for
+    fusion.  From the run head it picks the largest supported N (2, 3, or 4)
+    with pairwise-disjoint hints.
 
 ================================================================
 Manual: constructing a legal hint
@@ -91,7 +91,7 @@ There are two separate capabilities:
   1. **Fundamental lowering merge**: if the source already provides compatible
      `warp_used_hint`s, TDM-to-LLVM can merge the copies even when they write to
      independent shared allocations, provided the allocation ops are outside the
-     consecutive copy batch.
+     consecutive copy run.
   2. **Automatic hint generation**: if the env var is set, the compiler can
      synthesize hints only for the canonical indexed-destination shape:
 
@@ -104,23 +104,23 @@ There are two separate capabilities:
 Mergeability rules (authoritative list in
 `TDMUtility.h::TDMMergeGroupInfo`):
 
-  1. Every member has a verifier-legal `warp_used_hint`. Hint-less ops flush
-     the in-flight batch unless auto hint generation is enabled and the copies
-     match the generated-hint pattern.
+  1. Every member has a verifier-legal `warp_used_hint`. Unhinted copies end
+     the current run unless auto hint generation is enabled and the copies match
+     the generated-hint pattern.
   2. No member has an `mbarrier`.  Such ops lower as singletons and
-     flush the batch.
-  3. Members have pairwise-disjoint hints (the union need not itself be a
-     verifier-legal coset).  Members may have different K.
+     end the current run.
+  3. Members have pairwise-disjoint hints. The union does not need to be a
+     verifier-legal `warp_used_hint`.  Members may have different K.
   4. Group size N is 2, 3, or 4.
   5. Members are strictly consecutive in the same block; any intervening op
-     (TDM or not) flushes the in-flight batch.
+     (TDM or not) ends the current run.
   6. Members write to pairwise-distinct SSA destinations and have same-rank
      descriptors that can be represented by a compatible hardware descriptor
      group form for the fused intrinsic. Destination `MemDescType`s may
      otherwise differ; shape/layout/type metadata is lowered per member.
   7. Members share the same `cache_modifier`.
 
-The analyser picks, from the head of the candidate batch, the largest
+The analyser picks, from the head of the current run, the largest
 supported N (up to 4) whose hints stay pairwise disjoint.  Op order, not
 warp order: it picks the first N `async_load`s, not the first N warps.
 The union need not be a coset, so e.g. K=1 hints {0b0001, 0b0010,
@@ -254,7 +254,7 @@ def vector_add_tdm_kernel(
 
     # One allocation per copy: distinct buffers let the membar analysis see the
     # destinations as disjoint, so no workgroup barrier is inserted between the
-    # adjacent copies (a barrier would split the merge batch).  Fusion then
+    # adjacent copies (a barrier would split the current run).  Fusion then
     # depends only on the hint merge rules below.
     a_stage = ttgl.allocate_shared_memory(a_desc.dtype, [1] + a_desc.block_shape, a_desc.layout)
     b_stage = ttgl.allocate_shared_memory(b_desc.dtype, [1] + b_desc.block_shape, b_desc.layout)
@@ -542,7 +542,7 @@ def vector_add_tdm_kernel_3way(
                                                          block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
 
     # One allocation per copy so membar sees disjoint destinations (no barrier
-    # between the adjacent copies to split the merge batch).
+    # between the adjacent copies to split the current run).
     a_stage = ttgl.allocate_shared_memory(a_desc.dtype, [1] + a_desc.block_shape, a_desc.layout)
     b_stage = ttgl.allocate_shared_memory(b_desc.dtype, [1] + b_desc.block_shape, b_desc.layout)
     c_stage = ttgl.allocate_shared_memory(c_desc.dtype, [1] + c_desc.block_shape, c_desc.layout)
@@ -718,7 +718,7 @@ def vector_add_tdm_kernel_4way(
                                                          block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
 
     # One allocation per copy so membar sees disjoint destinations (no barrier
-    # between the adjacent copies to split the merge batch).
+    # between the adjacent copies to split the current run).
     a_stage = ttgl.allocate_shared_memory(a_desc.dtype, [1] + a_desc.block_shape, a_desc.layout)
     b_stage = ttgl.allocate_shared_memory(b_desc.dtype, [1] + b_desc.block_shape, b_desc.layout)
     c_stage = ttgl.allocate_shared_memory(c_desc.dtype, [1] + c_desc.block_shape, c_desc.layout)
@@ -1050,7 +1050,7 @@ def vector_add_tdm_kernel_cache(
                                                          block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
 
     # One allocation per copy so membar sees disjoint destinations (no barrier
-    # between the adjacent copies to split the merge batch).
+    # between the adjacent copies to split the current run).
     a_stage = ttgl.allocate_shared_memory(a_desc.dtype, [1] + a_desc.block_shape, a_desc.layout)
     b_stage = ttgl.allocate_shared_memory(b_desc.dtype, [1] + b_desc.block_shape, b_desc.layout)
     a_buf = a_stage.index(0)
