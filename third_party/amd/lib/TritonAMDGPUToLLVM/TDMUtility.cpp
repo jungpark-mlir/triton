@@ -1551,25 +1551,28 @@ uint32_t getWarpUsedHintI0(uint32_t hint) {
   return llvm::countr_zero(hint);
 }
 
-// Warp-id bits that change among the active warps, measured from i0.
-uint32_t getWarpUsedHintSupport(uint32_t hint) {
-  uint32_t i0 = getWarpUsedHintI0(hint);
-  uint32_t support = 0;
-  for (uint32_t mask = hint; mask != 0; mask &= mask - 1) {
-    unsigned w = llvm::countr_zero(mask);
-    support |= static_cast<uint32_t>(w ^ i0);
-  }
-  return support;
-}
-
-// Warp-id bits that must match i0 for a wave to belong to the hint.
+// A hint's active warps form an axis-aligned coset: their warp IDs all agree on
+// a fixed set of bit positions and vary on the rest.  Returns those fixed bits
+// (within the num_warps id range).  A wave belongs to the hint iff XOR-ing its
+// warpId with i0 (the lowest active warp) leaves these bits clear -- the test
+// used to build the per-member select predicate.
 uint32_t getWarpUsedHintFreeMask(uint32_t hint, int numWarps) {
   assert(llvm::isPowerOf2_32(numWarps) && "numWarps must be power-of-two");
   uint32_t warpIdMask = (uint32_t{1} << llvm::Log2_32(numWarps)) - 1;
-  return warpIdMask & ~getWarpUsedHintSupport(hint);
+
+  // `varying` = bit positions that differ across the active warps (relative to
+  // i0); the fixed bits are everything else within the id range.
+  uint32_t i0 = getWarpUsedHintI0(hint);
+  uint32_t varying = 0;
+  for (uint32_t mask = hint; mask != 0; mask &= mask - 1)
+    varying |= static_cast<uint32_t>(llvm::countr_zero(mask) ^ i0);
+
+  return warpIdMask & ~varying;
 }
 
-// Hint for member `groupIdx`, splitting numWarps across a group.
+// Generated hint for member `groupIdx`: an axis-aligned mask that splits the
+// numWarps warps evenly across the group.  (groupSize 3 needs a dedicated
+// half + quarter + quarter split to stay axis-aligned.)
 uint32_t getGeneratedMergeHint(unsigned groupIdx, unsigned groupSize,
                                unsigned numWarps) {
   if (groupSize == 3) {
@@ -1612,14 +1615,13 @@ size_t getTDMDescriptorRank(TDMCopyGlobalToLocalOp op) {
   return op.getDesc().getType().getShape().size();
 }
 
-// Make one generated group adjacent and stamp each copy's hint.
+// Stamp one generated group: pull its destination views ahead of the copies,
+// make the copies adjacent, and assign each an axis-aligned disjoint hint.
+// The caller (assignGeneratedMergeHintsGreedily) guarantees a 2/3/4-member
+// group with one view per copy.
 void assignGeneratedMergeHints(MutableArrayRef<TDMCopyGlobalToLocalOp> group,
                                ArrayRef<triton::gpu::MemDescIndexOp> viewOps,
                                unsigned numWarps) {
-  assert((group.size() == 2 || group.size() == 3 || group.size() == 4) &&
-         "only pair/triple/quad merge hint groups are supported");
-  assert(viewOps.size() == group.size() &&
-         "copy group and destination view group must match");
   auto groupSize = static_cast<unsigned>(group.size());
   auto *ctx = group.front().getContext();
   auto hintTy = IntegerType::get(ctx, 32);
@@ -1644,21 +1646,25 @@ void assignGeneratedMergeHints(MutableArrayRef<TDMCopyGlobalToLocalOp> group,
 void assignGeneratedMergeHintsGreedily(
     MutableArrayRef<TDMCopyGlobalToLocalOp> run,
     ArrayRef<triton::gpu::MemDescIndexOp> viewRun, unsigned numWarps) {
-  assert(run.size() == viewRun.size() &&
-         "copy run and destination view run must match");
+  // Generated 3-way hints only support 4 or 8 warps, so cap auto-merge at 8;
+  // beyond that a trailing triple would ask getGeneratedMergeHint for an
+  // unsupported split.
   if (numWarps > 8)
     return;
 
   for (size_t i = 0; i < run.size();) {
     size_t remaining = run.size() - i;
+    // Take the largest group that fits (<= 4 members and <= numWarps).  A 3-way
+    // group is only reachable for an exact trailing triple, since size 4 is
+    // preferred whenever >= 4 copies remain.
     size_t chosen = 0;
     for (size_t size : {size_t{4}, size_t{3}, size_t{2}}) {
-      if (size > remaining || size > numWarps || (size == 3 && remaining != 3))
-        continue;
-      chosen = size;
-      break;
+      if (size <= remaining && size <= numWarps) {
+        chosen = size;
+        break;
+      }
     }
-    if (chosen == 0)
+    if (chosen < 2)
       break;
     assignGeneratedMergeHints(run.slice(i, chosen), viewRun.slice(i, chosen),
                               numWarps);
@@ -1730,7 +1736,7 @@ bool canMergeWith(ArrayRef<Operation *> members,
   return true;
 }
 
-// Build merge groups from a strictly adjacent run of hinted TDM copies.
+// Build merge groups from an adjacent run of hinted TDM copies.
 void emitMergeGroup(
     MutableArrayRef<Operation *> run,
     DenseMap<Operation *, std::shared_ptr<TDMMergeGroupInfo>> &result) {
@@ -1808,7 +1814,9 @@ SmallVector<Value, 4> fillMergedTDMDescriptorMember(
   return filled;
 }
 
-// SGPR-uniform predicate: true when this wave belongs to `hint`.
+// Returns a wave-uniform i1 (all lanes agree, since it depends only on warpId):
+// true for the waves whose warp belongs to `hint`.  Drives the per-member
+// `select` that picks this wave's descriptor in the fused emit.
 Value buildTDMMergeMemberActivePredicate(RewriterBase &rewriter, Location loc,
                                          uint32_t hint, int numWarps) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -1842,8 +1850,8 @@ void prepareGeneratedTDMMergeHints(ModuleOp mod) {
   prepareGeneratedTDMMergeHintsImpl(mod);
 }
 
-// Find groups of strictly consecutive, hinted TDM copies.  Any intervening op
-// ends the current run.  Generated hints must already be materialized.
+// Find groups of consecutive, hinted TDM copies.  Any intervening op ends the
+// current run.  Generated hints must already be materialized.
 llvm::DenseMap<Operation *, std::shared_ptr<TDMMergeGroupInfo>>
 computeTDMMergeGroups(ModuleOp mod) {
   llvm::DenseMap<Operation *, std::shared_ptr<TDMMergeGroupInfo>> result;
@@ -1920,6 +1928,9 @@ void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
         rewriter, loc, hintPerMember[s], numWarps);
 
   // Pick the descriptor for this wave with a scalar select chain.
+  // FIXME(perf): descriptor groups that are loop-invariant across members
+  // (e.g. identical across the group) produce redundant selects; hoist those
+  // out of the per-group loop instead of rebuilding a full chain for each.
   SmallVector<Value, 6> args(numGroups);
   for (size_t g = 0; g < numGroups; ++g) {
     Value acc = filledPerMember[N - 1][g];

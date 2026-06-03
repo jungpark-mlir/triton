@@ -22,59 +22,13 @@ Worked examples by shape:
 Manual: terminology
 ================================================================
 
-  * **K** = `popcount(hint)` -- number of active warps.  Power of two,
-    `1 <= K <= num_warps`.
-  * **i0** = smallest active warp INDEX (`countr_zero(hint)`).
-  * **basis bits** = set bits of `support = OR over s in S of (s XOR i0)`.
-    They are bit positions; the basis vectors are `1 << basis_bit`.
-  * **axis-aligned coset** = active set written as `i0 XOR
-    span(basis_bits)`.  Equivalent to "passes the verifier".
+For `warp_used_hint` legality (K, i0, axis-aligned coset) and a cookbook of
+legal/illegal hints and the generic hint formulas, see the manual in
+`test_tdm_copy.py`; this file does not repeat it.  One merge-specific term:
+
   * **current run**: consecutive `async_load`s the merge analyser considers for
     fusion.  From the run head it picks the largest supported N (2, 3, or 4)
     with pairwise-disjoint hints.
-
-================================================================
-Manual: constructing a legal hint
-================================================================
-
-The verifier (`validateWarpUsedHint` in `Dialect.cpp`) requires the
-active set `S = { i : bit i of H is 1 }` to be an *axis-aligned coset*:
-
-  - `K = popcount(H)` is a power of two with `1 <= K <= num_warps`.
-  - `S` shifted by its anchor (smallest active index `i0`) is an
-    F_2-linear subspace whose basis vectors are single powers of two.
-
-Pass the hint as a binary-literal `int`.  Cookbook of legal 8-warp
-hints (bit 7 on the left, bit 0 on the right):
-
-  +-------------+---+----+--------------------------------------------+
-  | Bitmask     | K | i0 | Active warps / shape                       |
-  +-------------+---+----+--------------------------------------------+
-  | 0b00001111  | 4 |  0 | warps {0,1,2,3}    -- low 4 warps          |
-  | 0b11110000  | 4 |  4 | warps {4,5,6,7}    -- high 4 warps         |
-  | 0b01010101  | 4 |  0 | warps {0,2,4,6}    -- every other, low i0  |
-  | 0b10101010  | 4 |  1 | warps {1,3,5,7}    -- every other, high i0 |
-  | 0b00110011  | 4 |  0 | warps {0,1,4,5}    -- two K=2 lanes paired |
-  | 0b00000011  | 2 |  0 | warps {0,1}        -- low 2 warps          |
-  | 0b00010001  | 2 |  0 | warps {0,4}        -- one lane per half    |
-  | 0b00010000  | 1 |  4 | warps {4}          -- single warp          |
-  +-------------+---+----+--------------------------------------------+
-
-Common rejected patterns (DO NOT pass these):
-
-  +-------------+----------------------------------------------------+
-  | 0           | rejected: merge candidates must carry a real hint  |
-  | 0b00000111  | rejected: K=3 is not a power of two                |
-  | 0b00001001  | rejected: warps 0 and 3 cannot form a coset alone  |
-  +-------------+----------------------------------------------------+
-
-If you need to write a hint generically (e.g. parameterised on the
-number of active warps `K`), the formulas are:
-
-  * "first K warps":              `(1 << K) - 1`
-  * "K warps starting at off":    `((1 << K) - 1) << off`
-                                  (off must be a multiple of K)
-  * "K warps spaced by 2**s":     `sum(1 << (i << s) for i in range(K))`
 
 ================================================================
 Manual: implicit op-merging across adjacent copies
@@ -114,7 +68,7 @@ Mergeability rules (authoritative list in
   3. Members have pairwise-disjoint hints. The union does not need to be a
      verifier-legal `warp_used_hint`.  Members may have different K.
   4. Group size N is 2, 3, or 4.
-  5. Members are strictly consecutive in the same block; any intervening op
+  5. Members are consecutive in the same block; any intervening op
      (TDM or not) ends the current run.
   6. Members have same-rank descriptors that can be represented by a compatible
      hardware descriptor group form for the fused intrinsic. Destination
