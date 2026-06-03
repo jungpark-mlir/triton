@@ -1142,7 +1142,7 @@ def test_compile_vector_add_tdm_cache(BLOCK_M, BLOCK_N, CACHE_A, CACHE_B, expect
 
 if __name__ == "__main__":
     # Smoke test: iterate all cookbook entries at one block size.
-    # Run as `python test_tdm_partial_merge.py` on a gfx1250 device.
+    # Run as `python test_tdm_merge.py` on a gfx1250 device.
     if not is_hip_gfx1250():
         raise SystemExit("This script requires a gfx1250 device.")
     print("[2-way: vector_add_tdm_kernel]")

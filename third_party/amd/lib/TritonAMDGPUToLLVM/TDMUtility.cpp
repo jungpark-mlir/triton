@@ -1837,7 +1837,7 @@ Value buildTDMMergeMemberActivePredicate(RewriterBase &rewriter, Location loc,
 // but merge-group formation itself is NOT gated: TDM copies that already carry
 // compatible warp_used_hint values (user-authored or previously generated)
 // still merge.  This matches the documented contract in
-// test_tdm_partial_merge.py -- the env var governs auto-generation, not whether
+// test_tdm_merge.py -- the env var governs auto-generation, not whether
 // existing compatible hints fuse.
 static bool tdmAutoMergeEnabled() {
   auto disabled = mlir::triton::tools::isEnvValueBool(

@@ -88,7 +88,7 @@ here deliberately overlap to stay un-merged; the compile test also sets
 TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS=1 to suppress auto-generated hints
 for the unhinted pair.  Merge-aware lowering (where compatible hinted
 copies fuse into a single `tensor_load_to_lds`) is covered separately in
-`test_tdm_partial_merge.py`.
+`test_tdm_merge.py`.
 """
 
 import re
@@ -217,7 +217,7 @@ def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, monkeypatch):
     analyser's disjointness check rejects them and each copy stays
     standalone.  The env knob additionally suppresses auto-generated
     hints for the `no_hint` (unhinted) pair.  The fused (merged) lowering
-    is exercised in `test_tdm_partial_merge.py`.
+    is exercised in `test_tdm_merge.py`.
     """
     monkeypatch.setenv("TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS", "1")
     NUM_WARPS = 8
