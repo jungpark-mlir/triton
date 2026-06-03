@@ -1644,8 +1644,6 @@ void assignGeneratedMergeHints(MutableArrayRef<TDMCopyGlobalToLocalOp> group,
 void assignGeneratedMergeHintsGreedily(
     MutableArrayRef<TDMCopyGlobalToLocalOp> run,
     ArrayRef<triton::gpu::MemDescIndexOp> viewRun, unsigned numWarps) {
-  if (run.empty())
-    return;
   assert(run.size() == viewRun.size() &&
          "copy run and destination view run must match");
   if (numWarps > 8)
@@ -1736,21 +1734,21 @@ bool canMergeWith(ArrayRef<Operation *> members,
 void emitMergeGroup(
     MutableArrayRef<Operation *> run,
     DenseMap<Operation *, std::shared_ptr<TDMMergeGroupInfo>> &result) {
+  auto hintOf = [](Operation *op) {
+    return static_cast<uint32_t>(
+        cast<TDMCopyGlobalToLocalOp>(op).getWarpUsedHintAttr().getInt());
+  };
+
   while (run.size() >= 2) {
     // Extend while hints stay disjoint and descriptors stay compatible.
-    SmallVector<Operation *, 4> members;
-    members.push_back(run.front());
-    SmallVector<uint32_t, 4> hints;
-    hints.push_back(
-        static_cast<uint32_t>(cast<TDMCopyGlobalToLocalOp>(run.front())
-                                  .getWarpUsedHintAttr()
-                                  .getInt()));
+    SmallVector<Operation *, 4> members{run.front()};
+    SmallVector<uint32_t, 4> hints{hintOf(run.front())};
     uint32_t orSoFar = hints.front();
     for (size_t i = 1; i < run.size() && members.size() < 4; ++i) {
       auto op = cast<TDMCopyGlobalToLocalOp>(run[i]);
       if (!canMergeWith(members, op))
         break;
-      auto hint = static_cast<uint32_t>(op.getWarpUsedHintAttr().getInt());
+      uint32_t hint = hintOf(op);
       if (orSoFar & hint) // hints must be pairwise-disjoint
         break;
       orSoFar |= hint;
@@ -1808,13 +1806,6 @@ SmallVector<Value, 4> fillMergedTDMDescriptorMember(
                     info.sharedLayout, ctaId, /*isStore=*/!isLoad, warpsPerCTA,
                     hint);
   return filled;
-}
-
-// Emit the fused intrinsic from the selected descriptor groups.
-void emitMergedTDMIntrinsic(RewriterBase &rewriter, Location loc,
-                            ArrayRef<Value> desc, bool isLoad,
-                            int32_t auxBits) {
-  emitTDMRawIntrinsic(rewriter, loc, desc, isLoad, auxBits);
 }
 
 // SGPR-uniform predicate: true when this wave belongs to `hint`.
@@ -1906,22 +1897,20 @@ void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
          "merge group must carry one hint per member");
 
   auto b = TritonLLVMOpBuilder(loc, rewriter);
+  // canMergeWith guarantees a uniform rank across members, so every member
+  // shares this descriptor group count (2 for rank <= 2, otherwise 4).
   size_t numGroups = memberInfo.front().numGroups;
-  assert(numGroups == 2 || numGroups == 4);
 
   // Hints came from computeTDMMergeGroups; no per-member recheck here.
-  SmallVector<uint32_t, 4> hintPerMember(groupInfo.memberHints.begin(),
-                                         groupInfo.memberHints.end());
+  ArrayRef<uint32_t> hintPerMember = groupInfo.memberHints;
 
   SmallVector<SmallVector<Value, 4>, 4> filledPerMember(N);
   for (size_t i = 0; i < N; ++i) {
-    ArrayRef<Value> di = descPerMember[i];
     const TDMMergeMemberInfo &info = memberInfo[i];
-    assert(info.numGroups == numGroups &&
-           "merge members must have the same descriptor group count");
     filledPerMember[i] = fillMergedTDMDescriptorMember(
-        rewriter, loc, typeConverter, di, info, numWarps, offsetPerMember[i],
-        dstPtrsPerMember[i], predPerMember[i], isLoad, ctaId, hintPerMember[i]);
+        rewriter, loc, typeConverter, descPerMember[i], info, numWarps,
+        offsetPerMember[i], dstPtrsPerMember[i], predPerMember[i], isLoad,
+        ctaId, hintPerMember[i]);
   }
 
   // Build predicates for all but the last member; the last is the default.
@@ -1939,6 +1928,6 @@ void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
     args[g] = acc;
   }
 
-  emitMergedTDMIntrinsic(rewriter, loc, args, isLoad, auxBits);
+  emitTDMRawIntrinsic(rewriter, loc, args, isLoad, auxBits);
 }
 } // namespace mlir::LLVM::AMD
