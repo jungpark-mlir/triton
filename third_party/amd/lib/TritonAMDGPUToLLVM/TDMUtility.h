@@ -117,9 +117,9 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 // already carry verifier-legal `warp_used_hint` masks.  This includes
 // user-authored hints and hints created by `prepareGeneratedTDMMergeHints`.
 //
-// TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS (default on; set to 0 / "off" /
-// "false" to disable) gates ONLY the automatic generation of hints
-// (`prepareGeneratedTDMMergeHints`).  When disabled, the compiler stops
+// TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS (default off; set to 1 / "on" /
+// "true" to disable auto-generation) gates ONLY the automatic generation of
+// hints (`prepareGeneratedTDMMergeHints`).  When set, the compiler stops
 // synthesizing hints for adjacent unhinted copies, but `computeTDMMergeGroups`
 // is NOT gated: copies that already carry compatible `warp_used_hint` masks
 // (user-authored or previously generated) still merge.  To keep a hinted copy
@@ -127,41 +127,37 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 //
 // `prepareGeneratedTDMMergeHints` is a narrower pre-pass: it mutates only the
 // canonical adjacent hint-less indexed-destination form into hinted merge
-// candidates. It
-// is not the full mergeability contract; it only creates hints for one safe IR
-// shape. Then `computeTDMMergeGroups` builds a side-table from each merging
-// `async_tdm_copy_global_to_local` op to its group info (IR unchanged). The
-// conversion pattern dispatches on it: the first visited member emits a fused
-// intrinsic via `emitTDMLoadStoreMerged` and erases the whole group; singletons
-// fall back to `emitTDMLoadStore`.
+// candidates.  It is not the full mergeability contract; it only creates hints
+// for one safe IR shape.  Then `computeTDMMergeGroups` builds a side-table from
+// each merging `async_tdm_copy_global_to_local` op to its group info (IR
+// unchanged).  The conversion pattern dispatches on it: the first visited
+// member emits a fused intrinsic via `emitTDMLoadStoreMerged` and erases the
+// whole group; singletons fall back to `emitTDMLoadStore`.
 //
 // Mergeability rules (v1; all required):
 //   1. Every member has a verifier-legal `warp_used_hint`; hint-less ops
 //      flush the in-flight batch.
-//   2. No member has an `mbarrier` (fused intrinsic can't encode it);
-//      mbarrier-carrying ops flush.
-//   3. Members have pairwise-disjoint hints and their union is itself an
-//      axis-aligned coset. Members may have different K = popcount(hint).
+//   2. No member carries an `mbarrier` (the fused intrinsic cannot encode one);
+//      mbarrier-carrying copies flush.
+//   3. Members have pairwise-disjoint hints (their union need not itself be an
+//      axis-aligned coset).  Members may have different K = popcount(hint).
 //   4. Group size N is 2, 3, or 4.
-//   5. Members are consecutive in one block; pure ops thread through,
-//      side-effecting non-TDM ops flush.
+//   5. Members are strictly consecutive in one block; any intervening op (TDM
+//      or not) flushes the in-flight batch.
 //   6. Results have pairwise-distinct SSA destinations and same-rank
-//      descriptors that can be represented by a compatible hardware descriptor
-//      group form for the fused intrinsic.  Distinctness is enforced on the
-//      SSA result *values* (canMergeWith) -- a conservative non-overlap proxy:
-//      distinct SSA values are guaranteed non-aliasing here because membar
-//      keeps copies into the same allocation apart (so they never co-occur in
-//      a batch), but the check does not itself prove buffer non-overlap.
+//      descriptors representable by a compatible hardware descriptor group form
+//      for the fused intrinsic.  Distinctness is checked on the SSA result
+//      *values* (canMergeWith) as a conservative non-overlap proxy; it does not
+//      itself prove buffer non-overlap.
 //   7. Members share the same `cache` modifier (one auxBits on the fused
 //      intrinsic).
 struct TDMMergeGroupInfo {
   // Members in program order. |members| = |memberHints| = N.
   SmallVector<Operation *> members;
   SmallVector<uint32_t> memberHints;
-  // Last member in program order; used to anchor the fused intrinsic's
-  // insertion point so any pure ops between members dominate it.
+  // Last member in program order; anchors the fused intrinsic's insertion
+  // point so all members dominate it.
   Operation *lastInProgramOrder = nullptr;
-  uint32_t unionHint = 0; // bitwise union of member warp_used_hint masks
 };
 
 struct TDMMergeMemberInfo {
@@ -175,13 +171,13 @@ struct TDMMergeMemberInfo {
   size_t numGroups = 0;
 };
 
-// Enabled by default (set TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS=0 to disable):
+// Enabled by default (set TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS=1 to disable):
 // mutate only canonical adjacent hint-less copies with indexed destinations of
 // the form
 //   memdesc_index A; async_tdm_copy A; memdesc_index B; async_tdm_copy B; ...
 // into hinted merge candidates by moving the destination memdesc_index ops
 // before the copy group and assigning disjoint warp_used_hint masks.
-// No-op when the kill-switch env var disables auto-merge.
+// No-op when the env var disables auto-merge.
 void prepareGeneratedTDMMergeHints(ModuleOp mod);
 
 // Walk `mod` and identify all merge groups from copies that already carry
@@ -213,9 +209,9 @@ void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
 // Effective warp count that drives TDM warp distribution and the resulting
 // physical instruction count.  A `warp_used_hint` restricts emission to
 // K = popcount(hint) warps (the rest become hardware no-ops), so the
-// distribution must be sized by K, not num_warps.  This is the single source
-// of truth shared by the lowering (`emitTDMLoadStore`) and the wait-count pass
-// so the counted intrinsics cannot drift from the emitted ones.
+// distribution must be sized by K, not num_warps.  Both the lowering
+// (`emitTDMLoadStore`) and the wait-count pass call this so the counted
+// intrinsics cannot drift from the emitted ones.
 int getTDMEffectiveWarps(int numWarps, std::optional<uint32_t> warpUsedHint);
 
 // Returns (warpsPerCTA, numTDMInstructions) for a given shared encoding.

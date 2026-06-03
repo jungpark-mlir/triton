@@ -31,7 +31,7 @@ Manual: terminology
     span(basis_bits)`.  Equivalent to "passes the verifier".
   * **candidate batch** (merge-only term): consecutive `async_load`s
     the merge analyser considers for fusion.  From the batch head it
-    picks the largest supported N (2, 3, or 4) with a legal-coset union.
+    picks the largest supported N (2, 3, or 4) with pairwise-disjoint hints.
 
 ================================================================
 Manual: constructing a legal hint
@@ -83,7 +83,7 @@ Manual: implicit op-merging across adjacent copies
 Two or more adjacent `async_load`s with compatible hints fuse into one
 `llvm.amdgcn.tensor.load.to.lds` during TDM->LLVM lowering.  Each wave
 selects its member via SGPR-uniform selection; no source-level rewrite is
-needed.  With `TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS=1`, the compiler can
+needed.  Unless `TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS=1`, the compiler can
 also create compatible hints for adjacent unhinted copies.
 
 There are two separate capabilities:
@@ -109,12 +109,11 @@ Mergeability rules (authoritative list in
      match the generated-hint pattern.
   2. No member has an `mbarrier`.  Such ops lower as singletons and
      flush the batch.
-  3. Members are pairwise disjoint, and their union is itself a
-     verifier-legal coset.  Members may have different K.
+  3. Members have pairwise-disjoint hints (the union need not itself be a
+     verifier-legal coset).  Members may have different K.
   4. Group size N is 2, 3, or 4.
-  5. Members are consecutive in the same block; arith/index math
-     threads through, side-effecting non-TDM ops (`async_wait`,
-     `barrier`, `local_alloc`, ...) flush.
+  5. Members are strictly consecutive in the same block; any intervening op
+     (TDM or not) flushes the in-flight batch.
   6. Members write to pairwise-distinct SSA destinations and have same-rank
      descriptors that can be represented by a compatible hardware descriptor
      group form for the fused intrinsic. Destination `MemDescType`s may
@@ -122,18 +121,16 @@ Mergeability rules (authoritative list in
   7. Members share the same `cache_modifier`.
 
 The analyser picks, from the head of the candidate batch, the largest
-supported N whose first-N union is a legal coset.  Op order, not warp
-order: it picks the first N `async_load`s, not the first N warps.
-Intermediate unions need not be cosets; e.g. K=1 hints
-{0b0001, 0b0010, 0b0100, 0b1000} have non-coset 0b0111 mid-way but
-legal 0b1111 at the end, and still fuse as one N=4 group.
+supported N (up to 4) whose hints stay pairwise disjoint.  Op order, not
+warp order: it picks the first N `async_load`s, not the first N warps.
+The union need not be a coset, so e.g. K=1 hints {0b0001, 0b0010,
+0b0100, 0b1000} fuse as one N=4 group.
 
 Example: two adjacent loads that *will* fuse:
 
     # Op A's hint activates warps {0,1,2,3} (the lower half).
     # Op B's hint activates warps {4,5,6,7} (the upper half).
-    # K=4 each, disjoint, union = 0b11111111 covers all 8 warps and
-    # is a legal coset -> fuses into one `tensor_load_to_lds` op.
+    # K=4 each, pairwise disjoint -> fuses into one `tensor_load_to_lds` op.
     ttgl.amd.gfx1250.tdm.async_load(a_desc, [m, n], a_buf,
                                     warp_used_hint=0b00001111)
     ttgl.amd.gfx1250.tdm.async_load(b_desc, [m, n], b_buf,
@@ -143,11 +140,11 @@ Example: two adjacent loads that *will* fuse:
 Example: two adjacent loads that *will not* fuse:
 
     ttgl.amd.gfx1250.tdm.async_load(a_desc, [m, n], a_buf,
-                                    warp_used_hint=0b00000011)   # K=2
+                                    warp_used_hint=0b00000011)   # warps {0,1}
     ttgl.amd.gfx1250.tdm.async_load(b_desc, [m, n], b_buf,
-                                    warp_used_hint=0b00010000)   # K=1
-    # Rule 3 violation: union has K=3, which is not verifier-legal.
-    # Lowered as two separate intrinsics.
+                                    warp_used_hint=0b00000110)   # warps {1,2}
+    # Rule 3 violation: the hints overlap on warp 1, so they are not
+    # pairwise disjoint.  Lowered as two separate intrinsics.
 
 ================================================================
 Manual: `async_wait` is user-owned
@@ -199,7 +196,7 @@ def _use_tdm_hint(request):
 # Worked example #1: 2-way merge
 # ===========================================================================
 # Covers mergeable adjacent pairs and the "decline to merge" path for
-# merge-rule violations such as a non-coset union.
+# merge-rule violations such as overlapping (non-disjoint) hints.
 #
 #     ttgl.amd.gfx1250.tdm.async_load(a_desc, [m, n], a_buf,
 #                                     warp_used_hint=HINT_A)
@@ -207,7 +204,7 @@ def _use_tdm_hint(request):
 #                                     warp_used_hint=HINT_B)
 #     ttgl.amd.gfx1250.tdm.async_wait(0)
 #
-# Both hints legal + disjoint + legal-union -> fused into one
+# Both hints legal + pairwise disjoint -> fused into one
 # `tensor_load_to_lds`.
 # ===========================================================================
 
@@ -288,8 +285,9 @@ def vector_add_tdm_kernel(
 # ---------------------------------------------------------------------------
 # Hint cookbook for `vector_add_tdm_kernel`.  Layout:
 # (HINT_A, HINT_B, expected_merge, id).  Bit `i` => warp `i`.
-# `expected_merge=False` rows fail a merge rule while still using valid
-# predicated copies.
+# Every pair here is pairwise-disjoint, so all merge (rule 3 only requires
+# disjoint hints, not a coset union); other failing-rule cases live in the
+# cache cookbook below.  `expected_merge` is kept in the schema for symmetry.
 # ---------------------------------------------------------------------------
 
 _HINT_PARAMS = [
@@ -305,9 +303,11 @@ _HINT_PARAMS = [
     (0b00110011, 0b11001100, True, "merge_lo_hi_pairs"),
     # partial coverage: K=2 each, union covers 4 of 8 warps (rest idle).
     (0b00000011, 0b00001100, True, "merge_partial_K4_idle"),
-    # equal K, disjoint, but union is not a coset (warps {0,3} have
-    # support 0b11 with popcount 2 != log2(2)=1): rule 3 forbids merging.
-    (0b00000001, 0b00001000, False, "disjoint_K1_union_illegal"),
+    # disjoint K=1 hints whose union {0,3} is not itself a coset.  Rule 3
+    # only requires pairwise disjointness, so this still merges: warp 0 picks
+    # member A, every other warp falls through to member B (hint 0b1000),
+    # which predicates off all but warp 3 -- matching standalone emission.
+    (0b00000001, 0b00001000, True, "merge_disjoint_K1_noncoset_union"),
 ]
 
 
@@ -435,17 +435,17 @@ def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge
 
 def test_compile_vector_add_tdm_auto_merge_env_toggle(monkeypatch):
     """Compile-only: env toggles generated hints for adjacent unhinted copies."""
-    env_var = "TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS"
+    env_var = "TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS"
 
-    monkeypatch.setenv(env_var, "0")
+    monkeypatch.setenv(env_var, "1")
     amdgcn = _compile_vector_add_tdm_amdgcn(64, 64, USE_HINT=False)
     _assert_tensor_load_count(amdgcn, 2, "env-disabled generated hints")
 
-    monkeypatch.setenv(env_var, "1")
+    monkeypatch.setenv(env_var, "0")
     amdgcn = _compile_vector_add_tdm_amdgcn(32, 128, USE_HINT=False)
     _assert_tensor_load_count(amdgcn, 1, "env-enabled generated hints")
 
-    monkeypatch.setenv(env_var, "0")
+    monkeypatch.setenv(env_var, "1")
     amdgcn = _compile_vector_add_tdm_amdgcn(128, 64, USE_HINT=False)
     _assert_tensor_load_count(amdgcn, 2, "env-reset generated hints")
 
@@ -503,8 +503,7 @@ def test_runtime_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, expected_merge
 # Worked example #2: 3-way merge across three descriptors
 # ===========================================================================
 # Three back-to-back TDM copies can fuse into one hardware op when their hints
-# are disjoint and their union is a legal coset.  This covers the non-uniform
-# generated-hint shape:
+# are pairwise disjoint.  This covers the non-uniform generated-hint shape:
 #   num_warps=4: {0b0011, 0b0100, 0b1000}
 #   num_warps=8: {0b00001111, 0b00110000, 0b11000000}
 # ===========================================================================
@@ -575,7 +574,9 @@ def vector_add_tdm_kernel_3way(
 _HINT_PARAMS_3WAY = [
     (8, 0b00001111, 0b00110000, 0b11000000, True, "three_way_8w_generated_shape"),
     (4, 0b0011, 0b0100, 0b1000, True, "three_way_4w_generated_shape"),
-    (8, 0b00000001, 0b00001000, 0b00010000, False, "three_way_union_illegal"),
+    # Disjoint K=1 hints whose union {0,3,4} is not a coset; rule 3 only
+    # requires pairwise disjointness, so they still fuse.
+    (8, 0b00000001, 0b00001000, 0b00010000, True, "three_way_noncoset_union"),
 ]
 
 
@@ -629,7 +630,7 @@ def _compile_vector_add_tdm_3way_amdgcn(
     ids=[_param_id(p) for p in _HINT_PARAMS_3WAY],
 )
 def test_compile_vector_add_tdm_3way(BLOCK_M, BLOCK_N, NUM_WARPS, HINT_A, HINT_B, HINT_C, expected_merge, request):
-    """Compile-only: 3 adjacent copies fuse when their union is legal."""
+    """Compile-only: 3 adjacent copies fuse when their hints are pairwise disjoint."""
     use_tdm_hint = _use_tdm_hint(request)
     amdgcn = _compile_vector_add_tdm_3way_amdgcn(
         NUM_WARPS, use_tdm_hint, HINT_A, HINT_B, HINT_C, BLOCK_M, BLOCK_N)
@@ -647,21 +648,21 @@ def test_compile_vector_add_tdm_3way(BLOCK_M, BLOCK_N, NUM_WARPS, HINT_A, HINT_B
 
 def test_compile_vector_add_tdm_3way_auto_merge_env_toggle(monkeypatch):
     """Compile-only: env can generate 3-way hints for adjacent unhinted copies."""
-    env_var = "TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS"
+    env_var = "TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS"
 
-    monkeypatch.setenv(env_var, "0")
+    monkeypatch.setenv(env_var, "1")
     amdgcn = _compile_vector_add_tdm_3way_amdgcn(8, use_hint=False, block_m=64, block_n=64)
     _assert_tensor_load_count(amdgcn, 3, "3-way env-disabled generated hints")
 
-    monkeypatch.setenv(env_var, "1")
+    monkeypatch.setenv(env_var, "0")
     amdgcn = _compile_vector_add_tdm_3way_amdgcn(8, use_hint=False, block_m=32, block_n=128)
     _assert_tensor_load_count(amdgcn, 1, "3-way env-enabled generated hints for 8 warps")
 
-    monkeypatch.setenv(env_var, "1")
+    monkeypatch.setenv(env_var, "0")
     amdgcn = _compile_vector_add_tdm_3way_amdgcn(4, use_hint=False, block_m=128, block_n=64)
     _assert_tensor_load_count(amdgcn, 1, "3-way env-enabled generated hints for 4 warps")
 
-    monkeypatch.setenv(env_var, "0")
+    monkeypatch.setenv(env_var, "1")
     amdgcn = _compile_vector_add_tdm_3way_amdgcn(4, use_hint=False, block_m=64, block_n=128)
     _assert_tensor_load_count(amdgcn, 3, "3-way env-reset generated hints")
 
@@ -670,10 +671,9 @@ def test_compile_vector_add_tdm_3way_auto_merge_env_toggle(monkeypatch):
 # Worked example #3: 4-way merge across four descriptors
 # ===========================================================================
 # Four back-to-back TDM copies fused into one hardware op, exercising
-# the N=4 member-predicate path.  The full union of all four hints must be a legal
-# coset; intermediate unions need not be (e.g. K=1 hints {0b0001,
-# 0b0010, 0b0100, 0b1000} have non-coset 0b0111 mid-way but legal
-# 0b1111 at the end -- still fuses).
+# the N=4 member-predicate path.  Only pairwise disjointness is required; the
+# union need not be a coset (e.g. K=1 hints {0b0001, 0b0010, 0b0100, 0b1000}
+# fuse even though no proper sub-union is a coset).
 # ===========================================================================
 
 

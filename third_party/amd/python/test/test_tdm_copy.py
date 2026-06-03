@@ -85,7 +85,7 @@ Runtime tests are skipped on non-gfx1250 hosts.
 This file is the *standalone* per-`async_load` reference.  Merging only
 fuses adjacent copies with DISJOINT active-warp sets, so the hinted pairs
 here deliberately overlap to stay un-merged; the compile test also sets
-TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS=0 to suppress auto-generated hints
+TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS=1 to suppress auto-generated hints
 for the unhinted pair.  Merge-aware lowering (where compatible hinted
 copies fuse into a single `tensor_load_to_lds`) is covered separately in
 `test_tdm_partial_merge.py`.
@@ -219,7 +219,7 @@ def test_compile_vector_add_tdm(BLOCK_M, BLOCK_N, HINT_A, HINT_B, monkeypatch):
     hints for the `no_hint` (unhinted) pair.  The fused (merged) lowering
     is exercised in `test_tdm_partial_merge.py`.
     """
-    monkeypatch.setenv("TRITON_AMD_ENABLE_TDM_AUTO_MERGE_HINTS", "0")
+    monkeypatch.setenv("TRITON_AMD_DISABLE_TDM_AUTO_MERGE_HINTS", "1")
     NUM_WARPS = 8
     signature = {
         "a_ptr": "*i32",

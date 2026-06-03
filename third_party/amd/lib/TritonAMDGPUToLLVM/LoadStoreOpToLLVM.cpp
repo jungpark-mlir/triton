@@ -1314,8 +1314,10 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     auto shapePerCTA =
         triton::gpu::getShapePerCTA(encoding, tensorDescTy.getShape());
 
-    // Implicit merge dispatch: the first visited member emits the fused
-    // intrinsic for the whole group and erases the rest.
+    // If this op is part of a merge group, the first member visited emits one
+    // fused intrinsic for the whole group and erases the rest; the others are
+    // already gone by the time they would be visited.  See the mergeability
+    // contract and TDMMergeGroupInfo in TDMUtility.h.
     auto mergeIt = mergeGroups.find(op);
     if (mergeIt != mergeGroups.end()) {
       const auto &group = *mergeIt->second;

@@ -615,10 +615,9 @@ LogicalResult validateWarpUsedHint(AsyncTDMCopyGlobalToLocalOp op,
            << K << " must be a power of two (got hint "
            << llvm::formatv("{0:x}", hint) << ")";
 
-  // Axis-aligned check delegated to the shared predicate (single source of
-  // truth, also used by the TDM merge analysis).  All the granular conditions
-  // above have passed, so a false result here means specifically that the
-  // active set is not axis-aligned.
+  // Axis-aligned check delegated to the shared predicate (also used by the TDM
+  // merge analysis).  All the granular conditions above have passed, so a false
+  // result here means specifically that the active set is not axis-aligned.
   if (!isAxisAlignedWarpHint(hint, numWarps)) {
     unsigned logK = llvm::Log2_32(K);
     return op.emitOpError("warp_used_hint = ")
@@ -631,8 +630,8 @@ LogicalResult validateWarpUsedHint(AsyncTDMCopyGlobalToLocalOp op,
 }
 } // namespace
 
-// Single source of truth for the axis-aligned coset rule; keep in sync with
-// the granular diagnostics in validateWarpUsedHint above.
+// Defines the axis-aligned coset rule (see triton-lang/triton#10056); the
+// granular diagnostics in validateWarpUsedHint above mirror these checks.
 bool isAxisAlignedWarpHint(uint32_t hint, int64_t numWarps) {
   if (!llvm::isPowerOf2_64(numWarps) || numWarps >= 32 || hint == 0)
     return false;
