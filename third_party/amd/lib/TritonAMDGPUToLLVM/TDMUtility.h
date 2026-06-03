@@ -144,11 +144,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 //   4. Group size N is 2, 3, or 4.
 //   5. Members are strictly consecutive in one block; any intervening op (TDM
 //      or not) ends the current run.
-//   6. Results have pairwise-distinct SSA destinations and same-rank
-//      descriptors representable by a compatible hardware descriptor group form
-//      for the fused intrinsic.  Distinctness is checked on the SSA result
-//      *values* (canMergeWith) as a conservative non-overlap proxy; it does not
-//      itself prove buffer non-overlap.
+//   6. Members have same-rank descriptors representable by a compatible
+//      hardware descriptor group form for the fused intrinsic.
 //   7. Members share the same `cache` modifier (one auxBits on the fused
 //      intrinsic).
 struct TDMMergeGroupInfo {

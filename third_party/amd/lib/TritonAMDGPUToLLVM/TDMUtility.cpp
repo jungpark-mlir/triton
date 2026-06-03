@@ -1864,6 +1864,7 @@ computeTDMMergeGroups(ModuleOp mod) {
   for (Block *block : blocks) {
     SmallVector<Operation *> candidates;
     auto flush = [&]() {
+      // Finalize the current adjacent run before starting a new one.
       if (candidates.size() >= 2)
         emitMergeGroup(candidates, result);
       candidates.clear();
@@ -1885,6 +1886,7 @@ computeTDMMergeGroups(ModuleOp mod) {
   return result;
 }
 
+// Emit one fused TDM load for a merge group; store merging is not supported yet.
 void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
                             const LLVMTypeConverter *typeConverter,
                             ArrayRef<SmallVector<Value>> descPerMember,
