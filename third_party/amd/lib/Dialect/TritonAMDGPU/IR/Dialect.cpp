@@ -645,10 +645,10 @@ bool isAxisAlignedWarpHint(uint32_t hint, int64_t numWarps) {
   if (!llvm::isPowerOf2_32(K))
     return false;
 
-  // Anchor at i0 = lsb(hint) and OR the shifted warp indices: `support` is the
-  // bits that vary across the active set.  Legal iff popcount(support) ==
-  // log2(K) -- pigeonhole forces the K shifted indices to hit every subset of
-  // `support`, i.e. the active set is selectable by a single mask check.
+  // Legal iff the active warps form a regular axis-aligned bit pattern: after
+  // anchoring at i0 (the lowest active warp), the varying warp-id bits span
+  // exactly log2(K) positions, so the set is selectable by one mask test (see
+  // triton-lang/triton#10056).
   unsigned i0 = llvm::countr_zero(hint);
   uint32_t support = 0;
   for (uint32_t mask = hint; mask != 0; mask &= mask - 1) {

@@ -193,7 +193,7 @@ computeTDMMergeGroups(ModuleOp mod);
 // Emit one fused TDM intrinsic for a merge group. The site-local lowering
 // builds per-member descriptors and `select`s between them on an SGPR-uniform
 // per-wave selector. `auxBits` comes from any member (rule 7 makes it uniform);
-// no barrier (rule 2).
+// no mbarrier (rule 2).
 void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
                             const LLVMTypeConverter *typeConverter,
                             ArrayRef<Value> originalDescPerMember,

@@ -1546,11 +1546,13 @@ namespace {
 using TDMCopyGlobalToLocalOp =
     ::mlir::triton::amdgpu::AsyncTDMCopyGlobalToLocalOp;
 
+// i0: index of the lowest active warp in the hint (the coset anchor).
 uint32_t getWarpUsedHintI0(uint32_t hint) {
   assert(hint != 0 && "hint must be non-zero");
   return llvm::countr_zero(hint);
 }
 
+// support: the warp-id bits that vary across the hint's active warps.
 uint32_t getWarpUsedHintSupport(uint32_t hint) {
   uint32_t i0 = getWarpUsedHintI0(hint);
   uint32_t support = 0;
@@ -1561,6 +1563,8 @@ uint32_t getWarpUsedHintSupport(uint32_t hint) {
   return support;
 }
 
+// Warp-id bits pinned by the hint (those outside `support`); a wave is in the
+// hint iff (warpId ^ i0) has none of these set.
 uint32_t getWarpUsedHintFreeMask(uint32_t hint, int numWarps) {
   assert(llvm::isPowerOf2_32(numWarps) && "numWarps must be power-of-two");
   uint32_t warpIdMask = (uint32_t{1} << llvm::Log2_32(numWarps)) - 1;
@@ -1689,8 +1693,10 @@ void assignGeneratedMergeHintsGreedily(
 // move the destination views before the copies and attach generated
 // `warp_used_hint` masks so the existing merge analysis can consider them.
 //
-// This IR mutation is persisted (not analysis-local) and runs from two passes
-// -- UpdateAsyncWaitCount and the later LLVM conversion -- but is idempotent:
+// This IR mutation is persisted (not analysis-local) and runs from two separate
+// passes -- UpdateAsyncWaitCount (to count the post-merge physical intrinsics)
+// and the later LLVM conversion (to actually fuse).  They share no state, so
+// each regenerates the hints; this is safe because the stamping is idempotent:
 // `isGeneratedMergeHintCandidate` skips copies that already carry a hint, so
 // the second run is a no-op.  `computeTDMMergeGroups` assumes hints are already
 // materialized, so it must run after this.
@@ -1701,6 +1707,9 @@ void prepareGeneratedTDMMergeHintsImpl(ModuleOp mod) {
 
   for (Block *block : blocks) {
     unsigned numWarps = triton::gpu::lookupNumWarps(block->getParentOp());
+    // `run` accumulates a maximal sequence of adjacent hint-eligible copies (and
+    // their index views); `flush` then chunks that run into 4/3/2-sized groups
+    // (sized by numWarps) and stamps the generated hints.
     SmallVector<TDMCopyGlobalToLocalOp, 8> run;
     SmallVector<triton::gpu::MemDescIndexOp, 8> viewRun;
     auto flush = [&]() {
@@ -1981,12 +1990,9 @@ void emitTDMLoadStoreMerged(RewriterBase &rewriter, Location loc,
     memberActive[s] = buildTDMMergeMemberActivePredicate(
         rewriter, loc, hintPerMember[s], numWarps);
 
-  // Collapse the per-member descriptors into one via a select chain, evaluated
-  // per descriptor group operand.  Starting from member N-1 (the default) and
-  // folding downward yields nested selects equivalent to a priority match:
-  //   member0.active ? desc0 : (member1.active ? desc1 : ... : descN-1).
-  // The predicates are SGPR-uniform, so each select is a scalar pick with no
-  // cross-wave divergence cost.
+  // For each descriptor group operand, pick each wave's own member descriptor
+  // via a chain of selects (the last member is the default).  The predicates
+  // are SGPR-uniform, so the selects are scalar picks with no divergence cost.
   SmallVector<Value, 6> args(numGroups);
   for (size_t g = 0; g < numGroups; ++g) {
     Value acc = filledPerMember[N - 1][g];
