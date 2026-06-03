@@ -126,13 +126,14 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
 // standalone, make its hint overlap its neighbor's hint.
 //
 // `prepareGeneratedTDMMergeHints` is a narrower pre-pass: it mutates only the
-// canonical adjacent unhinted indexed-destination form into hinted merge
-// candidates.  It is not the full mergeability contract; it only creates hints
-// for one safe IR shape.  Then `computeTDMMergeGroups` builds a map from each
-// merging `async_tdm_copy_global_to_local` op to its group info (IR unchanged).
-// The conversion pattern dispatches on it: the first visited member emits a
-// fused intrinsic via `emitTDMLoadStoreMerged` and erases the whole group;
-// singletons fall back to `emitTDMLoadStore`.
+// canonical adjacent unhinted indexed-destination form with non-partitioned
+// destinations into hinted merge candidates.  It is not the full mergeability
+// contract; it only creates hints for one safe IR shape.  Then
+// `computeTDMMergeGroups` builds a map from each merging
+// `async_tdm_copy_global_to_local` op to its group info (IR unchanged).  The
+// conversion pattern dispatches on it: the first visited member emits a fused
+// intrinsic via `emitTDMLoadStoreMerged` and erases the whole group; singletons
+// fall back to `emitTDMLoadStore`.
 //
 // Mergeability rules (v1; all required):
 //   1. Every member has a verifier-legal `warp_used_hint`; unhinted copies end
@@ -173,7 +174,9 @@ struct TDMMergeMemberInfo {
 // the form
 //   memdesc_index A; async_tdm_copy A; memdesc_index B; async_tdm_copy B; ...
 // into hinted merge candidates by moving the destination memdesc_index ops
-// before the copy group and assigning disjoint warp_used_hint masks.
+// before the copy group and assigning disjoint warp_used_hint masks.  Partitioned
+// destinations are skipped because their extra hint legality rule is verified
+// before this pass runs.
 // No-op when the env var disables auto-merge.
 void prepareGeneratedTDMMergeHints(ModuleOp mod);
 

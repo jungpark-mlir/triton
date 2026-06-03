@@ -1591,11 +1591,15 @@ uint32_t getGeneratedMergeHint(unsigned groupIdx, unsigned groupSize,
   return hint;
 }
 
-// True if hint generation may stamp this copy: it has no hint yet and no
-// mbarrier.  The "no hint yet" half also makes generation idempotent -- a
-// re-run skips copies it already stamped.
+// True if hint generation may stamp this copy: it has no hint yet, no mbarrier,
+// and no partitioned destination.  Generated hints are stamped after the op
+// verifier runs, so skip partitioned layouts instead of revalidating their
+// extra K % numLogicalPieces constraint here.
 bool isGeneratedMergeHintCandidate(TDMCopyGlobalToLocalOp op) {
-  return !op.getWarpUsedHintAttr() && !op.getBarrier();
+  if (op.getWarpUsedHintAttr() || op.getBarrier())
+    return false;
+  return !isa<triton::gpu::PartitionedSharedEncodingAttr>(
+      op.getResult().getType().getEncoding());
 }
 
 // True if this copy may join a merge group.
@@ -1715,7 +1719,7 @@ void prepareGeneratedTDMMergeHintsImpl(ModuleOp mod) {
   }
 }
 
-// Pairwise checks other than hint disjointness: rank, destination, and cache.
+// Pairwise checks other than hint disjointness: rank and cache.
 bool canMergeWith(ArrayRef<Operation *> members,
                   TDMCopyGlobalToLocalOp candidate) {
   auto first = cast<TDMCopyGlobalToLocalOp>(members.front());
@@ -1725,10 +1729,6 @@ bool canMergeWith(ArrayRef<Operation *> members,
     return false;
   if (first.getCache() != candidate.getCache())
     return false;
-  for (Operation *member : members)
-    if (cast<TDMCopyGlobalToLocalOp>(member).getResult() ==
-        candidate.getResult())
-      return false;
   return true;
 }
 

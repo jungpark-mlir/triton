@@ -92,14 +92,16 @@ There are two separate capabilities:
      `warp_used_hint`s, TDM-to-LLVM can merge the copies even when they write to
      independent shared allocations, provided the allocation ops are outside the
      consecutive copy run.
-  2. **Automatic hint generation**: if the env var is set, the compiler can
-     synthesize hints only for the canonical indexed-destination shape:
+  2. **Automatic hint generation**: unless the disable env var is set, the
+     compiler can synthesize hints only for the canonical indexed-destination
+     shape with non-partitioned destinations:
 
          memdesc_index A; async_tdm_copy A;
          memdesc_index B; async_tdm_copy B; ...
 
      The auto pass does not synthesize hints for arbitrary independent
-     `allocate_shared_memory` destinations; provide hints explicitly for those.
+     `allocate_shared_memory` destinations or partitioned destinations; provide
+     hints explicitly for those.
 
 Mergeability rules (authoritative list in
 `TDMUtility.h::TDMMergeGroupInfo`):
@@ -114,10 +116,10 @@ Mergeability rules (authoritative list in
   4. Group size N is 2, 3, or 4.
   5. Members are strictly consecutive in the same block; any intervening op
      (TDM or not) ends the current run.
-  6. Members write to pairwise-distinct SSA destinations and have same-rank
-     descriptors that can be represented by a compatible hardware descriptor
-     group form for the fused intrinsic. Destination `MemDescType`s may
-     otherwise differ; shape/layout/type metadata is lowered per member.
+  6. Members have same-rank descriptors that can be represented by a compatible
+     hardware descriptor group form for the fused intrinsic. Destination
+     `MemDescType`s may differ; shape/layout/type metadata is lowered per
+     member.
   7. Members share the same `cache_modifier`.
 
 The analyser picks, from the head of the current run, the largest
