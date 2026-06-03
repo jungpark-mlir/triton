@@ -1331,6 +1331,8 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
       SmallVector<mlir::LLVM::AMD::TDMMergeMemberInfo> memberInfo;
       memberInfo.reserve(numMembers);
 
+      // Gather each member's descriptor, offsets, dst pointers, pred, and
+      // layout metadata for the fused emit.
       for (size_t i = 0; i < numMembers; ++i) {
         auto memberOp =
             cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(group.members[i]);
@@ -2725,8 +2727,9 @@ void populateLoadStoreOpToLLVMPatterns(
                AsyncTDMCopyLocalToGlobalOpConversion,
                AsyncTDMScatterOpConversion, AsyncTDMGatherOpConversion>(
       typeConverter, targetInfo, axisInfoAnalysis, benefit, uniformitySolver);
-  // AsyncTDMCopyGlobalToLocalOpConversion additionally consumes the TDM merge
-  // analysis side-table, so it is constructed separately from the shared batch.
+  // AsyncTDMCopyGlobalToLocalOpConversion additionally consumes the
+  // op-to-merge-group map built by computeTDMMergeGroups, so it is constructed
+  // separately from the shared batch.
   patterns.add<AsyncTDMCopyGlobalToLocalOpConversion>(
       typeConverter, targetInfo, axisInfoAnalysis, benefit, uniformitySolver,
       tdmMergeGroups);

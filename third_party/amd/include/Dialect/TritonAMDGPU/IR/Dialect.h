@@ -47,17 +47,6 @@ inline int getTensorDescNumDwords(triton::TensorDescType type) {
   auto shape = type.getShape();
   return (shape.size() > 2) ? (4 + 8 + 4 + 4) : (4 + 8);
 }
-
-/// Returns true iff `hint` is a legal `warp_used_hint`: an i32 bitmask whose
-/// active warps form a regular axis-aligned bit pattern (an axis-aligned coset
-/// of warp IDs).  Concretely: num_warps is a power of two below 32, the hint is
-/// non-zero with no bits beyond num_warps, K = popcount(hint) is a power of
-/// two, and the active warps span exactly log2(K) warpId bit positions.  See
-/// `AsyncTDMCopyGlobalToLocalOp` in TritonAMDGPUOps.td and
-/// triton-lang/triton#10056.  This is the op verifier's per-hint legality
-/// check; the TDM merge lowering relies on the same coset structure when it
-/// builds per-member warp predicates.
-bool isAxisAlignedWarpHint(uint32_t hint, int64_t numWarps);
 } // namespace mlir::triton::amdgpu
 
 // clang-format off

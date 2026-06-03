@@ -1552,7 +1552,9 @@ uint32_t getWarpUsedHintI0(uint32_t hint) {
   return llvm::countr_zero(hint);
 }
 
-// support: the warp-id bits that vary across the hint's active warps.
+// `support`: warp-id bit positions that vary within the hint's active warps,
+// measured relative to i0 (the lowest active warp).  ORs (w ^ i0) over every
+// active warp w, so each set bit marks a position that toggles across the set.
 uint32_t getWarpUsedHintSupport(uint32_t hint) {
   uint32_t i0 = getWarpUsedHintI0(hint);
   uint32_t support = 0;
@@ -1571,9 +1573,8 @@ uint32_t getWarpUsedHintFreeMask(uint32_t hint, int numWarps) {
   return warpIdMask & ~getWarpUsedHintSupport(hint);
 }
 
-// Hint mask for member `groupIdx` of a generated `groupSize`-way group: an
-// axis-aligned coset that partitions the `numWarps` warps evenly across the
-// group (3-way uses a dedicated half + quarter + quarter split).
+// Hint for member `groupIdx`, spreading a `groupSize`-way group evenly across
+// the numWarps warps.
 uint32_t getGeneratedMergeHint(unsigned groupIdx, unsigned groupSize,
                                unsigned numWarps) {
   if (groupSize == 3) {
@@ -1595,17 +1596,15 @@ uint32_t getGeneratedMergeHint(unsigned groupIdx, unsigned groupSize,
   return hint;
 }
 
-// A copy is eligible for *generated* hints only if it has no hint yet (and no
-// mbarrier).  The "no existing hint" clause is what makes hint generation
-// idempotent across its two pass invocations (see prepareGeneratedTDMMergeHints
-// Impl): a second run sees the already-stamped hint and skips the op.
+// True if hint generation may stamp this copy: it has no hint yet and no
+// mbarrier.  The "no hint yet" half also makes generation idempotent -- a
+// re-run skips copies it already stamped.
 bool isGeneratedMergeHintCandidate(TDMCopyGlobalToLocalOp op) {
   return !op.getWarpUsedHintAttr() && !op.getBarrier();
 }
 
-// A copy is eligible to enter a merge group once it carries a hint and no
-// mbarrier (the fused intrinsic can encode neither a missing hint nor a
-// barrier).  Complementary to isGeneratedMergeHintCandidate on the hint attr.
+// True if this copy may join a merge group: it already has a hint and no
+// mbarrier (the fused intrinsic can encode neither a missing hint nor one).
 bool isMergeableTDMShape(TDMCopyGlobalToLocalOp op) {
   return op.getWarpUsedHintAttr() && !op.getBarrier();
 }
@@ -1615,6 +1614,8 @@ size_t getTDMDescriptorRank(TDMCopyGlobalToLocalOp op) {
   return op.getDesc().getType().getShape().size();
 }
 
+// Materialise one generated group: move its views/copies adjacent and stamp
+// each copy with its share of the disjoint warp_used_hint split.
 void assignGeneratedMergeHints(MutableArrayRef<TDMCopyGlobalToLocalOp> group,
                                ArrayRef<triton::gpu::MemDescIndexOp> viewOps,
                                unsigned numWarps) {
@@ -1642,6 +1643,8 @@ void assignGeneratedMergeHints(MutableArrayRef<TDMCopyGlobalToLocalOp> group,
   }
 }
 
+// Chunk a run of adjacent candidates into the largest 4/3/2 groups that fit,
+// stamping each group's hints (no-op for >8 warps).
 void assignGeneratedMergeHintsGreedily(
     MutableArrayRef<TDMCopyGlobalToLocalOp> run,
     ArrayRef<triton::gpu::MemDescIndexOp> viewRun, unsigned numWarps) {
@@ -1652,27 +1655,14 @@ void assignGeneratedMergeHintsGreedily(
   if (numWarps > 8)
     return;
 
-  // How many warps a given group size needs.  3-way hints have a dedicated
-  // (4-or-8-warp) layout in getGeneratedMergeHint and are only used to consume
-  // an exact remainder of 3 (a leading 3 would be split as 2 + ...).
-  auto warpsAllow = [&](size_t size) {
-    switch (size) {
-    case 4:
-      return numWarps >= 4;
-    case 3:
-      return numWarps == 4 || numWarps == 8;
-    case 2:
-      return numWarps >= 2;
-    default:
-      return false;
-    }
-  };
-
+  // A group of `size` copies spreads across `size` warps, so it needs at least
+  // that many.  3-way only fills an exact remainder of 3 (a leading 3 would be
+  // split as 2 + ...).
   for (size_t i = 0; i < run.size();) {
     size_t remaining = run.size() - i;
     size_t chosen = 0;
     for (size_t size : {size_t{4}, size_t{3}, size_t{2}}) {
-      if (size > remaining || (size == 3 && remaining != 3) || !warpsAllow(size))
+      if (size > remaining || size > numWarps || (size == 3 && remaining != 3))
         continue;
       chosen = size;
       break;
