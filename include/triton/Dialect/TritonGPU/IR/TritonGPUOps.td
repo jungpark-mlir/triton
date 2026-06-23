@@ -356,14 +356,32 @@ def TTG_MemDescReinterpretOp : TTG_Op<"memdesc_reinterpret", [Pure, MemDescViewT
   let hasVerifier = 1;
 }
 
+def TTG_LocalAddressOp : TTG_Op<"local_address", [Pure]> {
+  let summary = "Compute local memory addresses for a distributed tensor load";
+
+  let description = [{
+    Compute the per-thread shared-memory addresses used to load a memory
+    descriptor into a distributed tensor layout. This operation does not read
+    shared memory; it exists so address calculation can be scheduled separately
+    from the local load instruction.
+  }];
+
+  let arguments = (ins TTG_MemDescType:$src);
+  let results = (outs TT_PtrTensor:$result);
+
+  let assemblyFormat = [{$src attr-dict `:` qualified(type($src)) `->` type($result)}];
+  let hasVerifier = 1;
+}
+
 def TTG_LocalLoadOp : TTG_Op<"local_load", [LocalLoadTrait]> {
   let summary = "Load a buffer from local memory into a distributed tensor";
 
   let description = [{
-    Load a tensor from the local memory descriptor into a distributed tensor.
+    Load a tensor from a local memory descriptor or from addresses produced by
+    `ttg.local_address` into a distributed tensor.
   }];
   let arguments = (ins
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+    Arg<AnyTypeOf<[TTG_MemDescType, TT_PtrTensor]>, "", [MemRead<SharedMemory>]>:$src,
     Optional<TTG_AsyncToken>:$token
   );
   let results = (outs TT_Tensor:$result);

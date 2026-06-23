@@ -699,6 +699,12 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                const TargetInfoBase &targetInfo,
                Operation *localLoadOp = nullptr);
 
+SmallVector<Value>
+lowerLocalAddresses(Location loc, MLIRContext *ctx, LinearLayout cvt,
+                    Type llvmElemTy, triton::gpu::MemDescType srcTy,
+                    SharedMemoryObject smemObj, RewriterBase &rewriter,
+                    const TargetInfoBase &targetInfo);
+
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter);
 

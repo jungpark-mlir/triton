@@ -708,6 +708,10 @@ void init_gluon_ir(py::module &&m) {
            [](GluonOpBuilder &self, Type resultTy, Value memDesc) -> Value {
              return self.create<ttg::LocalLoadOp>(resultTy, memDesc);
            })
+      .def("create_local_address",
+           [](GluonOpBuilder &self, Type resultTy, Value memDesc) -> Value {
+             return self.create<ttg::LocalAddressOp>(resultTy, memDesc);
+           })
       .def("create_local_gather",
            [](GluonOpBuilder &self, Type resultTy, Value memDesc, Value indices,
               int32_t axis) -> Value {

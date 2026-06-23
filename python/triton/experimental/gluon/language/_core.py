@@ -74,6 +74,7 @@ __all__ = [
     "float32",
     "float64",
     "distributed_type",
+    "local_address",
     "shared_memory_descriptor_type",
     "static_range",
     "tuple",
@@ -345,6 +346,20 @@ class shared_memory_descriptor(base_value):
         return _semantic.shared_load(self, layout)
 
     @builtin
+    def local_address(self, layout, _semantic: GluonSemantic = None) -> local_address:
+        """
+        Compute the per-thread shared-memory addresses for a later local load.
+
+        Args:
+            layout (DistributedLayout): The destination layout of the eventual loaded tensor.
+
+        Returns:
+            local_address: A schedulable address value that can be loaded with addr.load().
+        """
+        layout = _unwrap_if_constexpr(layout)
+        return _semantic.shared_address(self, layout)
+
+    @builtin
     def store(self, value, _semantic: GluonSemantic = None) -> None:
         """
         Store a tensor into shared memory.
@@ -529,6 +544,38 @@ class shared_memory_descriptor(base_value):
         Dummy use to keep the shared memory descriptor alive.
         """
         return _semantic.shared_dealloc(self)
+
+
+class local_address(base_value):
+    """
+    Represents precomputed per-thread shared-memory addresses for a local load.
+    """
+
+    def __init__(self, handle, element_ty, shape, layout):
+        self.handle = handle
+        self.element_ty = element_ty
+        self.type = distributed_type(pointer_type(element_ty, 3), shape, layout)
+
+    def _set_name(self, builder: ir.builder, name: str) -> None:
+        self.handle.set_loc(builder.create_name_loc(name, self.handle.get_loc()))
+
+    def _flatten_ir(self, handles: List[ir.value]) -> None:
+        handles.append(self.handle)
+
+    @property
+    def shape(self):
+        return self.type.shape
+
+    @property
+    def layout(self):
+        return self.type.layout
+
+    @builtin
+    def load(self, _semantic: GluonSemantic = None) -> tensor:
+        """
+        Load values from the precomputed shared-memory addresses.
+        """
+        return _semantic.local_load_from_address(self)
 
 
 @builtin

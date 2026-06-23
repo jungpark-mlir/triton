@@ -80,8 +80,9 @@ bool isUsedAsBarrier(Value v) {
 
 bool isUsedAsSharedMemory(Value v) {
   auto type = dyn_cast<ttg::MemDescType>(v.getType());
-  return type &&
-         isa_and_nonnull<ttg::SharedMemorySpaceAttr>(type.getMemorySpace());
+  if (type)
+    return isa_and_nonnull<ttg::SharedMemorySpaceAttr>(type.getMemorySpace());
+  return v.getDefiningOp<ttg::LocalAddressOp>() != nullptr;
 }
 
 bool isUsedAsTensorMemory(Value v) {
@@ -279,7 +280,7 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     }
   }
   // "Passthrough" ops that don't modify the buffer regions.
-  if (isa<ttg::MemDescTransOp, ttg::MemDescReshapeOp,
+  if (isa<ttg::LocalAddressOp, ttg::MemDescTransOp, ttg::MemDescReshapeOp,
           ttg::MemDescReinterpretOp>(op)) {
     // Just propagate the regions from the operand.
     RegionInfo in = operands[0]->getValue();

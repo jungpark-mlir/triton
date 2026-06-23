@@ -83,6 +83,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [2, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: local_address_load
+  tt.func @local_address_load() -> tensor<16x16xf16, #blocked> {
+    // GFX1250-NOT: llvm.amdgcn.ds.load.tr
+    // GFX1250: llvm.getelementptr
+    // GFX1250: llvm.load {{.*}} : !llvm.ptr<3> -> f16
+    %0 = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16x16xf16, #shared, #smem, mutable>
+    %1 = ttg.local_address %0 : !ttg.memdesc<16x16xf16, #shared, #smem, mutable> -> tensor<16x16x!tt.ptr<f16, 3>, #blocked>
+    %2 = ttg.local_load %1 : tensor<16x16x!tt.ptr<f16, 3>, #blocked> -> tensor<16x16xf16, #blocked>
+    tt.return %2 : tensor<16x16xf16, #blocked>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // GFX1250-LABEL: @bf16_mulf

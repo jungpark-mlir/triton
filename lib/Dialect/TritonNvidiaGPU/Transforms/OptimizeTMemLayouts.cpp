@@ -294,9 +294,11 @@ public:
       // 16x256b is optimized for 16bits load.
       if (localLoad.getType().getElementType().getIntOrFloatBitWidth() != 16)
         return failure();
+      auto smemType = dyn_cast<gpu::MemDescType>(localLoad.getSrc().getType());
+      if (!smemType)
+        return failure();
       LinearLayout regLayout = gpu::toLinearLayout(localLoad.getType());
-      LinearLayout smemLayout =
-          gpu::toLinearLayout(localLoad.getSrc().getType());
+      LinearLayout smemLayout = gpu::toLinearLayout(smemType);
       int vecDim =
           regLayout.invertAndCompose(smemLayout).getNumConsecutiveInOut();
       // If we find a 16bits load that cannot be vectorized use the alternative

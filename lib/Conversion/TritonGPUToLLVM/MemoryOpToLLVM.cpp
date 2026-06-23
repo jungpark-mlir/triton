@@ -161,6 +161,43 @@ struct LocalDeallocOpConversion
   }
 };
 
+struct LocalAddressOpConversion : public ConvertOpToLLVMPattern<LocalAddressOp> {
+public:
+  LocalAddressOpConversion(LLVMTypeConverter &typeConverter,
+                           const TargetInfoBase &targetInfo,
+                           PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {
+  }
+
+  LogicalResult
+  matchAndRewrite(LocalAddressOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = op.getContext();
+    auto memDescTy = cast<MemDescType>(op.getSrc().getType());
+    auto addrTy = cast<RankedTensorType>(op.getType());
+    auto typeConverter = getTypeConverter();
+
+    auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
+                                                         llvmElemTy, rewriter);
+
+    auto sharedLayout = isPaddedEncoding(memDescTy.getEncoding())
+                            ? paddedLinearLayout(memDescTy)
+                            : toLinearLayout(memDescTy);
+    auto cvt = invertAndComposeBlockLocal(sharedLayout, toLinearLayout(addrTy));
+
+    auto ptrs = lowerLocalAddresses(loc, ctx, cvt, llvmElemTy, memDescTy,
+                                    smemObj, rewriter, targetInfo);
+    Value result = packLLElements(loc, typeConverter, ptrs, rewriter, addrTy);
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+private:
+  const TargetInfoBase &targetInfo;
+};
+
 struct LocalLoadOpConversion : public ConvertOpToLLVMPattern<LocalLoadOp> {
 public:
   LocalLoadOpConversion(LLVMTypeConverter &typeConverter,
@@ -174,12 +211,29 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
-    auto memDescVal = op.getSrc();
+    auto srcVal = op.getSrc();
     auto regVal = op.getResult();
-    auto memDescTy = cast<MemDescType>(memDescVal.getType());
     auto regTy = cast<RankedTensorType>(regVal.getType());
     auto typeConverter = getTypeConverter();
 
+    if (isa<RankedTensorType>(srcVal.getType())) {
+      auto llvmElemTy = typeConverter->convertType(regTy.getElementType());
+      auto ptrs = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      SmallVector<Value> outVals;
+      outVals.reserve(ptrs.size());
+      for (Value ptr : ptrs) {
+        outVals.push_back(targetInfo.loadDShared(
+            rewriter, loc, ptr, /*ctaId=*/Value(), llvmElemTy,
+            /*pred=*/b.true_val(), op));
+      }
+      Value result = packLLElements(loc, typeConverter, outVals, rewriter,
+                                    regTy);
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
+    auto memDescTy = cast<MemDescType>(srcVal.getType());
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                          llvmElemTy, rewriter);
@@ -356,6 +410,7 @@ void mlir::triton::populateMemoryOpToLLVMPatterns(
                                                benefit);
   patterns.add<LocalAllocOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalDeallocOpConversion>(typeConverter, benefit);
+  patterns.add<LocalAddressOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalGatherOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalScatterOpConversion>(typeConverter, targetInfo, benefit);

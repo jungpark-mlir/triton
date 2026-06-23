@@ -268,6 +268,20 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         handle = self.builder.create_local_load(ret_ty.to_ir(self.builder), mem_desc.handle)
         return ttgl.tensor(handle, ret_ty)
 
+    def shared_address(self, mem_desc, layout):
+        _check(isinstance(layout, ttgl.DistributedLayout),
+               lambda: f"expected 'layout' to be a DistributedLayout but got {layout}")
+        addr_ty = ttgl.distributed_type(ttgl.pointer_type(mem_desc.dtype, 3), mem_desc.shape, layout)
+        handle = self.builder.create_local_address(addr_ty.to_ir(self.builder), mem_desc.handle)
+        return ttgl.local_address(handle, mem_desc.dtype, mem_desc.shape, layout)
+
+    def local_load_from_address(self, addr):
+        _check(isinstance(addr, ttgl.local_address),
+               lambda: f"expected 'addr' to be a local_address but got {type(addr)}")
+        ret_ty = ttgl.distributed_type(addr.element_ty, addr.shape, addr.layout)
+        handle = self.builder.create_local_load(ret_ty.to_ir(self.builder), addr.handle)
+        return ttgl.tensor(handle, ret_ty)
+
     def shared_store(self, mem_desc, value):
         _check(isinstance(value, ttgl.tensor), lambda: f"expected 'value' to be a tensor, but got a {type(value)}")
         _check(value.shape == mem_desc.shape,

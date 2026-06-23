@@ -1010,6 +1010,61 @@ lowerLocalLdSt(Location loc, MLIRContext *ctx,
                          rewriter, targetInfo, maybeMaxVecElems, localLoadOp);
 }
 
+SmallVector<Value> lowerLocalAddresses(Location loc, MLIRContext *ctx,
+                                       LinearLayout cvt, Type llvmElemTy,
+                                       triton::gpu::MemDescType srcTy,
+                                       SharedMemoryObject smemObj,
+                                       RewriterBase &rewriter,
+                                       const TargetInfoBase &targetInfo) {
+  auto removeBroadcastSrc = actionRemoveBroadcastedRegs(cvt);
+  if (!removeBroadcastSrc.isIdentity()) {
+    auto outVals = lowerLocalAddresses(loc, ctx, removeBroadcastSrc.apply(cvt),
+                                       llvmElemTy, srcTy, smemObj, rewriter,
+                                       targetInfo);
+    return broadcastAs(outVals, cvt);
+  }
+
+  auto affineOffset = smemObj.getShmemOffset(loc, rewriter, srcTy);
+  auto maskSpanAffineOffset = smemObj.getMaskSpanOffsets(srcTy);
+
+  std::optional<int> maybeMaxVecElems;
+  SmallVector<std::pair<unsigned, unsigned>> paddingShifts;
+  if (triton::gpu::isPaddedEncoding(srcTy.getEncoding())) {
+    maybeMaxVecElems = triton::gpu::getMinInterval(srcTy.getEncoding());
+    auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
+    paddingShifts = getPaddedSharedShifts(srcTy.getEncoding(), bitwidth,
+                                          /*offsetInBytes=*/true);
+  }
+
+  SmallVector<Value> smemBases(smemObj.getBases().begin(),
+                               smemObj.getBases().end());
+  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+  auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
+
+  auto emitAddrs = [&](RewriterBase &rewriter, Location loc,
+                       ArrayRef<Value> vals, Value shmemAddr, int idx,
+                       VectorType vecTy, Value ctaId) -> SmallVector<Value> {
+    assert(vals.empty());
+    if (ctaId) {
+      llvm::report_fatal_error(
+          "local_address does not support cross-CTA shared memory addresses");
+    }
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<Value> ptrs;
+    ptrs.reserve(vecTy.getNumElements());
+    for (int i = 0; i < vecTy.getNumElements(); ++i) {
+      Value byteOffset = b.i32_val(i * (bitwidth / 8));
+      ptrs.push_back(b.gep(shmemAddr.getType(), i8_ty, shmemAddr, byteOffset,
+                           LLVM::GEPNoWrapFlags::inbounds));
+    }
+    return ptrs;
+  };
+
+  return lowerLdSt(loc, ctx, cvt, {}, llvmElemTy, smemBases, paddingShifts,
+                   affineOffset, maskSpanAffineOffset, laneId, warpId, rewriter,
+                   targetInfo, maybeMaxVecElems, emitAddrs);
+}
+
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter) {
   assert(bool(llvmStruct) && "can not unpack null values");

@@ -44,7 +44,9 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     auto ctx = rewriter.getContext();
     auto loc = op.getLoc();
-    MemDescType srcTy = op.getSrc().getType();
+    auto srcTy = dyn_cast<MemDescType>(op.getSrc().getType());
+    if (!srcTy)
+      return failure();
     RankedTensorType dstTy = op.getType();
 
     auto typeConverter = this->getTypeConverter();

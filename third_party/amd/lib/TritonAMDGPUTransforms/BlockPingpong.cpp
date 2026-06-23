@@ -469,7 +469,9 @@ LogicalResult Pingponger::genLocalSlice(OpBuilder &builder, Value v,
   if (!localLoad)
     return failure();
   auto memDesc = localLoad.getSrc();
-  auto type = cast<ttg::MemDescType>(memDesc.getType());
+  auto type = dyn_cast<ttg::MemDescType>(memDesc.getType());
+  if (!type)
+    return failure();
   SmallVector<int64_t> shape = llvm::to_vector(type.getShape());
   Type elementType = type.getElementType();
   int64_t kIdx = opIdx == 0 ? 1 : 0;

@@ -75,6 +75,7 @@ from ._core import (
     reduce,
     reshape,
     distributed_type,
+    local_address,
     shared_memory_descriptor_type,
     set_auto_layout,
     split,

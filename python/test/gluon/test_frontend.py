@@ -186,6 +186,15 @@ def shared_memory_kernel(XBLOCK: ttgl.constexpr, YBLOCK: ttgl.constexpr, layout_
     unused._keep_alive()
 
 
+@gluon.jit
+def local_address_kernel(XBLOCK: ttgl.constexpr, YBLOCK: ttgl.constexpr, layout_a: ttgl.constexpr,
+                         layout_b: ttgl.constexpr, smem_layout: ttgl.constexpr):
+    a = ttgl.full([XBLOCK, YBLOCK], 0, ttgl.int32, layout_a)
+    mem = ttgl.allocate_shared_memory(ttgl.int32, a.shape, smem_layout, a)
+    addr = mem.local_address(layout_b)
+    b = addr.load()  # noqa: F841
+
+
 @pytest.mark.parametrize("target", ALL_TARGETS)
 def test_shared_memory(target):
     layout_a = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 32], warps_per_cta=[4, 1], order=[1, 0])
@@ -211,6 +220,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %2 = ttg.local_load %1 : !ttg.memdesc<8x32xi32, #shared, #smem, mutable> -> tensor<8x32xi32, #blocked1>
     ttg.local_store %cst, %1 : tensor<8x32xi32, #blocked> -> !ttg.memdesc<8x32xi32, #shared, #smem, mutable>
     ttg.local_dealloc %0 : !ttg.memdesc<8x32xi32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+""")
+
+
+def test_local_address_frontend():
+    layout_a = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 32], warps_per_cta=[4, 1], order=[1, 0])
+    layout_b = ttgl.BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[1, 32], warps_per_cta=[4, 1], order=[1, 0])
+    smem_layout = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=32, rank=2)
+    mod = run_parser(
+        local_address_kernel,
+        *make_args(8, 32, layout_a, layout_b, smem_layout, num_warps=layout_a.warps_per_cta[0]),
+        target=HIP_TARGET_GFX1250,
+    )
+    expecttest.assert_expected_inline(
+        anonymize_ir(mod.str_nodebug()), """\
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @local_address_kernel() attributes {noinline = false} {
+    %cst = arith.constant dense<0> : tensor<8x32xi32, #blocked>
+    %0 = ttg.local_alloc %cst : (tensor<8x32xi32, #blocked>) -> !ttg.memdesc<8x32xi32, #shared, #smem, mutable>
+    %1 = ttg.local_address %0 : !ttg.memdesc<8x32xi32, #shared, #smem, mutable> -> tensor<8x32x!tt.ptr<i32, 3>, #blocked1>
+    %2 = ttg.local_load %1 : tensor<8x32x!tt.ptr<i32, 3>, #blocked1> -> tensor<8x32xi32, #blocked1>
     tt.return
   }
 }

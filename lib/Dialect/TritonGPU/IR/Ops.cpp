@@ -342,6 +342,8 @@ struct CanonicalizeConvertFromConvert
 
     // cvt(local_load) -> local_load.
     if (auto sharedLoad = dyn_cast<LocalLoadOp>(arg)) {
+      if (!isa<MemDescType>(sharedLoad.getSrc().getType()))
+        return failure();
       // Shared_load can load to any layout so we can always fold convert into
       // it.
       // We insert at the point of the original op as there could be ops with
@@ -788,6 +790,47 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
   return success();
 }
 
+static LogicalResult verifyLocalAddressTypes(Operation *op,
+                                             MemDescType memdescTy,
+                                             RankedTensorType addrTy) {
+  auto ptrTy = dyn_cast<triton::PointerType>(addrTy.getElementType());
+  if (!ptrTy)
+    return op->emitOpError("result element type must be a pointer");
+  if (ptrTy.getPointeeType() != memdescTy.getElementType()) {
+    return op->emitOpError("result pointer pointee type ")
+           << ptrTy.getPointeeType()
+           << " must match source memdesc element type "
+           << memdescTy.getElementType();
+  }
+  if (addrTy.getShape() != memdescTy.getShape()) {
+    return op->emitOpError("result shape ")
+           << addrTy.getShape() << " must match source memdesc shape "
+           << memdescTy.getShape();
+  }
+  return success();
+}
+
+static LogicalResult verifyLocalLoadAddressTypes(Operation *op,
+                                                 RankedTensorType addrTy,
+                                                 RankedTensorType resultTy) {
+  auto ptrTy = dyn_cast<triton::PointerType>(addrTy.getElementType());
+  if (!ptrTy)
+    return op->emitOpError("source element type must be a pointer");
+  if (ptrTy.getPointeeType() != resultTy.getElementType()) {
+    return op->emitOpError("source pointer pointee type ")
+           << ptrTy.getPointeeType() << " must match result element type "
+           << resultTy.getElementType();
+  }
+  if (addrTy.getShape() != resultTy.getShape()) {
+    return op->emitOpError("source shape ")
+           << addrTy.getShape() << " must match result shape "
+           << resultTy.getShape();
+  }
+  if (addrTy.getEncoding() != resultTy.getEncoding())
+    return op->emitOpError("source layout must match result layout");
+  return success();
+}
+
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy) {
   if (dstTy.getShape() != dstTy.getAllocShape())
     return op->emitOpError("result shape and its alloc shape must match");
@@ -839,12 +882,25 @@ LogicalResult LocalStoreOp::verify() {
   return verifyMemoryOpTypes(*this, getSrc().getType(), getDst().getType());
 }
 
-// LocalLoadOp
-LogicalResult LocalLoadOp::verify() {
+// LocalAddressOp
+LogicalResult LocalAddressOp::verify() {
   if (failed(verifySharedMemoryRank(*this, getType(), getSrc().getType(),
                                     "result")))
     return failure();
-  return verifyMemoryOpTypes(*this, getSrc().getType(), getType());
+  return verifyLocalAddressTypes(*this, getSrc().getType(), getType());
+}
+
+// LocalLoadOp
+LogicalResult LocalLoadOp::verify() {
+  auto resultTy = getType();
+  Type srcTy = getSrc().getType();
+  if (auto memDescTy = dyn_cast<MemDescType>(srcTy)) {
+    if (failed(verifySharedMemoryRank(*this, resultTy, memDescTy, "result")))
+      return failure();
+    return verifyMemoryOpTypes(*this, memDescTy, resultTy);
+  }
+  return verifyLocalLoadAddressTypes(*this, cast<RankedTensorType>(srcTy),
+                                     resultTy);
 }
 
 // LocalGatherOp

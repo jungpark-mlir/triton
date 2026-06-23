@@ -25,7 +25,12 @@ bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
             [](auto op) { return op.getDest(); })
         .Case<triton::gpu::AsyncCopyGlobalToLocalOp>(
             [](auto op) { return op.getResult(); })
-        .Case<triton::gpu::LocalLoadOp>([](auto op) { return op.getSrc(); })
+        .Case<triton::gpu::LocalLoadOp>([](auto op) -> Value {
+          Value src = op.getSrc();
+          if (auto addr = src.getDefiningOp<triton::gpu::LocalAddressOp>())
+            return addr.getSrc();
+          return src;
+        })
         .Default([](Operation *) { return Value(); });
   };
 

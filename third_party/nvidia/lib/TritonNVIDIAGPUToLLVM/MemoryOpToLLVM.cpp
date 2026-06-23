@@ -140,7 +140,9 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     if (!op.getSrc())
       return failure();
-    MemDescType memDescType = op.getSrc().getType();
+    auto memDescType = dyn_cast<MemDescType>(op.getSrc().getType());
+    if (!memDescType)
+      return failure();
     RankedTensorType dstTy = op.getType();
     Type llvmElemTy = typeConverter->convertType(dstTy.getElementType());
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(

@@ -79,6 +79,15 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
   tt.func @memdesc_with_alloc_shape(%d : !ttg.memdesc<64x16xf16, #shared0, #smem, mutable, 2x64x16>){
     tt.return
   }
+
+  // CHECK-LABEL: local_address
+  tt.func @local_address(%d : !ttg.memdesc<64x16xf16, #shared0, #smem>) {
+    // CHECK: %[[ADDR:.*]] = ttg.local_address %{{.*}} : !ttg.memdesc<64x16xf16, #{{.+}}> -> tensor<64x16x!tt.ptr<f16, 3>, #{{.+}}>
+    // CHECK: ttg.local_load %[[ADDR]] : tensor<64x16x!tt.ptr<f16, 3>, #{{.+}}> -> tensor<64x16xf16, #{{.+}}>
+    %addr = ttg.local_address %d : !ttg.memdesc<64x16xf16, #shared0, #smem> -> tensor<64x16x!tt.ptr<f16, 3>, #blocked>
+    %val = ttg.local_load %addr : tensor<64x16x!tt.ptr<f16, 3>, #blocked> -> tensor<64x16xf16, #blocked>
+    tt.return
+  }
 }
 
 // -----
