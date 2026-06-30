@@ -336,8 +336,8 @@ tt.func @warp_local_padded(
 
 // -----
 
-// Hinted TDM predicates writer warps, but local_load has no reader-side hint.
-// Keep the barrier even when the unhinted warpsPerCTA would appear to match.
+// Hinted TDM predicates writer warps. local_load has no matching reader-side
+// predicate, so keep the barrier even if unhinted warpsPerCTA would match.
 #blocked_hint = #ttg.blocked<{sizePerThread = [8, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared_hint = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
 #smem_hint = #ttg.shared_memory
@@ -376,8 +376,8 @@ tt.func @warp_local_hinted_tdm_keeps_barrier(
 
 // -----
 
-// Partitioned shared TDM may use an encoding-aware warp distribution. Keep the
-// barrier until the filter uses the same mapping as lowering.
+// Partitioned shared TDM may use an encoding-aware writer distribution. Keep
+// the barrier until the filter uses the same mapping as lowering.
 #blocked_partitioned = #ttg.blocked<{sizePerThread = [8, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #inner_partitioned = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
 #shared_partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner_partitioned}>

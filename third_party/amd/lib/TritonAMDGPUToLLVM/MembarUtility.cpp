@@ -70,10 +70,9 @@ bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
 // Warp-local shared memory access — barrier suppression
 // ---------------------------------------------------------------------------
 //
-// When a shared memory layout guarantees that each warp accesses a disjoint
-// set of byte addresses, writes by one warp are invisible to every other warp.
-// In that case, a CTA-wide barrier (s_barrier) between a write and a
-// subsequent read is unnecessary — the access is warp-local.
+// When writer and reader use the same per-warp partition of shared memory, no
+// warp reads another warp's writes. In that case, a CTA-wide barrier
+// (s_barrier) between the write and the later read is unnecessary.
 //
 // This filter checks whether a (writer, reader) operation pair has warp-local
 // access patterns, and if so, tells the membar analysis to suppress the
@@ -116,22 +115,22 @@ static RankedTensorType getDistributedType(Operation *op) {
       .Default([](Operation *) { return RankedTensorType(); });
 }
 
-// Extract warpsPerCTA and tile element count from an op. For TDM ops, warps
-// come from tdmGetWarpDistribution on the tensor descriptor's block shape.
-// For register-side ops (local_load/store/alloc), warps come from the
+// Extract warpsPerCTA and tile element count from an op. The default TDM path
+// uses tdmGetWarpDistribution on the tensor descriptor's block shape; cases
+// where lowering uses a different writer mapping return unknown and keep the
+// barrier. For register-side ops (local_load/store/alloc), warps come from the
 // distributed encoding.
 static std::pair<SmallVector<unsigned>, int64_t> getWarpInfo(Operation *op) {
   if (auto tdm = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
-    // Hinted TDM writes only a subset of hardware warps. local_load has no
-    // matching reader-side predicate, so keep the barrier.
+    // Hinted TDM predicates writer warps. local_load has no matching
+    // reader-side predicate, so keep the barrier.
     if (tdm.getWarpUsedHintAttr())
       return {{}, 0};
 
     auto descTy = tdm.getDesc().getType();
     auto smemTy = tdm.getResult().getType();
-    // Partitioned shared TDM can use an encoding-aware warp distribution that
-    // differs from the default below. Keep this conservative until the filter
-    // uses the same mapping as lowering.
+    // Partitioned shared TDM may use an encoding-aware writer distribution.
+    // Keep the barrier until the filter uses the same mapping as lowering.
     if (isa<triton::gpu::PartitionedSharedEncodingAttr>(smemTy.getEncoding()))
       return {{}, 0};
 
