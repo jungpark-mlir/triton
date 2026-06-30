@@ -244,17 +244,27 @@ void initializeAllocation(ImplicitLocOpBuilder &b, Value alloc) {
       leaves.push_back(createSingleBufferView(b, alloc, buffer));
   }
 
+  bool isTensorMemory =
+      isa<ttng::TensorMemorySpaceAttr>(allocType.getMemorySpace());
+  ttg::AddrSpace barrierSpace =
+      isTensorMemory
+          ? (ttg::AddrSpace::TensorRead | ttg::AddrSpace::TensorWrite)
+          : ttg::AddrSpace::Local;
+  // Synchronize warps, so in case of re-used memory we won't start poisoning
+  // memory that is still being used, and finish poisoning before the kernel's
+  // first real use of the allocation.
+  ttg::BarrierOp::create(b, b.getLoc(), barrierSpace);
   for (Value leaf : leaves) {
-    Value poison =
-        createPoisonTensor(b, cast<ttg::MemDescType>(leaf.getType()));
-    if (isa<ttng::TensorMemorySpaceAttr>(
-            cast<ttg::MemDescType>(leaf.getType()).getMemorySpace())) {
+    auto leafType = cast<ttg::MemDescType>(leaf.getType());
+    Value poison = createPoisonTensor(b, leafType);
+    if (isTensorMemory) {
       Value pred = arith::ConstantIntOp::create(b, 1, 1);
       ttng::TMEMStoreOp::create(b, leaf, poison, pred);
     } else {
       ttg::LocalStoreOp::create(b, poison, leaf);
     }
   }
+  ttg::BarrierOp::create(b, b.getLoc(), barrierSpace);
 }
 
 bool canInitializeAllocation(Value alloc) {
@@ -434,8 +444,14 @@ private:
       ImplicitLocOpBuilder b(op->getLoc(), op);
       b.setInsertionPointAfter(op);
       Value alloc = op->getResult(0);
-      if (canInitializeAllocation(alloc))
+      if (canInitializeAllocation(alloc)) {
         initializeAllocation(b, alloc);
+        auto allocType = cast<ttg::MemDescType>(alloc.getType());
+        bool isShared =
+            isa<ttg::SharedMemorySpaceAttr>(allocType.getMemorySpace());
+        if (isShared && auxData.hasAsyncProxyFenceTracking)
+          ttng::FenceAsyncSharedOp::create(b, /*bCluster=*/false);
+      }
     }
   }
 
@@ -469,14 +485,21 @@ private:
 
       instrumentMemEffects(b, op, thread, funcBuilder);
       b.setLoc(op->getLoc());
+      if (auto info = hooks->getAsyncProxyFenceInfo(op)) {
+        funcBuilder.createFenceProxyAccessesCall(
+            b, baseThread, info->cluster, hooks->getIssuerCTAPred(b, op), op);
+      }
       if (auto wsOp = dyn_cast<ttg::WarpSpecializeOp>(op)) {
         funcBuilder.createSetActiveMaskCall(b, getActiveMask(wsOp), op);
         auto partitionRegions = wsOp.getNonEmptyPartitionRegions();
         if (!partitionRegions.empty()) {
           uint64_t destMask = 0;
+          uint64_t baseDestMask = 0;
           for (Region *region : partitionRegions)
             destMask |= getThreadPeersMask(region->getRegionNumber() + 1,
                                            auxData.threadLayout);
+          for (Region *region : partitionRegions)
+            baseDestMask |= 1ULL << (region->getRegionNumber() + 1);
           if (destMask) {
             for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
               funcBuilder.createCopyWriteVisibilityCall(b, thread, destMask,
@@ -485,6 +508,9 @@ private:
                                                        nullptr, memType, op);
             }
           }
+          if (baseDestMask)
+            funcBuilder.createCopyProxyAccessesCall(b, baseThread, baseDestMask,
+                                                    nullptr, op);
         }
       }
       if (auto info = hooks->getBarrierInitInfo(op)) {
@@ -506,6 +532,8 @@ private:
           funcBuilder.createClearBarrierReadTrackingCall(b, barrier, pred,
                                                          memType, op);
         }
+        funcBuilder.createClearBarrierProxyAccessTrackingCall(b, barrier, pred,
+                                                              op);
       }
       if (auto asyncCommitGroupOp = dyn_cast<ttg::AsyncCommitGroupOp>(op)) {
         if (!auxData.commits[CommitKind::AsyncCp].empty())
@@ -543,11 +571,27 @@ private:
         }
       }
       if (auto clusterBarrier = dyn_cast<ttng::ClusterBarrierOp>(op)) {
-        if (!clusterBarrier.getRelaxed()) {
+        if (!clusterBarrier.getRelaxed() &&
+            !llvm::is_contained(auxData.nonPublishingClusterBarriers, op)) {
           b.setInsertionPointAfter(op);
+          // Publish the cluster-wide frontier once, then keep every CTA at
+          // this synchronization point until the publication completes.
+          b.setListener(nullptr);
+          Value ctaId = tti::ExperimentalClusterCTAIdOp::create(b, b.getLoc());
+          Value zero = arith::ConstantIntOp::create(b, 0, 32);
+          Value isCTA0 =
+              arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaId, zero);
+          Value lock = auxData.lock.at(op).value;
+          tti::ExperimentalLockAcquireOp::create(b, lock, isCTA0);
           for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM})
-            funcBuilder.createPublishClusterVisibilityCall(b, nullptr, memType,
+            funcBuilder.createPublishClusterVisibilityCall(b, isCTA0, memType,
                                                            op);
+          funcBuilder.createPublishClusterProxyAccessesCall(b, isCTA0, op);
+          tti::ExperimentalLockReleaseOp::create(b, lock, isCTA0);
+          auto publishBarrier = ttng::ClusterBarrierOp::create(b, b.getLoc());
+          auxData.nonPublishingClusterBarriers.push_back(
+              publishBarrier.getOperation());
+          b.setListener(&listener);
         }
       }
 
@@ -602,6 +646,8 @@ private:
           wb, alloc, getThreadPeersMask(thread, auxData.threadLayout), pred,
           memType, op);
     }
+    funcBuilder.createTransferProxyAccessesCall(wb, alloc, baseThread, pred,
+                                                op);
     funcBuilder.createClearWaitingCall(wb, alloc, baseThread, pred, op);
     tti::ExperimentalLockReleaseOp::create(wb, lock, pred);
   }
@@ -623,6 +669,16 @@ private:
       MemType memType = MemType::TENSOR_MEM;
       if (isa<ttg::SharedEncodingTrait>(bufType.getEncoding())) {
         memType = MemType::SHARED_MEM;
+      }
+      if (memType == MemType::SHARED_MEM) {
+        if (effect.proxy == MemEffectsOpInfo::Effects::Proxy::Async) {
+          funcBuilder.createVerifyProxyAccessCall(
+              b, buf, effect.length, baseThread, effect.operandName, pred, op,
+              effectCTAs);
+        } else {
+          funcBuilder.createSetProxyAccessCall(
+              b, buf, effect.length, baseThread, pred, op, effectCTAs);
+        }
       }
       if (effect.rw == MemEffectsOpInfo::Effects::Read) {
         // For op that is reading, we only need to check if anything else
@@ -690,6 +746,8 @@ private:
           funcBuilder.createTrackVisibleReadsCall(
               b, barrier, thread, combinedPred, memType, op, recipientCTAs);
         }
+        funcBuilder.createTrackProxyAccessesCall(
+            b, barrier, baseThread, combinedPred, op, recipientCTAs);
       } else if (barrierInfo.trackingMode ==
                  MemEffectsOpInfo::BarrierTrackingMode::EffectWrites) {
         for (const auto &effect : opInfo->operandEffects) {

@@ -385,6 +385,42 @@ def test_tuple_assignment_respects_prior_constexpr_annotation():
     run_parser(kernel)
 
 
+def test_tuple_assignment_constexpr_tuple_matches_annassign():
+
+    @triton.jit
+    def kernel():
+        a: tl.constexpr
+        a, b = (0, 1), 2
+
+        assigned_a: tl.constexpr = (0, 1)
+        assigned_b = 2
+
+        tl.static_assert(a == assigned_a)
+        tl.static_assert(a.type == ((0, 1)).type)
+        tl.static_assert(assigned_a.type == ((0, 1)).type)
+        tl.static_assert(b.dtype == tl.int32)
+        tl.static_assert(assigned_b.dtype == tl.int32)
+
+    run_parser(kernel)
+
+
+def test_tuple_assignment_constexpr_tuple_normalizes_recursively():
+
+    @triton.jit
+    def kernel():
+        a: tl.constexpr
+        a, b = ((0, 1), (2, 3)), 4
+
+        assigned_a: tl.constexpr = ((0, 1), (2, 3))
+
+        tl.static_assert(a == assigned_a)
+        tl.static_assert(a.type == (((0, 1), (2, 3))).type)
+        tl.static_assert(assigned_a.type == (((0, 1), (2, 3))).type)
+        tl.static_assert(b.dtype == tl.int32)
+
+    run_parser(kernel)
+
+
 def test_named_expr_respects_prior_constexpr_annotation():
 
     @triton.jit
@@ -736,6 +772,45 @@ def test_atomic_scalar_masks():
     tl.atomic_xor(ptrs, 1, mask=True)
 
 
+@filecheck_test
+@triton.jit
+def test_atomic_poll():
+    # CHECK-LABEL: test_atomic_poll
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    # CHECK: %{{.*}} = tt.atomic_poll relaxed, sys, %{{.*}}, %{{.*}} : !tt.ptr<i32>, i32 -> i1
+    tl.atomic_poll(ptr, 1, sem="relaxed", scope="sys")
+
+
+@filecheck_test
+@triton.jit
+def test_atomic_poll_timeout():
+    # CHECK-LABEL: test_atomic_poll_timeout
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    # CHECK: %{{.*}} = tt.atomic_poll acquire, gpu, %{{.*}}, %{{.*}} timeout %{{.*}} : !tt.ptr<i32>, i32 -> i1
+    tl.atomic_poll(ptr, 1, timeout_ns=1000)
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_tensor_pointer():
+    ptrs = tl.full((1, ), 0, tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptrs, 1)
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_release_semantics():
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptr, 1, sem="release")
+
+
+@doesnt_compile
+@triton.jit
+def test_atomic_poll_rejects_negative_timeout():
+    ptr = tl.to_tensor(0).to(tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    tl.atomic_poll(ptr, 1, timeout_ns=-1)
+
+
 @pytest.mark.interpreter
 def test_return_promotion():
 
@@ -1072,3 +1147,15 @@ def test_aggregate_replace_ir():
     # Original aggregate still references original tensor.
     # CHECK: call @{{.*}}anchor{{.*}}([[A]])
     anchor(state.vals)
+
+
+def test_dot_fp16_accumulator():
+
+    @triton.jit
+    def fp16_acc_kernel():
+        c = tl.zeros([16, 16], dtype=tl.float16)
+        a = tl.full([16, 16], 1, dtype=tl.float16)
+        b = tl.full([16, 16], 1, dtype=tl.float16)
+        tl.dot(a, b, c)
+
+    run_parser(fp16_acc_kernel)

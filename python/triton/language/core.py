@@ -123,6 +123,18 @@ def is_builtin(fn) -> bool:
 
 @builtin
 def to_tensor(x, _semantic=None):
+    """
+    Converts a Python scalar into a 0-dimensional :code:`tensor`.
+
+    If :code:`x` is already a :code:`tensor` it is returned unchanged. The result
+    dtype is inferred from the value: a Python :code:`bool` becomes
+    :code:`tl.int1`, an :code:`int` becomes the smallest of :code:`tl.int32`,
+    :code:`tl.uint32`, :code:`tl.int64`, or :code:`tl.uint64` that can represent
+    it, and a :code:`float` becomes :code:`tl.float32` (or :code:`tl.float64` when
+    it is outside the :code:`float32` range).
+
+    :param x: any numeric value.
+    """
     return _semantic.to_tensor(x)
 
 
@@ -1189,6 +1201,9 @@ class tensor(base_value):
     def atomic_or(self, val, mask=None, sem=None, scope=None) -> tensor:
         ...
 
+    def atomic_poll(self, expected_value, sem="acquire", scope="gpu", timeout_ns=None) -> tensor:
+        ...
+
     def atomic_xor(self, val, mask=None, sem=None, scope=None) -> tensor:
         ...
 
@@ -1604,11 +1619,11 @@ def _resolve_aggregate_fields(cls):
             continue
         if not getattr(base, "__triton_aggregate__", False):
             raise TypeError(f"Aggregates can only inherit from other aggregates, but got non-aggregate base: {base}")
-        all_annotations.update(getattr(base, "__annotations__", {}))
+        all_annotations.update(inspect.get_annotations(base))
         all_defaults.update(getattr(base, "__aggregate_defaults__", {}))
 
     # Add cls's own fields, resolving string annotations via typing.get_type_hints.
-    own_names = cls.__dict__.get("__annotations__", {})
+    own_names = inspect.get_annotations(cls)
     hints = typing.get_type_hints(cls)
     for name in own_names:
         all_annotations[name] = hints[name]
@@ -2275,6 +2290,7 @@ def reshape(input, *shape, can_reorder=False, _semantic=None, _generator=None):
         reshape(x, 32, 32)
     """
     shape = _shape_check_impl(_unwrap_iterable(shape))
+    can_reorder = _unwrap_if_constexpr(can_reorder)
     if len(shape) == 0:
         return _unsplat(input, _semantic=_semantic, _generator=_generator)
     return _semantic.reshape(input, shape, can_reorder)
@@ -2350,7 +2366,7 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
 
 
 @builtin
-def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=float32,
+def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=None,
         _semantic=None):
     """
     Returns the matrix product of two blocks.
@@ -2751,6 +2767,42 @@ def atomic_cas(pointer, cmp, val, sem=None, scope=None, _semantic=None):
 
 @_tensor_member_fn
 @builtin
+def atomic_poll(pointer, expected_value, sem=None, scope=None, timeout_ns=None, _semantic=None):
+    """
+    Wait until the value at :code:`pointer` equals :code:`expected_value`.
+
+    This will spin-wait on the specified pointer until either the value equals
+    the expected value, or the operation times out. In the event of a timeout,
+    the operation returns false and no results may be acquired.
+
+    :param pointer: A pointer to a scalar 16-, 32-, or 64-bit integer.
+    :type pointer: triton.PointerDType
+    :param expected_value: The value that ends the polling loop.
+    :type expected_value: pointer.dtype.element_ty
+    :param sem: Specifies whether a successful poll has acquire semantics.
+        Acceptable values are "acquire" (default) and "relaxed".
+    :type sem: str, optional
+    :param scope: Defines the scope of threads that observe the synchronizing
+        effect of the poll. Acceptable values are "gpu" (default), "cta"
+        (cooperative thread array, thread block), and "sys" (system).
+    :type scope: str, optional
+    :param timeout_ns: Maximum wall time to poll, measured in nanoseconds by
+        the GPU global timer. If omitted, polling has no timeout. A timeout of
+        zero still performs one load.
+    :type timeout_ns: int, optional
+    :return: True if the expected value was observed, or False if the timeout
+        expired first.
+    :rtype: triton.language.tensor
+    """
+    expected_value = _semantic.to_tensor(expected_value)
+    sem = _unwrap_if_constexpr(sem)
+    scope = _unwrap_if_constexpr(scope)
+    timeout_ns = _unwrap_if_constexpr(timeout_ns)
+    return _semantic.atomic_poll(pointer, expected_value, sem, scope, timeout_ns)
+
+
+@_tensor_member_fn
+@builtin
 @_add_atomic_docstr("exchange")
 def atomic_xchg(pointer, val, mask=None, sem=None, scope=None, _semantic=None):
     val = _semantic.to_tensor(val)
@@ -2854,12 +2906,61 @@ def where(condition, x, y, _semantic=None):
     return _semantic.where(condition, x, y)
 
 
+@builtin
+def expect_zero(x, mask, _semantic=None):
+    """
+    Mark values that are expected to have underflowed to zero.
+
+    In regular compilation this preserves :code:`x`. Debug builds assert that
+    :code:`x` is zero wherever :code:`mask` is true. Under FPSAN this becomes
+    :code:`where(mask, 0, x)` so sanitized execution observes the intended
+    floating-point underflow.
+
+    :param x: values to preserve outside FPSAN mode.
+    :param mask: positions where :code:`x` is expected to be zero.
+    """
+    x = _unwrap_if_constexpr(x)
+    mask = _semantic.to_tensor(mask)
+    instrumentation_mode = getattr(_semantic.builder.options, "instrumentation_mode", "")
+    if "fpsan" in instrumentation_mode:
+        return _semantic.where(mask, 0, x)
+    if _semantic.builder.options.debug:
+        x_tensor = _semantic.to_tensor(x)
+        zero = _semantic.to_tensor(0)
+        cond = _semantic.or_(_semantic.equal(x_tensor, zero), _semantic.not_(mask))
+        _semantic.device_assert(cond, "expect_zero expected x == 0 where mask is true", None)
+    return x
+
+
 # -----------------------
 # Math
 # -----------------------
 
 
+def _add_binary_op_docstr(name: str, op: str) -> Callable[[T], T]:
+
+    def _decorator(func: T) -> T:
+        func.__doc__ = f"""
+    Computes the element-wise {name} of :code:`x` and :code:`y`.
+
+    This is the function form of the :code:`{op}` operator.
+
+    :param x: the first input tensor
+    :type x: Block
+    :param y: the second input tensor
+    :type y: Block
+    :param sanitize_overflow: insert an integer-overflow check when overflow
+        sanitization is enabled at compile time; set to :code:`False` to emit
+        plain wrapping arithmetic. Ignored for floating-point operands.
+    :type sanitize_overflow: bool
+    """
+        return func
+
+    return _decorator
+
+
 @builtin
+@_add_binary_op_docstr("sum", "+")
 def add(x, y, sanitize_overflow: constexpr = True, _semantic=None):
     x = _unwrap_if_constexpr(x)
     y = _unwrap_if_constexpr(y)
@@ -2867,6 +2968,7 @@ def add(x, y, sanitize_overflow: constexpr = True, _semantic=None):
 
 
 @builtin
+@_add_binary_op_docstr("difference", "-")
 def sub(x, y, sanitize_overflow: constexpr = True, _semantic=None):
     x = _unwrap_if_constexpr(x)
     y = _unwrap_if_constexpr(y)
@@ -2874,6 +2976,7 @@ def sub(x, y, sanitize_overflow: constexpr = True, _semantic=None):
 
 
 @builtin
+@_add_binary_op_docstr("product", "*")
 def mul(x, y, sanitize_overflow: constexpr = True, _semantic=None):
     x = _unwrap_if_constexpr(x)
     y = _unwrap_if_constexpr(y)
@@ -3224,7 +3327,7 @@ def map_elementwise(
         :return: one tensor or a tuple of tensors, depending on the mapped function.
     '''
     # Build the block for the nested region first to discover the return types
-    assert pack >= 1
+    assert pack >= 1, f"pack must be >= 1, got {pack}"
     in_scalar_tys = [t.type.scalar for t in args]
     builder = _semantic.builder
     block = builder.new_block()
@@ -3279,7 +3382,18 @@ def debug_barrier(_semantic=None):
 @builtin
 def multiple_of(input, values, _semantic=None):
     """
-    Let the compiler know that the values in :code:`input` are all multiples of :code:`value`.
+    Let the compiler know that ``values[d]`` is the largest power of two that
+    divides the first element of every contiguous group along dimension ``d``
+    of :code:`input` (see :func:`max_contiguous` for the definition of contiguous
+    group). ``values`` must have one entry per dimension of :code:`input`.
+
+    For a 1D input with contiguity 1, this is equivalent to saying that every
+    element of :code:`input` is a multiple of ``values[0]``. For example, if
+    :code:`values` is ``[16]`` and :code:`input` is ``[64, 80, 96, 112]``, the
+    hint is valid because 16 divides 64.
+
+    This hint enables alignment-dependent optimizations such as vectorized
+    memory accesses.
     """
     if isinstance(values, constexpr):
         values = [values]
@@ -3295,7 +3409,19 @@ def multiple_of(input, values, _semantic=None):
 @builtin
 def max_contiguous(input, values, _semantic=None):
     """
-    Let the compiler know that the `value` first values in :code:`input` are contiguous.
+    Let the compiler know that the elements of :code:`input` along dimension
+    ``d`` form contiguous groups of length ``values[d]``. ``values`` must have
+    one entry per dimension of :code:`input` and each entry must be a power of
+    two.
+
+    A 1D array of ``N`` elements with contiguity ``C`` is viewed as ``N/C``
+    runs of ``C`` integers each, where the integers in a run are
+    sequentially contiguous. For example, if :code:`values` is ``[4]``, the
+    array ``[0, 1, 2, 3, 8, 9, 10, 11]`` satisfies the hint because it
+    consists of two runs of 4 contiguous values.
+
+    Together with :func:`multiple_of`, this hint enables vectorized loads and
+    stores of contiguous, aligned regions.
     """
     if isinstance(values, constexpr):
         values = [values]
@@ -3311,10 +3437,14 @@ def max_contiguous(input, values, _semantic=None):
 @builtin
 def max_constancy(input, values, _semantic=None):
     """
-    Let the compiler know that the `value` first values in :code:`input` are constant.
+    Let the compiler know that the elements of :code:`input` along dimension
+    ``d`` form constant groups of length ``values[d]``. ``values`` must have
+    one entry per dimension of :code:`input` and each entry must be a power of
+    two.
 
-    e.g. if :code:`values` is [4], then each group of 4 values in :code:`input` should all be equal,
-    for example [0, 0, 0, 0, 1, 1, 1, 1].
+    A 1D array of ``N`` elements with constancy ``C`` is viewed as ``N/C``
+    runs of ``C`` identical values. For example, if :code:`values` is ``[4]``,
+    the array ``[0, 0, 0, 0, 1, 1, 1, 1]`` satisfies the hint.
     """
     if isinstance(values, constexpr):
         values = [values]
@@ -3406,6 +3536,7 @@ def device_print(prefix, *args, hex=False, _semantic=None):
     '''
     import string
     prefix = _unwrap_if_constexpr(prefix)
+    hex = _unwrap_if_constexpr(hex)
     assert isinstance(prefix, str), f"{prefix} is not string"
     b_ascii = True
     for ch in prefix:
@@ -3829,8 +3960,8 @@ def builtin_max(*args, propagate_nan=_NOTHING, _semantic=None):
     is_constexpr = all(not isinstance(x, base_value) for x in args)
     if is_constexpr:
         assert propagate_nan is _NOTHING, "propagate_nan is not supported on builtin max"
-        assert not any(math.isnan(x) for x in args)
-        assert not any(is_negative_zero(x) for x in args)
+        assert not any(math.isnan(x) for x in args), "constexpr max does not support NaN values"
+        assert not any(is_negative_zero(x) for x in args), "constexpr max does not support negative zero"
         return constexpr(builtins.max(_unwrap_if_constexpr(args)))
 
     if propagate_nan is _NOTHING:
@@ -3853,8 +3984,8 @@ def builtin_min(*args, propagate_nan=_NOTHING, _semantic=None):
     is_constexpr = all(not isinstance(x, base_value) for x in args)
     if is_constexpr:
         assert propagate_nan is _NOTHING, "propagate_nan is not supported on builtin min"
-        assert not any(math.isnan(x) for x in args)
-        assert not any(is_negative_zero(x) for x in args)
+        assert not any(math.isnan(x) for x in args), "constexpr min does not support NaN values"
+        assert not any(is_negative_zero(x) for x in args), "constexpr min does not support negative zero"
         return constexpr(builtins.min(_unwrap_if_constexpr(args)))
 
     if propagate_nan is _NOTHING:

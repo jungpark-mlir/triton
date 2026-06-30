@@ -34,8 +34,7 @@ test-cpp:
 
 .PHONY: test-unit
 test-unit: all
-	cd python/test/unit && $(PYTEST) -n $(NUM_PROCS) --ignore-glob='plugins/*' --ignore=test_debug.py
-	$(PYTEST) -n $(NUM_PROCS) python/test/unit/test_debug.py
+	cd python/test/unit && $(PYTEST) -n $(NUM_PROCS) --ignore-glob='plugins/*'
 	$(PYTEST) -n 6 python/triton_kernels/tests/
 	# Run attention separately to avoid out of gpu memory
 	$(PYTEST) python/tutorials/06-fused-attention.py
@@ -119,8 +118,7 @@ dev-install: dev-install-requires dev-install-triton
 .NOPARALLEL: dev-install-llvm
 dev-install-llvm:
 	LLVM_BUILD_PATH=$(LLVM_BUILD_PATH) scripts/build-llvm-project.sh
-	TRITON_BUILD_WITH_CLANG_LLD=1 TRITON_BUILD_WITH_CCACHE=0 \
-		LLVM_INCLUDE_DIRS=$(LLVM_BUILD_PATH)/include \
+	LLVM_INCLUDE_DIRS=$(LLVM_BUILD_PATH)/include \
 		LLVM_LIBRARY_DIR=$(LLVM_BUILD_PATH)/lib \
 		LLVM_SYSPATH=$(LLVM_BUILD_PATH) \
 	$(MAKE) dev-install

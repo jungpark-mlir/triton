@@ -156,6 +156,17 @@ void AtomicRMWOp::setPredicateOperand(Value pred) {
 
 Type AtomicRMWOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
 
+LogicalResult AtomicPollOp::verify() {
+  if (getSem() != MemSemantic::ACQUIRE && getSem() != MemSemantic::RELAXED)
+    return emitOpError("only supports acquire and relaxed semantics");
+
+  unsigned bitWidth = getExpected().getType().getIntOrFloatBitWidth();
+  if (bitWidth != 16 && bitWidth != 32 && bitWidth != 64)
+    return emitOpError(
+        "only supports integer elements with width {16, 32, 64}");
+  return success();
+}
+
 void StoreOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                           MLIRContext *context) {
   results.add<CanonicalizeMaskedStorePattern>(context);
@@ -281,13 +292,6 @@ LogicalResult DotOp::verify() {
   auto interface = cast<DialectInferLayoutInterface>(&dialect);
   return interface->verifyDotOpEncodingCompatibility(getOperation(), aEncoding,
                                                      bEncoding);
-}
-
-bool DotOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
 }
 
 //-- DotScaledOp --
@@ -663,14 +667,17 @@ llvm::SmallVector<Type> ReduceOp::getElementTypes() {
   if (!reduceOp || reduceOp->getNumOperands() != 2 ||
       reduceOp->getNumResults() != 1)
     return nullptr;
-  if (reduceOp->getOperand(0) != block->getArgument(0) ||
-      reduceOp->getOperand(1) != block->getArgument(1))
+  Value arg0 = block->getArgument(0), arg1 = block->getArgument(1);
+  Value lhs = reduceOp->getOperand(0), rhs = reduceOp->getOperand(1);
+  // For commutative combiners, the reversed argument-operand mapping is
+  // equivalent.
+  bool reversedMapping = (lhs == arg1 && rhs == arg0) &&
+                         reduceOp->hasTrait<OpTrait::IsCommutative>();
+  if (!(lhs == arg0 && rhs == arg1) && !reversedMapping)
     return nullptr;
 
   return reduceOp;
 }
-
-unsigned ReduceOp::getNumOperands() { return this->getOperands().size(); }
 
 //-- ScanOp --
 void ScanOp::build(OpBuilder &builder, OperationState &state,
@@ -704,8 +711,6 @@ llvm::SmallVector<RankedTensorType> ScanOp::getInputTypes() {
 llvm::SmallVector<Type> ScanOp::getElementTypes() {
   return getElementTypesImpl(this->getOperands());
 }
-
-unsigned ScanOp::getNumOperands() { return this->getOperands().size(); }
 
 //-- MapElementwiseOp
 LogicalResult MapElementwiseOp::verify() {
