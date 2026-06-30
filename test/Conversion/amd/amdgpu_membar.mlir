@@ -310,7 +310,8 @@ tt.func @warp_local_padded(
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable>
 
   %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
-  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<64x64xf16, #shared_wl> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+  %copy_desc0 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %pred {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_wl>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %copy_desc0 into %slot0_w : !tt.tensordesc<64x64xf16, #shared_wl> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
 
   // async_tdm_wait has MemWaitOpTrait — membar always inserts barrier here.
   %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
@@ -321,7 +322,8 @@ tt.func @warp_local_padded(
   // analysis, membar would insert a barrier. But each warp touches disjoint
   // rows, so no cross-warp synchronization is needed.
   %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
-  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<64x64xf16, #shared_wl> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
+  %copy_desc2 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %pred {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_wl>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %copy_desc2 into %slot0_w : !tt.tensordesc<64x64xf16, #shared_wl> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
 
   %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_wl, #smem_wl, mutable> -> !ttg.memdesc<64x64xf16, #shared_wl, #smem_wl, mutable>
   // CHECK: amdg.async_tdm_copy_global_to_local
@@ -354,14 +356,16 @@ tt.func @warp_local_hinted_tdm_keeps_barrier(
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_hint, #smem_hint, mutable>
 
   %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_hint, #smem_hint, mutable> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
-  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<64x64xf16, #shared_hint> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
+  %copy_desc0 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %pred {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_hint>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %copy_desc0 into %slot0_w : !tt.tensordesc<64x64xf16, #shared_hint> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
 
   %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
   // CHECK: amdg.async_tdm_wait
   // CHECK-NEXT: ttg.barrier local
 
   %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_hint, #smem_hint, mutable> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
-  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred {warp_used_hint = 1 : i32} : !tt.tensordesc<64x64xf16, #shared_hint> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
+  %copy_desc2 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %pred {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_hint>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %copy_desc2 into %slot0_w {warp_used_hint = 1 : i32} : !tt.tensordesc<64x64xf16, #shared_hint> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
 
   %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_hint, #smem_hint, mutable> -> !ttg.memdesc<64x64xf16, #shared_hint, #smem_hint, mutable>
   // CHECK: amdg.async_tdm_copy_global_to_local
@@ -395,14 +399,16 @@ tt.func @warp_local_partitioned_keeps_barrier(
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
 
   %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_partitioned, #smem_partitioned, mutable> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
-  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<64x64xf16, #shared_partitioned> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
+  %copy_desc0 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %pred {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_partitioned>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %copy_desc0 into %slot0_w : !tt.tensordesc<64x64xf16, #shared_partitioned> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
 
   %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
   // CHECK: amdg.async_tdm_wait
   // CHECK-NEXT: ttg.barrier local
 
   %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_partitioned, #smem_partitioned, mutable> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
-  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<64x64xf16, #shared_partitioned> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
+  %copy_desc2 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %pred {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_partitioned>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %copy_desc2 into %slot0_w : !tt.tensordesc<64x64xf16, #shared_partitioned> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
 
   %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_partitioned, #smem_partitioned, mutable> -> !ttg.memdesc<64x64xf16, #shared_partitioned, #smem_partitioned, mutable>
   // CHECK: amdg.async_tdm_copy_global_to_local
@@ -439,14 +445,16 @@ tt.func @warp_local_mismatched_warps(
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
 
   %slot0_w = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
-  %tdm0 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot0_w, pred = %pred : !tt.tensordesc<64x64xf16, #shared_mismatch> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+  %copy_desc0 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %pred {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_mismatch>
+  %tdm0 = amdg.async_tdm_copy_global_to_local %copy_desc0 into %slot0_w : !tt.tensordesc<64x64xf16, #shared_mismatch> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
 
   %wait = amdg.async_tdm_wait %tdm0 {num = 0 : i32}
   // CHECK: amdg.async_tdm_wait
   // CHECK-NEXT: ttg.barrier local
 
   %slot2 = ttg.memdesc_index %alloc[%c2] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
-  %tdm2 = amdg.async_tdm_copy_global_to_local %desc[%c0, %c0] into %slot2, pred = %pred : !tt.tensordesc<64x64xf16, #shared_mismatch> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
+  %copy_desc2 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %pred {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_mismatch>
+  %tdm2 = amdg.async_tdm_copy_global_to_local %copy_desc2 into %slot0_w : !tt.tensordesc<64x64xf16, #shared_mismatch> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
 
   %slot0_r = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<3x64x64xf16, #shared_mismatch, #smem_mismatch, mutable> -> !ttg.memdesc<64x64xf16, #shared_mismatch, #smem_mismatch, mutable>
   // CHECK: amdg.async_tdm_copy_global_to_local

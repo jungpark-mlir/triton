@@ -70,13 +70,15 @@ bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
 // Warp-local shared memory access — barrier suppression
 // ---------------------------------------------------------------------------
 //
-// When writer and reader use the same per-warp partition of shared memory, no
-// warp reads another warp's writes. In that case, a CTA-wide barrier
-// (s_barrier) between the write and the later read is unnecessary.
+// Membar inserts CTA barriers to protect cross-warp shared-memory
+// dependencies. The backend preserves same-warp memory ordering. Therefore, if
+// two accesses use the same per-warp partition of shared memory, any RAW, WAR,
+// or WAW conflict is intra-warp and does not need a CTA-wide barrier
+// (s_barrier).
 //
-// This filter checks whether a (writer, reader) operation pair has warp-local
-// access patterns, and if so, tells the membar analysis to suppress the
-// barrier it would otherwise insert.
+// This filter checks whether an operation pair has warp-local access patterns,
+// and if so, tells the membar analysis to suppress the barrier it would
+// otherwise insert.
 //
 // The check compares the warpsPerCTA distribution on both sides: if both the
 // write and read distribute warps identically across tensor dimensions, each
@@ -181,7 +183,9 @@ static bool hasMatchingWarpDistribution(Operation *op1, Operation *op2) {
 }
 
 // Returns true if the barrier between op1 and op2 can be suppressed because
-// their shared memory accesses are warp-local.
+// their shared memory accesses are warp-local. This applies to RAW, WAR, and
+// WAW dependencies because matching per-warp partitions make each conflict
+// intra-warp.
 bool filterWarpLocalAccesses(Operation *op1, Operation *op2) {
   if (!isa<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op1) &&
       !isa<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op2))
@@ -194,6 +198,9 @@ bool filterWarpLocalAccesses(Operation *op1, Operation *op2) {
 
 bool membarFilter(Operation *op1, Operation *op2, bool /*op1IsRead*/,
                   bool /*op2IsRead*/, Allocation *allocation) {
+  // The warp-local filter intentionally does not distinguish RAW, WAR, and WAW:
+  // once both accesses use the same per-warp partition, membar's cross-warp
+  // ordering requirement is gone.
   return (filterAsyncLocalLoadsDependencies(op1, op2, allocation) ||
           filterLDSMemoryBarriersDependencies(op1, op2) ||
           filterWarpLocalAccesses(op1, op2));
