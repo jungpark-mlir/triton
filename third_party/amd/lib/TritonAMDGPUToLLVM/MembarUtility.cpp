@@ -121,7 +121,9 @@ static RankedTensorType getDistributedType(Operation *op) {
 // uses tdmGetWarpDistribution on the tensor descriptor's block shape; cases
 // where lowering uses a different writer mapping return unknown and keep the
 // barrier. For register-side ops (local_load/store/alloc), warps come from the
-// distributed encoding.
+// distributed encoding. Dot-operand layouts can broadcast/rearrange MMA operand
+// data in ways that are not captured by warpsPerCTA alone, so keep the barrier
+// for those consumers.
 static std::pair<SmallVector<unsigned>, int64_t> getWarpInfo(Operation *op) {
   if (auto tdm = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
     // Hinted TDM predicates writer warps. local_load has no matching
@@ -147,6 +149,8 @@ static std::pair<SmallVector<unsigned>, int64_t> getWarpInfo(Operation *op) {
   }
   auto regTy = getDistributedType(op);
   if (!regTy)
+    return {{}, 0};
+  if (isa<triton::gpu::DotOperandEncodingAttr>(regTy.getEncoding()))
     return {{}, 0};
   return {triton::gpu::getWarpsPerCTA(regTy), product(regTy.getShape())};
 }
