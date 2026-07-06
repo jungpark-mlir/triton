@@ -15,10 +15,10 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
                                                SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr,
                                                BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
                                                GROUP_SIZE_M: gl.constexpr, NUM_BUFFERS: gl.constexpr,
-                                               NUM_WARPS: gl.constexpr):
+                                               NUM_WARPS: gl.constexpr, USE_SCALES: gl.constexpr):
     DIV_FACTOR_A: gl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: gl.constexpr = 2 if DTYPE_B == "e2m1" else 1
-    NUM_LOADS_IN_BATCH: gl.constexpr = 4
+    NUM_LOADS_IN_BATCH: gl.constexpr = 4 if USE_SCALES else 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // SCALE_BLOCK
     BLOCK_K_PACKED_A: gl.constexpr = BLOCK_K // DIV_FACTOR_A
     BLOCK_K_PACKED_B: gl.constexpr = BLOCK_K // DIV_FACTOR_B
@@ -77,14 +77,15 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
                                         strides=(stride_bn, stride_bk), block_shape=(BLOCK_N, BLOCK_K_PACKED_B),
                                         layout=shared_layout_b)
 
-    a_scale_desc = tdm.make_tensor_descriptor(
-        base=a_scale + a_scale_offs, shape=(M, K // SCALE_BLOCK), strides=(stride_scale, 1),
-        block_shape=(BLOCK_M, BLOCK_K_SCALE),
-        layout=shared_layout_a_scale)
-    b_scale_desc = tdm.make_tensor_descriptor(
-        base=b_scale + b_scale_offs, shape=(N, K // SCALE_BLOCK), strides=(stride_scale, 1),
-        block_shape=(BLOCK_N, BLOCK_K_SCALE),
-        layout=shared_layout_b_scale)
+    if USE_SCALES:
+        a_scale_desc = tdm.make_tensor_descriptor(
+            base=a_scale + a_scale_offs, shape=(M, K // SCALE_BLOCK), strides=(stride_scale, 1),
+            block_shape=(BLOCK_M, BLOCK_K_SCALE),
+            layout=shared_layout_a_scale)
+        b_scale_desc = tdm.make_tensor_descriptor(
+            base=b_scale + b_scale_offs, shape=(N, K // SCALE_BLOCK), strides=(stride_scale, 1),
+            block_shape=(BLOCK_N, BLOCK_K_SCALE),
+            layout=shared_layout_b_scale)
 
     offs_cm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, acc_layout))
     offs_cn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, acc_layout))
@@ -93,10 +94,11 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
 
     a_buffer = gl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
     b_buffer = gl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
-    a_scale_buffer = gl.allocate_shared_memory(a_scale_desc.dtype, shape=[NUM_BUFFERS] + a_scale_desc.block_shape,
-                                               layout=a_scale_desc.layout)
-    b_scale_buffer = gl.allocate_shared_memory(b_scale_desc.dtype, shape=[NUM_BUFFERS] + b_scale_desc.block_shape,
-                                               layout=b_scale_desc.layout)
+    if USE_SCALES:
+        a_scale_buffer = gl.allocate_shared_memory(a_scale_desc.dtype, shape=[NUM_BUFFERS] + a_scale_desc.block_shape,
+                                                   layout=a_scale_desc.layout)
+        b_scale_buffer = gl.allocate_shared_memory(b_scale_desc.dtype, shape=[NUM_BUFFERS] + b_scale_desc.block_shape,
+                                                   layout=b_scale_desc.layout)
 
     load_idx = 0
     wmma_idx = 0
@@ -104,10 +106,11 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
     # Standalone copy of MXFPGEMMPipelinedProgram.warp_pipeline, with the issue_* helper bodies inlined.
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = load_idx % NUM_BUFFERS
-        tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
-        a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-        tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
-        b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
+        if USE_SCALES:
+            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
+            a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
+            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
+            b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
         tdm.async_load(a_desc, [0, 0], a_buffer.index(slot))
         a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
         tdm.async_load(b_desc, [0, 0], b_buffer.index(slot))
@@ -123,18 +126,20 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
         with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
             a = a_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=dot_layout_a)
             b = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).load(layout=dot_layout_b)
-            a_scale_buffer_slice = a_scale_buffer.index(wmma_idx % NUM_BUFFERS)
-            b_scale_buffer_slice = b_scale_buffer.index(wmma_idx % NUM_BUFFERS)
-            scale_a = a_scale_buffer_slice.load(layout=layout_a_scale)
-            scale_b = b_scale_buffer_slice.load(layout=layout_b_scale)
+            if USE_SCALES:
+                a_scale_buffer_slice = a_scale_buffer.index(wmma_idx % NUM_BUFFERS)
+                b_scale_buffer_slice = b_scale_buffer.index(wmma_idx % NUM_BUFFERS)
+                scale_a = a_scale_buffer_slice.load(layout=layout_a_scale)
+                scale_b = b_scale_buffer_slice.load(layout=layout_b_scale)
 
             wmma_idx += 1
             phase = wmma_idx + NUM_BUFFERS - 2
             slot = phase % NUM_BUFFERS
-            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
-            a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
-            b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
+            if USE_SCALES:
+                tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
+                a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
+                tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
+                b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
             tdm.async_load(a_desc, [0, 0], a_buffer.index(slot))
             a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
             tdm.async_load(b_desc, [0, 0], b_buffer.index(slot))
@@ -144,19 +149,26 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
         tdm.async_wait(0)
         with gl.amd.warp_pipeline_stage("wmma", priority=0):
             load_idx = load_idx + 1
-            accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+            if USE_SCALES:
+                accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+            else:
+                accumulator = gl.amd.gfx1250.wmma_scaled(a, None, DTYPE_A, b, None, DTYPE_B, accumulator)
 
     for i in gl.static_range(NUM_BUFFERS - 1):
         #tdm.async_wait((NUM_BUFFERS - 1 - i) * NUM_LOADS_IN_BATCH)
         tdm.async_wait(0)
         a = a_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=dot_layout_a)
         b = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).load(layout=dot_layout_b)
-        a_scale_buffer_slice = a_scale_buffer.index(wmma_idx % NUM_BUFFERS)
-        b_scale_buffer_slice = b_scale_buffer.index(wmma_idx % NUM_BUFFERS)
-        scale_a = a_scale_buffer_slice.load(layout=layout_a_scale)
-        scale_b = b_scale_buffer_slice.load(layout=layout_b_scale)
+        if USE_SCALES:
+            a_scale_buffer_slice = a_scale_buffer.index(wmma_idx % NUM_BUFFERS)
+            b_scale_buffer_slice = b_scale_buffer.index(wmma_idx % NUM_BUFFERS)
+            scale_a = a_scale_buffer_slice.load(layout=layout_a_scale)
+            scale_b = b_scale_buffer_slice.load(layout=layout_b_scale)
         wmma_idx += 1
-        accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+        if USE_SCALES:
+            accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+        else:
+            accumulator = gl.amd.gfx1250.wmma_scaled(a, None, DTYPE_A, b, None, DTYPE_B, accumulator)
 
     gl.amd.gfx1250.buffer_store(accumulator, c_ptr, c_offs, mask=c_mask)
     tdm.async_wait(0)
@@ -169,10 +181,10 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
                                                   SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr,
                                                   BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
                                                   GROUP_SIZE_M: gl.constexpr, NUM_BUFFERS: gl.constexpr,
-                                                  NUM_WARPS: gl.constexpr):
+                                                  NUM_WARPS: gl.constexpr, USE_SCALES: gl.constexpr):
     DIV_FACTOR_A: gl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: gl.constexpr = 2 if DTYPE_B == "e2m1" else 1
-    NUM_LOADS_IN_BATCH: gl.constexpr = 4
+    NUM_LOADS_IN_BATCH: gl.constexpr = 4 if USE_SCALES else 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // SCALE_BLOCK
     BLOCK_K_PACKED_A: gl.constexpr = BLOCK_K // DIV_FACTOR_A
     BLOCK_K_PACKED_B: gl.constexpr = BLOCK_K // DIV_FACTOR_B
@@ -231,14 +243,15 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
                                         strides=(stride_bn, stride_bk), block_shape=(BLOCK_N, BLOCK_K_PACKED_B),
                                         layout=shared_layout_b)
 
-    a_scale_desc = tdm.make_tensor_descriptor(
-        base=a_scale + a_scale_offs, shape=(M, K // SCALE_BLOCK), strides=(stride_scale, 1),
-        block_shape=(BLOCK_M, BLOCK_K_SCALE),
-        layout=shared_layout_a_scale)
-    b_scale_desc = tdm.make_tensor_descriptor(
-        base=b_scale + b_scale_offs, shape=(N, K // SCALE_BLOCK), strides=(stride_scale, 1),
-        block_shape=(BLOCK_N, BLOCK_K_SCALE),
-        layout=shared_layout_b_scale)
+    if USE_SCALES:
+        a_scale_desc = tdm.make_tensor_descriptor(
+            base=a_scale + a_scale_offs, shape=(M, K // SCALE_BLOCK), strides=(stride_scale, 1),
+            block_shape=(BLOCK_M, BLOCK_K_SCALE),
+            layout=shared_layout_a_scale)
+        b_scale_desc = tdm.make_tensor_descriptor(
+            base=b_scale + b_scale_offs, shape=(N, K // SCALE_BLOCK), strides=(stride_scale, 1),
+            block_shape=(BLOCK_N, BLOCK_K_SCALE),
+            layout=shared_layout_b_scale)
 
     offs_cm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, acc_layout))
     offs_cn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, acc_layout))
@@ -247,20 +260,22 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
 
     a_buffer = gl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
     b_buffer = gl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
-    a_scale_buffer = gl.allocate_shared_memory(a_scale_desc.dtype, shape=[NUM_BUFFERS] + a_scale_desc.block_shape,
-                                               layout=a_scale_desc.layout)
-    b_scale_buffer = gl.allocate_shared_memory(b_scale_desc.dtype, shape=[NUM_BUFFERS] + b_scale_desc.block_shape,
-                                               layout=b_scale_desc.layout)
+    if USE_SCALES:
+        a_scale_buffer = gl.allocate_shared_memory(a_scale_desc.dtype, shape=[NUM_BUFFERS] + a_scale_desc.block_shape,
+                                                   layout=a_scale_desc.layout)
+        b_scale_buffer = gl.allocate_shared_memory(b_scale_desc.dtype, shape=[NUM_BUFFERS] + b_scale_desc.block_shape,
+                                                   layout=b_scale_desc.layout)
 
     load_idx = 0
     wmma_idx = 0
 
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = load_idx % NUM_BUFFERS
-        tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
-        a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-        tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
-        b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
+        if USE_SCALES:
+            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
+            a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
+            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
+            b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
         tdm.async_load(a_desc, [0, 0], a_buffer.index(slot))
         a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
         tdm.async_load(b_desc, [0, 0], b_buffer.index(slot))
@@ -273,22 +288,25 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
     gl.static_assert(LOOP_UB >= 0)
     a_addr = a_buffer.index(wmma_idx % NUM_BUFFERS).local_address(dot_layout_a)
     b_addr = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).local_address(dot_layout_b)
-    scale_a_addr = a_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_a_scale)
-    scale_b_addr = b_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_b_scale)
+    if USE_SCALES:
+        scale_a_addr = a_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_a_scale)
+        scale_b_addr = b_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_b_scale)
 
     for _ in gl.static_range(LOOP_UB):
         with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
             a = a_addr.load()
             b = b_addr.load()
-            scale_a = scale_a_addr.load()
-            scale_b = scale_b_addr.load()
+            if USE_SCALES:
+                scale_a = scale_a_addr.load()
+                scale_b = scale_b_addr.load()
             wmma_idx += 1
             phase = wmma_idx + NUM_BUFFERS - 2
             slot = phase % NUM_BUFFERS
-            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
-            a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
-            b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
+            if USE_SCALES:
+                tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
+                a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
+                tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
+                b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
             tdm.async_load(a_desc, [0, 0], a_buffer.index(slot))
             a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
             tdm.async_load(b_desc, [0, 0], b_buffer.index(slot))
@@ -297,25 +315,34 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
         tdm.async_wait(0)
         with gl.amd.warp_pipeline_stage("wmma", priority=0):
             load_idx = load_idx + 1
-            accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+            if USE_SCALES:
+                accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+            else:
+                accumulator = gl.amd.gfx1250.wmma_scaled(a, None, DTYPE_A, b, None, DTYPE_B, accumulator)
             a_addr = a_buffer.index(wmma_idx % NUM_BUFFERS).local_address(dot_layout_a)
             b_addr = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).local_address(dot_layout_b)
-            scale_a_addr = a_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_a_scale)
-            scale_b_addr = b_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_b_scale)
+            if USE_SCALES:
+                scale_a_addr = a_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_a_scale)
+                scale_b_addr = b_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_b_scale)
 
     for i in gl.static_range(NUM_BUFFERS - 1):
         tdm.async_wait(0)
         a = a_addr.load()
         b = b_addr.load()
-        scale_a = scale_a_addr.load()
-        scale_b = scale_b_addr.load()
+        if USE_SCALES:
+            scale_a = scale_a_addr.load()
+            scale_b = scale_b_addr.load()
         wmma_idx += 1
-        accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+        if USE_SCALES:
+            accumulator = gl.amd.gfx1250.wmma_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+        else:
+            accumulator = gl.amd.gfx1250.wmma_scaled(a, None, DTYPE_A, b, None, DTYPE_B, accumulator)
         if i != NUM_BUFFERS - 2:
             a_addr = a_buffer.index(wmma_idx % NUM_BUFFERS).local_address(dot_layout_a)
             b_addr = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).local_address(dot_layout_b)
-            scale_a_addr = a_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_a_scale)
-            scale_b_addr = b_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_b_scale)
+            if USE_SCALES:
+                scale_a_addr = a_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_a_scale)
+                scale_b_addr = b_scale_buffer.index(wmma_idx % NUM_BUFFERS).local_address(layout_b_scale)
 
     gl.amd.gfx1250.buffer_store(accumulator, c_ptr, c_offs, mask=c_mask)
     tdm.async_wait(0)
@@ -329,24 +356,33 @@ def test_runtime_mxgemm_tdm_warp_pipeline_standalone(USE_LOCAL_ADDRESS):
 
 def run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512, N=512, K=512, BLOCK_M=128, BLOCK_N=128,
                                             BLOCK_K=128, SCALE_BLOCK=32, GROUP_SIZE_M=8, NUM_BUFFERS=3, NUM_WARPS=8,
-                                            DTYPE_A="float8_e4m3", DTYPE_B="float8_e5m2", seed=0):
+                                            DTYPE_A="float8_e4m3", DTYPE_B="float8_e5m2", seed=0, use_scales=True):
     torch.manual_seed(seed)
     torch_dtype = {"float8_e5m2": torch.float8_e5m2, "float8_e4m3": torch.float8_e4m3fn}
 
     a = torch.randint(20, 40, (M, K), dtype=torch.uint8).view(torch_dtype[DTYPE_A])
     b = torch.randint(20, 40, (K, N), dtype=torch.uint8).view(torch_dtype[DTYPE_B])
-    a_scale = MXScaleTensor(size=(M, (K + SCALE_BLOCK - 1) // SCALE_BLOCK)).random(low=1.0, high=32.0)
-    b_scale = MXScaleTensor(size=(N, (K + SCALE_BLOCK - 1) // SCALE_BLOCK)).random(low=1.0, high=32.0)
+    if use_scales:
+        a_scale = MXScaleTensor(size=(M, (K + SCALE_BLOCK - 1) // SCALE_BLOCK)).random(low=1.0, high=32.0)
+        b_scale = MXScaleTensor(size=(N, (K + SCALE_BLOCK - 1) // SCALE_BLOCK)).random(low=1.0, high=32.0)
 
-    a_scale_f32 = a_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1)[:M, :K]
-    b_scale_f32 = b_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1).T.contiguous()[:K, :N]
-    c_ref = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float32)
+        a_scale_f32 = a_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1)[:M, :K]
+        b_scale_f32 = b_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1).T.contiguous()[:K, :N]
+        c_ref = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float32)
+    else:
+        a_scale = None
+        b_scale = None
+        c_ref = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float32)
 
     c_d = torch.zeros(M, N, dtype=torch.float32).cuda()
     a_d = a.contiguous().cuda()
     b_d = b.T.contiguous().cuda()
-    a_scale_d = a_scale.data.cuda()
-    b_scale_d = b_scale.data.cuda()
+    if use_scales:
+        a_scale_d = a_scale.data.cuda()
+        b_scale_d = b_scale.data.cuda()
+    else:
+        a_scale_d = torch.empty(1, dtype=torch.uint8, device="cuda")
+        b_scale_d = torch.empty(1, dtype=torch.uint8, device="cuda")
 
     stride_am, stride_ak = a_d.stride(0), a_d.stride(1)
     stride_bk, stride_bn = b_d.stride(1), b_d.stride(0)
@@ -359,17 +395,17 @@ def run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512, N=51
         mxgemm_tdm_warp_pipeline_local_address_kernel[grid](
             a_d, b_d, c_d, a_scale_d, b_scale_d, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
             stride_cn, stride_scale, dtype_converter[DTYPE_A], dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N,
-            BLOCK_K, GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, num_warps=NUM_WARPS, num_ctas=1,
+            BLOCK_K, GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, use_scales, num_warps=NUM_WARPS, num_ctas=1,
             waves_per_eu=NUM_WARPS // 4)
     else:
         mxgemm_tdm_warp_pipeline_standalone_kernel[grid](
             a_d, b_d, c_d, a_scale_d, b_scale_d, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
             stride_cn, stride_scale, dtype_converter[DTYPE_A], dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N,
-            BLOCK_K, GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, num_warps=NUM_WARPS, num_ctas=1,
+            BLOCK_K, GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, use_scales, num_warps=NUM_WARPS, num_ctas=1,
             waves_per_eu=NUM_WARPS // 4)
 
     torch.testing.assert_close(c_d.cpu(), c_ref.cpu(), rtol=1e-5, atol=1e-8)
-    print(f"Pass use_local_address={use_local_address}")
+    print(f"Pass use_local_address={use_local_address} use_scales={use_scales}")
 
 
 if __name__ == "__main__":
@@ -378,6 +414,7 @@ if __name__ == "__main__":
     supported_dtypes = ("float8_e4m3", "float8_e5m2")
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-local-address", action="store_true", help="Precompute LDS addresses before local_load.")
+    parser.add_argument("--no-scales", action="store_true", help="Skip MX scale copies, loads, and scaled operands.")
     parser.add_argument("-M", type=int, default=512)
     parser.add_argument("-N", type=int, default=512)
     parser.add_argument("-K", type=int, default=512)
@@ -397,5 +434,6 @@ if __name__ == "__main__":
                                             BLOCK_M=args.block_m, BLOCK_N=args.block_n, BLOCK_K=args.block_k,
                                             SCALE_BLOCK=args.scale_block, GROUP_SIZE_M=args.group_size_m,
                                             NUM_BUFFERS=args.num_buffers, NUM_WARPS=args.num_warps,
-                                            DTYPE_A=args.dtype_a, DTYPE_B=args.dtype_b, seed=args.seed)
+                                            DTYPE_A=args.dtype_a, DTYPE_B=args.dtype_b, seed=args.seed,
+                                            use_scales=not args.no_scales)
 
