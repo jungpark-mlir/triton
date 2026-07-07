@@ -1,4 +1,4 @@
-import pytest
+import time
 import torch
 import triton
 from triton._internal_testing import is_hip_gfx1250
@@ -6,6 +6,33 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from triton.experimental.gluon.language.amd.gfx1250 import tdm
 from triton.tools.mxfp import MXScaleTensor
+
+try:
+    import pytest
+except ModuleNotFoundError:
+
+    class _PytestMarkStub:
+
+        @staticmethod
+        def parametrize(*_args, **_kwargs):
+
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+        @staticmethod
+        def skipif(*_args, **_kwargs):
+
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+    class _PytestStub:
+        mark = _PytestMarkStub()
+
+    pytest = _PytestStub()
 
 
 @gluon.jit
@@ -15,7 +42,8 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
                                                SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr,
                                                BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
                                                GROUP_SIZE_M: gl.constexpr, NUM_BUFFERS: gl.constexpr,
-                                               NUM_WARPS: gl.constexpr, USE_SCALES: gl.constexpr):
+                                               NUM_WARPS: gl.constexpr, USE_SCALES: gl.constexpr,
+                                               TDM_WARP_USED_HINT: gl.constexpr):
     DIV_FACTOR_A: gl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: gl.constexpr = 2 if DTYPE_B == "e2m1" else 1
     NUM_LOADS_IN_BATCH: gl.constexpr = 4 if USE_SCALES else 2
@@ -107,13 +135,13 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = load_idx % NUM_BUFFERS
         if USE_SCALES:
-            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
+            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
             a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
+            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
             b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-        tdm.async_load(a_desc, [0, 0], a_buffer.index(slot))
+        tdm.async_load(a_desc, [0, 0], a_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
         a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
-        tdm.async_load(b_desc, [0, 0], b_buffer.index(slot))
+        tdm.async_load(b_desc, [0, 0], b_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
         b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K_PACKED_B])
         load_idx = load_idx + 1
 
@@ -136,13 +164,13 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
             phase = wmma_idx + NUM_BUFFERS - 2
             slot = phase % NUM_BUFFERS
             if USE_SCALES:
-                tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
+                tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
                 a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-                tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
+                tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
                 b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(a_desc, [0, 0], a_buffer.index(slot))
+            tdm.async_load(a_desc, [0, 0], a_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
             a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
-            tdm.async_load(b_desc, [0, 0], b_buffer.index(slot))
+            tdm.async_load(b_desc, [0, 0], b_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
             b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K_PACKED_B])
 
         #tdm.async_wait((NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH)
@@ -181,7 +209,8 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
                                                   SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr,
                                                   BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
                                                   GROUP_SIZE_M: gl.constexpr, NUM_BUFFERS: gl.constexpr,
-                                                  NUM_WARPS: gl.constexpr, USE_SCALES: gl.constexpr):
+                                                  NUM_WARPS: gl.constexpr, USE_SCALES: gl.constexpr,
+                                                  TDM_WARP_USED_HINT: gl.constexpr):
     DIV_FACTOR_A: gl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: gl.constexpr = 2 if DTYPE_B == "e2m1" else 1
     NUM_LOADS_IN_BATCH: gl.constexpr = 4 if USE_SCALES else 2
@@ -272,13 +301,13 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = load_idx % NUM_BUFFERS
         if USE_SCALES:
-            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
+            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
             a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
+            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
             b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-        tdm.async_load(a_desc, [0, 0], a_buffer.index(slot))
+        tdm.async_load(a_desc, [0, 0], a_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
         a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
-        tdm.async_load(b_desc, [0, 0], b_buffer.index(slot))
+        tdm.async_load(b_desc, [0, 0], b_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
         b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K_PACKED_B])
         load_idx = load_idx + 1
 
@@ -303,13 +332,13 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
             phase = wmma_idx + NUM_BUFFERS - 2
             slot = phase % NUM_BUFFERS
             if USE_SCALES:
-                tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot))
+                tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
                 a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-                tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot))
+                tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
                 b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(a_desc, [0, 0], a_buffer.index(slot))
+            tdm.async_load(a_desc, [0, 0], a_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
             a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
-            tdm.async_load(b_desc, [0, 0], b_buffer.index(slot))
+            tdm.async_load(b_desc, [0, 0], b_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
             b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K_PACKED_B])
 
         tdm.async_wait(0)
@@ -354,25 +383,34 @@ def test_runtime_mxgemm_tdm_warp_pipeline_standalone(USE_LOCAL_ADDRESS):
     run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=USE_LOCAL_ADDRESS)
 
 
-def run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512, N=512, K=512, BLOCK_M=128, BLOCK_N=128,
-                                            BLOCK_K=128, SCALE_BLOCK=32, GROUP_SIZE_M=8, NUM_BUFFERS=3, NUM_WARPS=8,
-                                            DTYPE_A="float8_e4m3", DTYPE_B="float8_e5m2", seed=0, use_scales=True):
-    torch.manual_seed(seed)
+def _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, use_kernel_c):
+    if use_kernel_c and NUM_BUFFERS < 3:
+        raise ValueError("kernelC requires NUM_BUFFERS >= 3")
+    if use_kernel_c and NUM_WARPS != 8:
+        raise ValueError("kernelC requires NUM_WARPS == 8 for its 4-warp TDM hint")
+    if triton.cdiv(K, BLOCK_K) < NUM_BUFFERS:
+        raise ValueError("K/BLOCK_K must be at least NUM_BUFFERS")
+
+
+def _make_mxgemm_inputs(M, N, K, SCALE_BLOCK, DTYPE_A, DTYPE_B, use_scales=True, make_reference=True):
     torch_dtype = {"float8_e5m2": torch.float8_e5m2, "float8_e4m3": torch.float8_e4m3fn}
 
     a = torch.randint(20, 40, (M, K), dtype=torch.uint8).view(torch_dtype[DTYPE_A])
     b = torch.randint(20, 40, (K, N), dtype=torch.uint8).view(torch_dtype[DTYPE_B])
+    c_ref = None
     if use_scales:
         a_scale = MXScaleTensor(size=(M, (K + SCALE_BLOCK - 1) // SCALE_BLOCK)).random(low=1.0, high=32.0)
         b_scale = MXScaleTensor(size=(N, (K + SCALE_BLOCK - 1) // SCALE_BLOCK)).random(low=1.0, high=32.0)
 
-        a_scale_f32 = a_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1)[:M, :K]
-        b_scale_f32 = b_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1).T.contiguous()[:K, :N]
-        c_ref = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float32)
+        if make_reference:
+            a_scale_f32 = a_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1)[:M, :K]
+            b_scale_f32 = b_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1).T.contiguous()[:K, :N]
+            c_ref = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32).to(torch.float32)
     else:
         a_scale = None
         b_scale = None
-        c_ref = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float32)
+        if make_reference:
+            c_ref = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float32)
 
     c_d = torch.zeros(M, N, dtype=torch.float32).cuda()
     a_d = a.contiguous().cuda()
@@ -384,6 +422,16 @@ def run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512, N=51
         a_scale_d = torch.empty(1, dtype=torch.uint8, device="cuda")
         b_scale_d = torch.empty(1, dtype=torch.uint8, device="cuda")
 
+    return a_d, b_d, c_d, a_scale_d, b_scale_d, c_ref
+
+
+def _launch_mxgemm_tdm_warp_pipeline_standalone(a_d, b_d, c_d, a_scale_d, b_scale_d, use_local_address=False, M=512,
+                                                N=512, K=512, BLOCK_M=128, BLOCK_N=128, BLOCK_K=128,
+                                                SCALE_BLOCK=32, GROUP_SIZE_M=8, NUM_BUFFERS=3, NUM_WARPS=8,
+                                                DTYPE_A="float8_e4m3", DTYPE_B="float8_e5m2", use_scales=True,
+                                                use_kernel_c=False):
+    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, use_kernel_c)
+
     stride_am, stride_ak = a_d.stride(0), a_d.stride(1)
     stride_bk, stride_bn = b_d.stride(1), b_d.stride(0)
     stride_cm, stride_cn = c_d.stride(0), c_d.stride(1)
@@ -391,21 +439,116 @@ def run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512, N=51
 
     grid = [triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1, 1]
     dtype_converter = {"float8_e5m2": "e5m2", "float8_e4m3": "e4m3"}
+    tdm_warp_used_hint = 0b00001111 if use_kernel_c else (1 << NUM_WARPS) - 1
     if use_local_address:
-        mxgemm_tdm_warp_pipeline_local_address_kernel[grid](
+        return mxgemm_tdm_warp_pipeline_local_address_kernel[grid](
             a_d, b_d, c_d, a_scale_d, b_scale_d, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
             stride_cn, stride_scale, dtype_converter[DTYPE_A], dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N,
-            BLOCK_K, GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, use_scales, num_warps=NUM_WARPS, num_ctas=1,
-            waves_per_eu=NUM_WARPS // 4)
-    else:
-        mxgemm_tdm_warp_pipeline_standalone_kernel[grid](
-            a_d, b_d, c_d, a_scale_d, b_scale_d, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
-            stride_cn, stride_scale, dtype_converter[DTYPE_A], dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N,
-            BLOCK_K, GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, use_scales, num_warps=NUM_WARPS, num_ctas=1,
-            waves_per_eu=NUM_WARPS // 4)
+            BLOCK_K, GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, use_scales, tdm_warp_used_hint, num_warps=NUM_WARPS,
+            num_ctas=1, waves_per_eu=NUM_WARPS // 4)
+    return mxgemm_tdm_warp_pipeline_standalone_kernel[grid](
+        a_d, b_d, c_d, a_scale_d, b_scale_d, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        stride_scale, dtype_converter[DTYPE_A], dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
+        GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, use_scales, tdm_warp_used_hint, num_warps=NUM_WARPS, num_ctas=1,
+        waves_per_eu=NUM_WARPS // 4)
+
+
+def run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512, N=512, K=512, BLOCK_M=128, BLOCK_N=128,
+                                            BLOCK_K=128, SCALE_BLOCK=32, GROUP_SIZE_M=8, NUM_BUFFERS=3, NUM_WARPS=8,
+                                            DTYPE_A="float8_e4m3", DTYPE_B="float8_e5m2", seed=0, use_scales=True,
+                                            use_kernel_c=False):
+    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, use_kernel_c)
+    torch.manual_seed(seed)
+    a_d, b_d, c_d, a_scale_d, b_scale_d, c_ref = _make_mxgemm_inputs(M, N, K, SCALE_BLOCK, DTYPE_A, DTYPE_B,
+                                                                      use_scales=use_scales)
+    _launch_mxgemm_tdm_warp_pipeline_standalone(
+        a_d, b_d, c_d, a_scale_d, b_scale_d, use_local_address=use_local_address, M=M, N=N, K=K, BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SCALE_BLOCK=SCALE_BLOCK, GROUP_SIZE_M=GROUP_SIZE_M, NUM_BUFFERS=NUM_BUFFERS,
+        NUM_WARPS=NUM_WARPS, DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, use_scales=use_scales, use_kernel_c=use_kernel_c)
 
     torch.testing.assert_close(c_d.cpu(), c_ref.cpu(), rtol=1e-5, atol=1e-8)
-    print(f"Pass use_local_address={use_local_address} use_scales={use_scales}")
+    kernel_mode = "kernelC" if use_kernel_c else "default"
+    print(f"Pass mode={kernel_mode} use_local_address={use_local_address} use_scales={use_scales}")
+
+
+def _event_probe(fn, iters):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+
+def _capture_graph(fn, n_per_graph):
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            fn()
+        side.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):
+            for _ in range(n_per_graph):
+                fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    return graph
+
+
+def benchmark_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512, N=512, K=512, BLOCK_M=128,
+                                                  BLOCK_N=128, BLOCK_K=128, SCALE_BLOCK=32, GROUP_SIZE_M=8,
+                                                  NUM_BUFFERS=3, NUM_WARPS=8, DTYPE_A="float8_e4m3",
+                                                  DTYPE_B="float8_e5m2", seed=0, use_scales=True,
+                                                  use_kernel_c=False, warmup=10, probe_iters=20,
+                                                  graph_ms=100.0, n_replays=20, iters_per_graph=None):
+    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, use_kernel_c)
+    torch.manual_seed(seed)
+    a_d, b_d, c_d, a_scale_d, b_scale_d, _ = _make_mxgemm_inputs(
+        M, N, K, SCALE_BLOCK, DTYPE_A, DTYPE_B, use_scales=use_scales, make_reference=False)
+
+    def launch():
+        return _launch_mxgemm_tdm_warp_pipeline_standalone(
+            a_d, b_d, c_d, a_scale_d, b_scale_d, use_local_address=use_local_address, M=M, N=N, K=K, BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SCALE_BLOCK=SCALE_BLOCK, GROUP_SIZE_M=GROUP_SIZE_M,
+            NUM_BUFFERS=NUM_BUFFERS, NUM_WARPS=NUM_WARPS, DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, use_scales=use_scales,
+            use_kernel_c=use_kernel_c)
+
+    for _ in range(warmup):
+        launch()
+    torch.cuda.synchronize()
+
+    probe_ms = _event_probe(launch, probe_iters)
+    if iters_per_graph is None:
+        n_per_graph = max(1, int(graph_ms / max(probe_ms, 1e-6)))
+    else:
+        n_per_graph = iters_per_graph
+    if n_per_graph <= 0:
+        raise ValueError("--iters-per-graph must be positive")
+
+    graph = _capture_graph(launch, n_per_graph)
+    total_iters = n_replays * n_per_graph
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n_replays):
+        graph.replay()
+    torch.cuda.synchronize()
+    elapsed_s = time.perf_counter() - t0
+
+    per_iter_s = elapsed_s / total_iters
+    flops = 2 * M * N * K
+    tflops = flops / per_iter_s / 1e12
+
+    print(f"probe per-iter   : {probe_ms * 1e3:.2f} us")
+    print(f"iters per graph  : {n_per_graph}")
+    print(f"replays          : {n_replays}")
+    print(f"total iters      : {total_iters}")
+    print()
+    print(f"total elapsed    : {elapsed_s:.6f} s")
+    print(f"per-iter         : {per_iter_s * 1e6:.2f} us")
+    print(f"TFLOPS           : {tflops:.3f}")
 
 
 if __name__ == "__main__":
@@ -415,6 +558,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--use-local-address", action="store_true", help="Precompute LDS addresses before local_load.")
     parser.add_argument("--no-scales", action="store_true", help="Skip MX scale copies, loads, and scaled operands.")
+    parser.add_argument("--kernelC", action="store_true", help="Use partial TDM load issue.")
     parser.add_argument("-M", type=int, default=512)
     parser.add_argument("-N", type=int, default=512)
     parser.add_argument("-K", type=int, default=512)
@@ -428,12 +572,32 @@ if __name__ == "__main__":
     parser.add_argument("--dtype-a", type=str, default="float8_e4m3", choices=supported_dtypes)
     parser.add_argument("--dtype-b", type=str, default="float8_e5m2", choices=supported_dtypes)
     parser.add_argument("--seed", type=int, default=0)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--benchmark", action="store_true", help="Benchmark the kernel and report TFLOPS.")
+    mode_group.add_argument("--check", action="store_true", help="Check output against torch.")
+    parser.add_argument("--warmup", type=int, default=10, help="Benchmark warmup iterations.")
+    parser.add_argument("--probe-iters", type=int, default=20, help="Iterations for CUDA event timing probe.")
+    parser.add_argument("--graph-ms", type=float, default=100.0, help="Target CUDA graph body duration in ms.")
+    parser.add_argument("--n-replays", type=int, default=20, help="Number of CUDA graph replays to time.")
+    parser.add_argument("--iters-per-graph", type=int, default=None, help="Override graph body iteration count.")
     args = parser.parse_args()
 
-    run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=args.use_local_address, M=args.M, N=args.N, K=args.K,
-                                            BLOCK_M=args.block_m, BLOCK_N=args.block_n, BLOCK_K=args.block_k,
-                                            SCALE_BLOCK=args.scale_block, GROUP_SIZE_M=args.group_size_m,
-                                            NUM_BUFFERS=args.num_buffers, NUM_WARPS=args.num_warps,
-                                            DTYPE_A=args.dtype_a, DTYPE_B=args.dtype_b, seed=args.seed,
-                                            use_scales=not args.no_scales)
+    print(
+        f"(M={args.M}, N={args.N}, K={args.K}), (BLOCK_M={args.block_m}, BLOCK_N={args.block_n}, BLOCK_K={args.block_k}), "
+        f"NUM_WARPS={args.num_warps}, NUM_BUFFERS={args.num_buffers}, use_local_address={args.use_local_address}, "
+        f"use_scales={not args.no_scales}, kernelC={args.kernelC}, DTYPE_A={args.dtype_a}, DTYPE_B={args.dtype_b}")
+    if args.benchmark:
+        benchmark_mxgemm_tdm_warp_pipeline_standalone(
+            use_local_address=args.use_local_address, M=args.M, N=args.N, K=args.K, BLOCK_M=args.block_m,
+            BLOCK_N=args.block_n, BLOCK_K=args.block_k, SCALE_BLOCK=args.scale_block, GROUP_SIZE_M=args.group_size_m,
+            NUM_BUFFERS=args.num_buffers, NUM_WARPS=args.num_warps, DTYPE_A=args.dtype_a, DTYPE_B=args.dtype_b,
+            seed=args.seed, use_scales=not args.no_scales, use_kernel_c=args.kernelC, warmup=args.warmup,
+            probe_iters=args.probe_iters, graph_ms=args.graph_ms, n_replays=args.n_replays,
+            iters_per_graph=args.iters_per_graph)
+    else:
+        run_mxgemm_tdm_warp_pipeline_standalone(
+            use_local_address=args.use_local_address, M=args.M, N=args.N, K=args.K, BLOCK_M=args.block_m,
+            BLOCK_N=args.block_n, BLOCK_K=args.block_k, SCALE_BLOCK=args.scale_block, GROUP_SIZE_M=args.group_size_m,
+            NUM_BUFFERS=args.num_buffers, NUM_WARPS=args.num_warps, DTYPE_A=args.dtype_a, DTYPE_B=args.dtype_b,
+            seed=args.seed, use_scales=not args.no_scales, use_kernel_c=args.kernelC)
 
