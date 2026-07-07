@@ -36,6 +36,14 @@ except ModuleNotFoundError:
 
 
 @gluon.jit
+def _tdm_async_load(desc, dest, TDM_WARP_USED_HINT: gl.constexpr):
+    if TDM_WARP_USED_HINT == 0:
+        tdm.async_load(desc, [0, 0], dest)
+    else:
+        tdm.async_load(desc, [0, 0], dest, warp_used_hint=TDM_WARP_USED_HINT)
+
+
+@gluon.jit
 def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, stride_am, stride_ak,
                                                stride_bk, stride_bn, stride_cm, stride_cn, stride_scale,
                                                DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr,
@@ -43,7 +51,8 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
                                                BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
                                                GROUP_SIZE_M: gl.constexpr, NUM_BUFFERS: gl.constexpr,
                                                NUM_WARPS: gl.constexpr, USE_SCALES: gl.constexpr,
-                                               TDM_WARP_USED_HINT: gl.constexpr):
+                                               TDM_WARP_USED_HINT: gl.constexpr,
+                                               USE_PARTITIONED_LAYOUT: gl.constexpr):
     DIV_FACTOR_A: gl.constexpr = 2 if DTYPE_A == "e2m1" else 1
     DIV_FACTOR_B: gl.constexpr = 2 if DTYPE_B == "e2m1" else 1
     NUM_LOADS_IN_BATCH: gl.constexpr = 4 if USE_SCALES else 2
@@ -60,8 +69,27 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
     else:
         WARP_BASES: gl.constexpr = [[0, TILES_PER_WARP], [TILES_PER_WARP, 0], [TILES_PER_WARP * 2, 0]]
 
-    WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(3, True, WARP_BASES, REG_BASES, [INSTR_M, 16, 128])
-    WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(3, True, WARP_BASES, REG_BASES, [INSTR_M, 16, 64])
+    PAD_INTERVAL_A: gl.constexpr = 256 if BLOCK_K_PACKED_A <= 256 else BLOCK_K_PACKED_A
+    PAD_INTERVAL_B: gl.constexpr = 256 if BLOCK_K_PACKED_B <= 256 else BLOCK_K_PACKED_B
+    padded_layout_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PAD_INTERVAL_A, 16]],
+                                                                            [BLOCK_M, BLOCK_K_PACKED_A], [1, 0])
+    padded_layout_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PAD_INTERVAL_B, 16]],
+                                                                            [BLOCK_N, BLOCK_K_PACKED_B], [1, 0])
+
+    if USE_PARTITIONED_LAYOUT:
+        _DOT_LAYOUTS: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+            BLOCK_M, BLOCK_N, padded_layout_a, padded_layout_b, NUM_WARPS, [INSTR_M, 16, 128], a_transposed=False,
+            b_transposed=True)
+        shared_layout_a: gl.constexpr = _DOT_LAYOUTS[0]
+        shared_layout_b: gl.constexpr = _DOT_LAYOUTS[1]
+        WMMA_LAYOUT: gl.constexpr = _DOT_LAYOUTS[2]
+        WMMA_LAYOUT_PACKED: gl.constexpr = WMMA_LAYOUT
+    else:
+        shared_layout_a: gl.constexpr = padded_layout_a
+        shared_layout_b: gl.constexpr = padded_layout_b
+        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(3, True, WARP_BASES, REG_BASES, [INSTR_M, 16, 128])
+        WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(3, True, WARP_BASES, REG_BASES, [INSTR_M, 16, 64])
+
     dot_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0,
                                                      parent=WMMA_LAYOUT_PACKED if DTYPE_A == "e2m1" else WMMA_LAYOUT,
                                                      k_width=16)
@@ -72,12 +100,6 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
     layout_b_scale: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_layout_b, [BLOCK_N, BLOCK_K_SCALE])
     acc_layout: gl.constexpr = WMMA_LAYOUT
 
-    PAD_INTERVAL_A: gl.constexpr = 256 if BLOCK_K_PACKED_A <= 256 else BLOCK_K_PACKED_A
-    PAD_INTERVAL_B: gl.constexpr = 256 if BLOCK_K_PACKED_B <= 256 else BLOCK_K_PACKED_B
-    shared_layout_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PAD_INTERVAL_A, 16]],
-                                                                            [BLOCK_M, BLOCK_K_PACKED_A], [1, 0])
-    shared_layout_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PAD_INTERVAL_B, 16]],
-                                                                            [BLOCK_N, BLOCK_K_PACKED_B], [1, 0])
     shared_layout_a_scale: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[256, 8]], [BLOCK_M, BLOCK_K_SCALE], [1, 0])
     shared_layout_b_scale: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -135,13 +157,13 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = load_idx % NUM_BUFFERS
         if USE_SCALES:
-            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+            _tdm_async_load(a_scale_desc, a_scale_buffer.index(slot), TDM_WARP_USED_HINT)
             a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+            _tdm_async_load(b_scale_desc, b_scale_buffer.index(slot), TDM_WARP_USED_HINT)
             b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-        tdm.async_load(a_desc, [0, 0], a_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+        _tdm_async_load(a_desc, a_buffer.index(slot), TDM_WARP_USED_HINT)
         a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
-        tdm.async_load(b_desc, [0, 0], b_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+        _tdm_async_load(b_desc, b_buffer.index(slot), TDM_WARP_USED_HINT)
         b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K_PACKED_B])
         load_idx = load_idx + 1
 
@@ -164,13 +186,13 @@ def mxgemm_tdm_warp_pipeline_standalone_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_s
             phase = wmma_idx + NUM_BUFFERS - 2
             slot = phase % NUM_BUFFERS
             if USE_SCALES:
-                tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+                _tdm_async_load(a_scale_desc, a_scale_buffer.index(slot), TDM_WARP_USED_HINT)
                 a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-                tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+                _tdm_async_load(b_scale_desc, b_scale_buffer.index(slot), TDM_WARP_USED_HINT)
                 b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(a_desc, [0, 0], a_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+            _tdm_async_load(a_desc, a_buffer.index(slot), TDM_WARP_USED_HINT)
             a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
-            tdm.async_load(b_desc, [0, 0], b_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+            _tdm_async_load(b_desc, b_buffer.index(slot), TDM_WARP_USED_HINT)
             b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K_PACKED_B])
 
         #tdm.async_wait((NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH)
@@ -301,13 +323,13 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
     for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = load_idx % NUM_BUFFERS
         if USE_SCALES:
-            tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+            _tdm_async_load(a_scale_desc, a_scale_buffer.index(slot), TDM_WARP_USED_HINT)
             a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+            _tdm_async_load(b_scale_desc, b_scale_buffer.index(slot), TDM_WARP_USED_HINT)
             b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-        tdm.async_load(a_desc, [0, 0], a_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+        _tdm_async_load(a_desc, a_buffer.index(slot), TDM_WARP_USED_HINT)
         a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
-        tdm.async_load(b_desc, [0, 0], b_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+        _tdm_async_load(b_desc, b_buffer.index(slot), TDM_WARP_USED_HINT)
         b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K_PACKED_B])
         load_idx = load_idx + 1
 
@@ -332,13 +354,13 @@ def mxgemm_tdm_warp_pipeline_local_address_kernel(a_ptr, b_ptr, c_ptr, a_scale, 
             phase = wmma_idx + NUM_BUFFERS - 2
             slot = phase % NUM_BUFFERS
             if USE_SCALES:
-                tdm.async_load(a_scale_desc, [0, 0], a_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+                _tdm_async_load(a_scale_desc, a_scale_buffer.index(slot), TDM_WARP_USED_HINT)
                 a_scale_desc = tdm.update_tensor_descriptor(a_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-                tdm.async_load(b_scale_desc, [0, 0], b_scale_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+                _tdm_async_load(b_scale_desc, b_scale_buffer.index(slot), TDM_WARP_USED_HINT)
                 b_scale_desc = tdm.update_tensor_descriptor(b_scale_desc, add_offsets=[0, BLOCK_K_SCALE])
-            tdm.async_load(a_desc, [0, 0], a_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+            _tdm_async_load(a_desc, a_buffer.index(slot), TDM_WARP_USED_HINT)
             a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K_PACKED_A])
-            tdm.async_load(b_desc, [0, 0], b_buffer.index(slot), warp_used_hint=TDM_WARP_USED_HINT)
+            _tdm_async_load(b_desc, b_buffer.index(slot), TDM_WARP_USED_HINT)
             b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K_PACKED_B])
 
         tdm.async_wait(0)
@@ -383,11 +405,21 @@ def test_runtime_mxgemm_tdm_warp_pipeline_standalone(USE_LOCAL_ADDRESS):
     run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=USE_LOCAL_ADDRESS)
 
 
-def _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, use_kernel_c):
+def _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, DTYPE_A, DTYPE_B, use_local_address, use_kernel_c,
+                      use_partitioned_layout):
     if use_kernel_c and NUM_BUFFERS < 3:
         raise ValueError("kernelC requires NUM_BUFFERS >= 3")
     if use_kernel_c and NUM_WARPS != 8:
         raise ValueError("kernelC requires NUM_WARPS == 8 for its 4-warp TDM hint")
+    if use_partitioned_layout:
+        if use_local_address:
+            raise ValueError("--partitioned-layout is only wired for the direct local_load path")
+        if use_kernel_c:
+            raise ValueError("--partitioned-layout is not compatible with --kernelC")
+        if NUM_WARPS != 8:
+            raise ValueError("--partitioned-layout requires NUM_WARPS == 8")
+        if DTYPE_A not in ("float8_e4m3", "float8_e5m2") or DTYPE_B not in ("float8_e4m3", "float8_e5m2"):
+            raise ValueError("--partitioned-layout is only wired for FP8 inputs")
     if triton.cdiv(K, BLOCK_K) < NUM_BUFFERS:
         raise ValueError("K/BLOCK_K must be at least NUM_BUFFERS")
 
@@ -429,8 +461,9 @@ def _launch_mxgemm_tdm_warp_pipeline_standalone(a_d, b_d, c_d, a_scale_d, b_scal
                                                 N=512, K=512, BLOCK_M=128, BLOCK_N=128, BLOCK_K=128,
                                                 SCALE_BLOCK=32, GROUP_SIZE_M=8, NUM_BUFFERS=3, NUM_WARPS=8,
                                                 DTYPE_A="float8_e4m3", DTYPE_B="float8_e5m2", use_scales=True,
-                                                use_kernel_c=False):
-    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, use_kernel_c)
+                                                use_kernel_c=False, use_partitioned_layout=False):
+    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, DTYPE_A, DTYPE_B, use_local_address, use_kernel_c,
+                      use_partitioned_layout)
 
     stride_am, stride_ak = a_d.stride(0), a_d.stride(1)
     stride_bk, stride_bn = b_d.stride(1), b_d.stride(0)
@@ -439,7 +472,7 @@ def _launch_mxgemm_tdm_warp_pipeline_standalone(a_d, b_d, c_d, a_scale_d, b_scal
 
     grid = [triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1, 1]
     dtype_converter = {"float8_e5m2": "e5m2", "float8_e4m3": "e4m3"}
-    tdm_warp_used_hint = 0b00001111 if use_kernel_c else (1 << NUM_WARPS) - 1
+    tdm_warp_used_hint = 0b00001111 if use_kernel_c else 0
     if use_local_address:
         return mxgemm_tdm_warp_pipeline_local_address_kernel[grid](
             a_d, b_d, c_d, a_scale_d, b_scale_d, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
@@ -449,26 +482,29 @@ def _launch_mxgemm_tdm_warp_pipeline_standalone(a_d, b_d, c_d, a_scale_d, b_scal
     return mxgemm_tdm_warp_pipeline_standalone_kernel[grid](
         a_d, b_d, c_d, a_scale_d, b_scale_d, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
         stride_scale, dtype_converter[DTYPE_A], dtype_converter[DTYPE_B], SCALE_BLOCK, BLOCK_M, BLOCK_N, BLOCK_K,
-        GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, use_scales, tdm_warp_used_hint, num_warps=NUM_WARPS, num_ctas=1,
-        waves_per_eu=NUM_WARPS // 4)
+        GROUP_SIZE_M, NUM_BUFFERS, NUM_WARPS, use_scales, tdm_warp_used_hint, use_partitioned_layout,
+        num_warps=NUM_WARPS, num_ctas=1, waves_per_eu=NUM_WARPS // 4)
 
 
 def run_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512, N=512, K=512, BLOCK_M=128, BLOCK_N=128,
                                             BLOCK_K=128, SCALE_BLOCK=32, GROUP_SIZE_M=8, NUM_BUFFERS=3, NUM_WARPS=8,
                                             DTYPE_A="float8_e4m3", DTYPE_B="float8_e5m2", seed=0, use_scales=True,
-                                            use_kernel_c=False):
-    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, use_kernel_c)
+                                            use_kernel_c=False, use_partitioned_layout=False):
+    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, DTYPE_A, DTYPE_B, use_local_address, use_kernel_c,
+                      use_partitioned_layout)
     torch.manual_seed(seed)
     a_d, b_d, c_d, a_scale_d, b_scale_d, c_ref = _make_mxgemm_inputs(M, N, K, SCALE_BLOCK, DTYPE_A, DTYPE_B,
                                                                       use_scales=use_scales)
     _launch_mxgemm_tdm_warp_pipeline_standalone(
         a_d, b_d, c_d, a_scale_d, b_scale_d, use_local_address=use_local_address, M=M, N=N, K=K, BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SCALE_BLOCK=SCALE_BLOCK, GROUP_SIZE_M=GROUP_SIZE_M, NUM_BUFFERS=NUM_BUFFERS,
-        NUM_WARPS=NUM_WARPS, DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, use_scales=use_scales, use_kernel_c=use_kernel_c)
+        NUM_WARPS=NUM_WARPS, DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, use_scales=use_scales, use_kernel_c=use_kernel_c,
+        use_partitioned_layout=use_partitioned_layout)
 
     torch.testing.assert_close(c_d.cpu(), c_ref.cpu(), rtol=1e-5, atol=1e-8)
     kernel_mode = "kernelC" if use_kernel_c else "default"
-    print(f"Pass mode={kernel_mode} use_local_address={use_local_address} use_scales={use_scales}")
+    print(f"Pass mode={kernel_mode} use_local_address={use_local_address} use_scales={use_scales} "
+          f"use_partitioned_layout={use_partitioned_layout}")
 
 
 def _event_probe(fn, iters):
@@ -503,8 +539,10 @@ def benchmark_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512
                                                   NUM_BUFFERS=3, NUM_WARPS=8, DTYPE_A="float8_e4m3",
                                                   DTYPE_B="float8_e5m2", seed=0, use_scales=True,
                                                   use_kernel_c=False, warmup=10, probe_iters=20,
-                                                  graph_ms=100.0, n_replays=20, iters_per_graph=None):
-    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, use_kernel_c)
+                                                  graph_ms=100.0, n_replays=20, iters_per_graph=None,
+                                                  use_partitioned_layout=False):
+    _validate_options(K, BLOCK_K, NUM_BUFFERS, NUM_WARPS, DTYPE_A, DTYPE_B, use_local_address, use_kernel_c,
+                      use_partitioned_layout)
     torch.manual_seed(seed)
     a_d, b_d, c_d, a_scale_d, b_scale_d, _ = _make_mxgemm_inputs(
         M, N, K, SCALE_BLOCK, DTYPE_A, DTYPE_B, use_scales=use_scales, make_reference=False)
@@ -514,7 +552,7 @@ def benchmark_mxgemm_tdm_warp_pipeline_standalone(use_local_address=False, M=512
             a_d, b_d, c_d, a_scale_d, b_scale_d, use_local_address=use_local_address, M=M, N=N, K=K, BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SCALE_BLOCK=SCALE_BLOCK, GROUP_SIZE_M=GROUP_SIZE_M,
             NUM_BUFFERS=NUM_BUFFERS, NUM_WARPS=NUM_WARPS, DTYPE_A=DTYPE_A, DTYPE_B=DTYPE_B, use_scales=use_scales,
-            use_kernel_c=use_kernel_c)
+            use_kernel_c=use_kernel_c, use_partitioned_layout=use_partitioned_layout)
 
     for _ in range(warmup):
         launch()
@@ -559,6 +597,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-local-address", action="store_true", help="Precompute LDS addresses before local_load.")
     parser.add_argument("--no-scales", action="store_true", help="Skip MX scale copies, loads, and scaled operands.")
     parser.add_argument("--kernelC", action="store_true", help="Use partial TDM load issue.")
+    parser.add_argument("--partitioned-layout", action="store_true",
+                        help="Use partitioned shared layout for the default FP8 direct-load path.")
     parser.add_argument("-M", type=int, default=512)
     parser.add_argument("-N", type=int, default=512)
     parser.add_argument("-K", type=int, default=512)
@@ -585,7 +625,8 @@ if __name__ == "__main__":
     print(
         f"(M={args.M}, N={args.N}, K={args.K}), (BLOCK_M={args.block_m}, BLOCK_N={args.block_n}, BLOCK_K={args.block_k}), "
         f"NUM_WARPS={args.num_warps}, NUM_BUFFERS={args.num_buffers}, use_local_address={args.use_local_address}, "
-        f"use_scales={not args.no_scales}, kernelC={args.kernelC}, DTYPE_A={args.dtype_a}, DTYPE_B={args.dtype_b}")
+        f"use_scales={not args.no_scales}, kernelC={args.kernelC}, partitioned_layout={args.partitioned_layout}, "
+        f"DTYPE_A={args.dtype_a}, DTYPE_B={args.dtype_b}")
     if args.benchmark:
         benchmark_mxgemm_tdm_warp_pipeline_standalone(
             use_local_address=args.use_local_address, M=args.M, N=args.N, K=args.K, BLOCK_M=args.block_m,
@@ -593,11 +634,12 @@ if __name__ == "__main__":
             NUM_BUFFERS=args.num_buffers, NUM_WARPS=args.num_warps, DTYPE_A=args.dtype_a, DTYPE_B=args.dtype_b,
             seed=args.seed, use_scales=not args.no_scales, use_kernel_c=args.kernelC, warmup=args.warmup,
             probe_iters=args.probe_iters, graph_ms=args.graph_ms, n_replays=args.n_replays,
-            iters_per_graph=args.iters_per_graph)
+            iters_per_graph=args.iters_per_graph, use_partitioned_layout=args.partitioned_layout)
     else:
         run_mxgemm_tdm_warp_pipeline_standalone(
             use_local_address=args.use_local_address, M=args.M, N=args.N, K=args.K, BLOCK_M=args.block_m,
             BLOCK_N=args.block_n, BLOCK_K=args.block_k, SCALE_BLOCK=args.scale_block, GROUP_SIZE_M=args.group_size_m,
             NUM_BUFFERS=args.num_buffers, NUM_WARPS=args.num_warps, DTYPE_A=args.dtype_a, DTYPE_B=args.dtype_b,
-            seed=args.seed, use_scales=not args.no_scales, use_kernel_c=args.kernelC)
+            seed=args.seed, use_scales=not args.no_scales, use_kernel_c=args.kernelC,
+            use_partitioned_layout=args.partitioned_layout)
 
