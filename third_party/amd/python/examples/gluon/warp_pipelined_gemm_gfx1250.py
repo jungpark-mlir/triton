@@ -9,7 +9,6 @@ from triton.experimental.gluon.language.amd.gfx1250 import async_copy as cp
 from triton.experimental.gluon.language.amd.gfx1250 import tdm
 
 try:
-    from .f16_gemm_warp_pipeline_gfx1250 import get_xcd_swizzled_pids
     from .mxfp_gemm_gfx1250 import (
         get_scale_blocked_layout,
         get_wmma_layout,
@@ -20,7 +19,6 @@ try:
         torch_gemm_mxfp,
     )
 except ImportError:
-    from f16_gemm_warp_pipeline_gfx1250 import get_xcd_swizzled_pids
     from mxfp_gemm_gfx1250 import (
         get_scale_blocked_layout,
         get_wmma_layout,
@@ -37,6 +35,30 @@ MXFP_DTYPE_TO_KERNEL = {
     "float8_e4m3": "e4m3",
     "float4": "e2m1",
 }
+
+
+@gluon.jit
+def _remap_xcd_chunked(pid, grid_mn, NUM_XCDS: gl.constexpr, CHUNK_SIZE: gl.constexpr):
+    if pid >= (grid_mn // (NUM_XCDS * CHUNK_SIZE)) * (NUM_XCDS * CHUNK_SIZE):
+        return pid
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    return (local_pid // CHUNK_SIZE) * NUM_XCDS * CHUNK_SIZE + xcd * CHUNK_SIZE + (local_pid % CHUNK_SIZE)
+
+
+@gluon.jit
+def get_xcd_swizzled_pids(M, N, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, GRID_MN: gl.constexpr,
+                          NUM_XCDS: gl.constexpr, GROUP_SIZE_M: gl.constexpr):
+    pid = _remap_xcd_chunked(gl.program_id(axis=0), GRID_MN, NUM_XCDS, 2)
+    num_pid_m = gl.cdiv(M, BLOCK_M)
+    num_pid_n = gl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = gl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
 
 
 @gluon.jit
