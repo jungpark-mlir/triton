@@ -1,3 +1,5 @@
+import time
+
 import pytest
 import torch
 
@@ -283,6 +285,138 @@ def gemm_tdm_pipelined_warp_pipelined_kernelB(a_ptr, b_ptr, c_ptr,  #
 # ---------------------------------------------------------------------------
 
 
+def _make_gemm_inputs(M, N, K, TRANSPOSE_B):
+    a = torch.randn((M, K), dtype=torch.float16)
+    b = torch.randn((K, N), dtype=torch.float16)
+    if TRANSPOSE_B:
+        b = b.T.contiguous()
+    c = torch.zeros((M, N), dtype=torch.float32)
+    return a.cuda(), b.cuda(), c.cuda()
+
+
+def _launch_gemm(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, a_device, b_device, c_device,
+                 USE_KERNEL_B):
+    stride_am, stride_ak = a_device.stride(0), a_device.stride(1)
+    stride_bk, stride_bn = (b_device.stride(0), b_device.stride(1)) if not TRANSPOSE_B else (b_device.stride(1),
+                                                                                            b_device.stride(0))
+    stride_cm, stride_cn = c_device.stride(0), c_device.stride(1)
+
+    NUM_WARPS = 8
+    WARP_BASES = ((0, 1), (1, 0), (2, 0))
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
+    kernel_fn = gemm_tdm_pipelined_warp_pipelined_kernelB if USE_KERNEL_B else gemm_tdm_pipelined_warp_pipelined_kernel
+    return kernel_fn[grid](
+        a_device, b_device, c_device,  #
+        M, N, K,  #
+        stride_am, stride_ak,  #
+        stride_bk, stride_bn,  #
+        stride_cm, stride_cn,  #
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,  #
+        NUM_BUFFERS=NUM_BUFFERS, TRANSPOSE_B=TRANSPOSE_B, WARP_BASES=WARP_BASES,  #
+        num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4)
+
+
+def _launch_gemm_predicated(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, a_device, b_device, c_device):
+    stride_am, stride_ak = a_device.stride(0), a_device.stride(1)
+    stride_bk, stride_bn = (b_device.stride(0), b_device.stride(1)) if not TRANSPOSE_B else (b_device.stride(1),
+                                                                                            b_device.stride(0))
+    stride_cm, stride_cn = c_device.stride(0), c_device.stride(1)
+
+    NUM_WARPS = 8
+    WARP_BASES = ((0, 1), (1, 0), (2, 0))
+    TDM_WARP_USED_HINT = 0b00001111
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
+    return gemm_tdm_predicated_pipelined_warp_pipelined_kernel[grid](
+        a_device, b_device, c_device,  #
+        M, N, K,  #
+        stride_am, stride_ak,  #
+        stride_bk, stride_bn,  #
+        stride_cm, stride_cn,  #
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,  #
+        NUM_BUFFERS=NUM_BUFFERS, TRANSPOSE_B=TRANSPOSE_B, WARP_BASES=WARP_BASES,  #
+        TDM_WARP_USED_HINT=TDM_WARP_USED_HINT, num_warps=NUM_WARPS, waves_per_eu=NUM_WARPS // 4)
+
+
+def _event_probe(fn, iters):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+
+def _capture_graph(fn, n_per_graph):
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            fn()
+        side.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):
+            for _ in range(n_per_graph):
+                fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    return graph
+
+
+def _benchmark_gemm(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, USE_KERNEL_B, FOUR_WARP_TDM, warmup,
+                    probe_iters, graph_ms, n_replays, iters_per_graph):
+    if triton.cdiv(K, BLOCK_K) < NUM_BUFFERS:
+        raise ValueError("K/BLOCK_K must be at least NUM_BUFFERS")
+    if USE_KERNEL_B and NUM_BUFFERS < 3:
+        raise ValueError("kernelB requires NUM_BUFFERS >= 3")
+
+    torch.manual_seed(42)
+    a_device, b_device, c_device = _make_gemm_inputs(M, N, K, TRANSPOSE_B)
+
+    def launch():
+        if FOUR_WARP_TDM:
+            return _launch_gemm_predicated(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, a_device,
+                                           b_device, c_device)
+        return _launch_gemm(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, a_device, b_device, c_device,
+                            USE_KERNEL_B)
+
+    for _ in range(warmup):
+        launch()
+    torch.cuda.synchronize()
+
+    probe_ms = _event_probe(launch, probe_iters)
+    if iters_per_graph is None:
+        n_per_graph = max(1, int(graph_ms / max(probe_ms, 1e-6)))
+    else:
+        n_per_graph = iters_per_graph
+    if n_per_graph <= 0:
+        raise ValueError("--iters-per-graph must be positive")
+
+    graph = _capture_graph(launch, n_per_graph)
+
+    total_iters = n_replays * n_per_graph
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n_replays):
+        graph.replay()
+    torch.cuda.synchronize()
+    elapsed_s = time.perf_counter() - t0
+
+    per_iter_s = elapsed_s / total_iters
+    flops = 2 * M * N * K
+    tflops = flops / per_iter_s / 1e12
+
+    print(f"probe per-iter   : {probe_ms * 1e3:.2f} us")
+    print(f"iters per graph  : {n_per_graph}")
+    print(f"replays          : {n_replays}")
+    print(f"total iters      : {total_iters}")
+    print()
+    print(f"total elapsed    : {elapsed_s:.6f} s")
+    print(f"per-iter         : {per_iter_s * 1e6:.2f} us")
+    print(f"TFLOPS           : {tflops:.3f}")
+
+
 @pytest.mark.parametrize("BLOCK_M,BLOCK_N,BLOCK_K", [(256, 256, 64)])
 @pytest.mark.parametrize("NUM_BUFFERS", [3])
 @pytest.mark.parametrize("TRANSPOSE_B", [True])
@@ -404,6 +538,12 @@ if __name__ == "__main__":
     parser.add_argument("--4warp-tdm", action="store_true", dest="four_warp_tdm", help="Use 4-warp partial TDM copy")
     parser.add_argument("--dump", action="store_true", help="Print out result/golden tensors")
     parser.add_argument("--kernelB", action="store_true", help="Use the kernelB variant")
+    parser.add_argument("--benchmark", action="store_true", help="Benchmark the kernel and report TFLOPS")
+    parser.add_argument("--warmup", type=int, default=10, help="Benchmark warmup iterations")
+    parser.add_argument("--probe-iters", type=int, default=20, help="Iterations for CUDA event timing probe")
+    parser.add_argument("--graph-ms", type=float, default=100.0, help="Target CUDA graph body duration in ms")
+    parser.add_argument("--n-replays", type=int, default=20, help="Number of CUDA graph replays to time")
+    parser.add_argument("--iters-per-graph", type=int, default=None, help="Override graph body iteration count")
     args = parser.parse_args()
 
     M, N, K = args.M, args.N, args.K
@@ -416,6 +556,12 @@ if __name__ == "__main__":
     print(
         f"({M=}, {N=}, {K=}), ({BLOCK_M=}, {BLOCK_N=}, {BLOCK_K=}), {TRANSPOSE_B=}, {NUM_WARPS=}, {NUM_BUFFERS=}, {USE_KERNEL_B=}"
     )
+
+    if args.benchmark:
+        _benchmark_gemm(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, USE_KERNEL_B,
+                        args.four_warp_tdm, args.warmup, args.probe_iters, args.graph_ms, args.n_replays,
+                        args.iters_per_graph)
+        raise SystemExit
 
     if args.four_warp_tdm:
         test_runtime_gemm_tdm_predicated_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B, M, N, K, DUMP)
