@@ -453,19 +453,17 @@ def mxfp_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, a_scale_ptr,
     gl.assume(iter_max > 3)
     load_k = 2
     for _ in range(0, iter_max - 2, 2):
-        with gl.amd.warp_pipeline_stage("wmma", priority=0):
-            acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_left, bs_left, DTYPE_B, acc_tl)
+        acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_left, bs_left, DTYPE_B, acc_tl)
         _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        with gl.amd.warp_pipeline_stage("mem", priority=1):
-            a_bot = a_bot_buf.index(0).load(layout=dot_a)
-            if WITH_A_SCALE:
-                as_bot = _load_mxfp_scale(as_bot_buf, 0, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
-                                          PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-            else:
-                as_bot = as_top
-            tdm.async_load(b_left_desc, [0, load_k * BK_B], b_left_buf.index(0))
-            _issue_mxfp_scale_load(bs_left_desc, bs_left_ptrs, load_k, bs_left_buf, 0, BK_SCALE_PRESHUFFLED,
-                                   ASYNC_COPY_SCALE)
+        a_bot = a_bot_buf.index(0).load(layout=dot_a)
+        if WITH_A_SCALE:
+            as_bot = _load_mxfp_scale(as_bot_buf, 0, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
+                                      PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        else:
+            as_bot = as_top
+        tdm.async_load(b_left_desc, [0, load_k * BK_B], b_left_buf.index(0))
+        _issue_mxfp_scale_load(bs_left_desc, bs_left_ptrs, load_k, bs_left_buf, 0, BK_SCALE_PRESHUFFLED,
+                               ASYNC_COPY_SCALE)
 
         acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_left, bs_left, DTYPE_B, acc_bl)
         _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
