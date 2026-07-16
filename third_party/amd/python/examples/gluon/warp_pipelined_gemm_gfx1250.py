@@ -142,7 +142,7 @@ def f16_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
         wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(3, True, WARP_BASES, [], [16, 16, 32])
     dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma_layout, 8)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma_layout, 8)
-    store_layout: gl.constexpr = gl.BlockedLayout([4, 8], [4, 16], [2, 4], [1, 0])
+    store_layout: gl.constexpr = wmma_layout
 
     nbuf: gl.constexpr = NUM_BUFFERS
     a_top_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, BLOCK_M // 2, BLOCK_K], shared_a)
@@ -322,7 +322,7 @@ def mxfp_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, a_scale_ptr,
     dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma_packed if DTYPE_B == "e2m1" else wmma, 16)
     scale_a_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_a, [HALF_M, BK_SCALE])
     scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_b, [HALF_N, BK_SCALE])
-    store_layout: gl.constexpr = gl.BlockedLayout([4, 8], [4, 16], [NUM_WARPS // 4, 4], [1, 0])
+    store_layout: gl.constexpr = wmma
 
     nbuf: gl.constexpr = NUM_BUFFERS
     a_top_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, HALF_M, BK_A], shared_a)
