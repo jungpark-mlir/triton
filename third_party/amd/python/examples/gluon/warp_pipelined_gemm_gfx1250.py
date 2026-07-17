@@ -163,13 +163,15 @@ def f16_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
                                               strides=(stride_bn, stride_bk), block_shape=(BLOCK_N // 2, BLOCK_K),
                                               layout=shared_b)
 
-    for i in gl.static_range(2):
+    for i in gl.static_range(NUM_BUFFERS - 1):
         tdm.async_load(b_left_desc, [0, i * BLOCK_K], b_left_buf.index(i))
         tdm.async_load(a_top_desc, [0, i * BLOCK_K], a_top_buf.index(i))
         tdm.async_load(a_bot_desc, [0, i * BLOCK_K], a_bot_buf.index(i))
         tdm.async_load(b_right_desc, [0, i * BLOCK_K], b_right_buf.index(i))
 
-    tdm.async_wait(6)
+    prefetch_wait: gl.constexpr = 4 * (NUM_BUFFERS - 1) - 2
+    steady_wait: gl.constexpr = 4 * (NUM_BUFFERS - 1) - 3
+    tdm.async_wait(prefetch_wait)
     a_top = a_top_buf.index(0).load(layout=dot_a)
     b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
 
@@ -180,89 +182,60 @@ def f16_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
 
     iter_max = gl.cdiv(K, BLOCK_K)
     gl.assume(iter_max > 3)
-    load_k = 2
-    for _ in range(0, iter_max - 2, 2):
+    consume_k = 0
+    load_k = NUM_BUFFERS - 1
+    for _ in range(0, iter_max - (NUM_BUFFERS - 1)):
+        read_slot = consume_k % nbuf
+        next_slot = (consume_k + 1) % nbuf
+        write_slot = load_k % nbuf
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_tl = gl.amd.gfx1250.wmma(a_top, b_left, acc_tl)
-        tdm.async_wait(5)
+        tdm.async_wait(steady_wait)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
-            a_bot = a_bot_buf.index(0).load(layout=dot_a)
-            tdm.async_load(b_left_desc, [0, load_k * BLOCK_K], b_left_buf.index(0))
+            a_bot = a_bot_buf.index(read_slot).load(layout=dot_a)
+            tdm.async_load(b_left_desc, [0, load_k * BLOCK_K], b_left_buf.index(write_slot))
 
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_bl = gl.amd.gfx1250.wmma(a_bot, b_left, acc_bl)
-        tdm.async_wait(5)
+        tdm.async_wait(steady_wait)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
-            b_right = b_right_buf.index(0).permute([1, 0]).load(layout=dot_b)
-            tdm.async_load(a_top_desc, [0, load_k * BLOCK_K], a_top_buf.index(0))
+            b_right = b_right_buf.index(read_slot).permute([1, 0]).load(layout=dot_b)
+            tdm.async_load(a_top_desc, [0, load_k * BLOCK_K], a_top_buf.index(write_slot))
 
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_tr = gl.amd.gfx1250.wmma(a_top, b_right, acc_tr)
-        tdm.async_wait(5)
+        tdm.async_wait(steady_wait)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
-            b_left = b_left_buf.index(1).permute([1, 0]).load(layout=dot_b)
-            tdm.async_load(a_bot_desc, [0, load_k * BLOCK_K], a_bot_buf.index(0))
+            b_left = b_left_buf.index(next_slot).permute([1, 0]).load(layout=dot_b)
+            tdm.async_load(a_bot_desc, [0, load_k * BLOCK_K], a_bot_buf.index(write_slot))
 
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_br = gl.amd.gfx1250.wmma(a_bot, b_right, acc_br)
-        tdm.async_wait(5)
+        tdm.async_wait(steady_wait)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
-            a_top = a_top_buf.index(1).load(layout=dot_a)
-            tdm.async_load(b_right_desc, [0, load_k * BLOCK_K], b_right_buf.index(0))
-
+            a_top = a_top_buf.index(next_slot).load(layout=dot_a)
+            tdm.async_load(b_right_desc, [0, load_k * BLOCK_K], b_right_buf.index(write_slot))
+        consume_k += 1
         load_k += 1
-        with gl.amd.warp_pipeline_stage("mfma", priority=0):
-            acc_tl = gl.amd.gfx1250.wmma(a_top, b_left, acc_tl)
-        tdm.async_wait(5)
-        with gl.amd.warp_pipeline_stage("mem", priority=1):
-            a_bot = a_bot_buf.index(1).load(layout=dot_a)
-            tdm.async_load(b_left_desc, [0, load_k * BLOCK_K], b_left_buf.index(1))
 
-        with gl.amd.warp_pipeline_stage("mfma", priority=0):
-            acc_bl = gl.amd.gfx1250.wmma(a_bot, b_left, acc_bl)
-        tdm.async_wait(5)
-        with gl.amd.warp_pipeline_stage("mem", priority=1):
-            b_right = b_right_buf.index(1).permute([1, 0]).load(layout=dot_b)
-            tdm.async_load(a_top_desc, [0, load_k * BLOCK_K], a_top_buf.index(1))
-
-        with gl.amd.warp_pipeline_stage("mfma", priority=0):
-            acc_tr = gl.amd.gfx1250.wmma(a_top, b_right, acc_tr)
-        tdm.async_wait(5)
-        with gl.amd.warp_pipeline_stage("mem", priority=1):
-            b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
-            tdm.async_load(a_bot_desc, [0, load_k * BLOCK_K], a_bot_buf.index(1))
-
-        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        read_slot = (iter_max - (NUM_BUFFERS - 1 - i)) % nbuf
+        acc_tl = gl.amd.gfx1250.wmma(a_top, b_left, acc_tl)
+        tdm.async_wait(4 * (NUM_BUFFERS - 1 - i) - 3)
+        a_bot = a_bot_buf.index(read_slot).load(layout=dot_a)
+        acc_bl = gl.amd.gfx1250.wmma(a_bot, b_left, acc_bl)
+        tdm.async_wait(4 * (NUM_BUFFERS - 1 - i) - 4)
+        b_right = b_right_buf.index(read_slot).permute([1, 0]).load(layout=dot_b)
+        acc_tr = gl.amd.gfx1250.wmma(a_top, b_right, acc_tr)
+        if i < NUM_BUFFERS - 2:
+            next_slot = (iter_max - (NUM_BUFFERS - 1 - i) + 1) % nbuf
+            tdm.async_wait(4 * (NUM_BUFFERS - 2 - i) - 1)
+            b_left = b_left_buf.index(next_slot).permute([1, 0]).load(layout=dot_b)
             acc_br = gl.amd.gfx1250.wmma(a_bot, b_right, acc_br)
-        tdm.async_wait(5)
-        with gl.amd.warp_pipeline_stage("mem", priority=1):
-            a_top = a_top_buf.index(0).load(layout=dot_a)
-            tdm.async_load(b_right_desc, [0, load_k * BLOCK_K], b_right_buf.index(1))
-        load_k += 1
-
-    acc_tl = gl.amd.gfx1250.wmma(a_top, b_left, acc_tl)
-    tdm.async_wait(5)
-    l_idx = (iter_max - 2) % 2
-    a_bot = a_bot_buf.index(l_idx).load(layout=dot_a)
-    acc_bl = gl.amd.gfx1250.wmma(a_bot, b_left, acc_bl)
-    tdm.async_wait(4)
-    b_right = b_right_buf.index(l_idx).permute([1, 0]).load(layout=dot_b)
-    acc_tr = gl.amd.gfx1250.wmma(a_top, b_right, acc_tr)
-    tdm.async_wait(3)
-    g_idx = 1 - l_idx
-    b_left = b_left_buf.index(g_idx).permute([1, 0]).load(layout=dot_b)
-    acc_br = gl.amd.gfx1250.wmma(a_bot, b_right, acc_br)
-    tdm.async_wait(2)
-    a_top = a_top_buf.index(g_idx).load(layout=dot_a)
-
-    acc_tl = gl.amd.gfx1250.wmma(a_top, b_left, acc_tl)
-    tdm.async_wait(1)
-    a_bot = a_bot_buf.index(g_idx).load(layout=dot_a)
-    acc_bl = gl.amd.gfx1250.wmma(a_bot, b_left, acc_bl)
-    tdm.async_wait(0)
-    b_right = b_right_buf.index(g_idx).permute([1, 0]).load(layout=dot_b)
-    acc_tr = gl.amd.gfx1250.wmma(a_top, b_right, acc_tr)
-    acc_br = gl.amd.gfx1250.wmma(a_bot, b_right, acc_br)
+            tdm.async_wait(4 * (NUM_BUFFERS - 2 - i) - 2)
+            a_top = a_top_buf.index(next_slot).load(layout=dot_a)
+        else:
+            acc_br = gl.amd.gfx1250.wmma(a_bot, b_right, acc_br)
 
     _store_quadrants(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc_tl, acc_bl, acc_tr, acc_br, store_layout,
                      BLOCK_M, BLOCK_N)
@@ -403,7 +376,7 @@ def mxfp_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, a_scale_ptr,
     bs_left_ptrs = b_scale_ptr + bs_left_base + scale_n[:, None] * stride_scale + scale_k[None, :]
     bs_right_ptrs = b_scale_ptr + bs_right_base + scale_n[:, None] * stride_scale + scale_k[None, :]
 
-    for i in gl.static_range(2):
+    for i in gl.static_range(NUM_BUFFERS - 1):
         tdm.async_load(b_left_desc, [0, i * BK_B], b_left_buf.index(i))
         if ASYNC_COPY_SCALE:
             cp.global_to_shared(bs_left_buf.index(i), bs_left_ptrs + i * BK_SCALE_PRESHUFFLED)
@@ -432,7 +405,10 @@ def mxfp_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, a_scale_ptr,
             tdm.async_load(bs_right_desc, [0, i * BK_SCALE_PRESHUFFLED], bs_right_buf.index(i))
 
     wait_unit: gl.constexpr = 8 if WITH_A_SCALE else 6
-    _wait_mxfp_scale_pipeline(wait_unit - 2, ASYNC_COPY_SCALE)
+    initial_needed: gl.constexpr = 4 if WITH_A_SCALE else 3
+    prefetch_wait: gl.constexpr = wait_unit - initial_needed if NUM_BUFFERS == 2 else (NUM_BUFFERS - 2) * wait_unit - 2
+    steady_wait: gl.constexpr = wait_unit - 3 if NUM_BUFFERS == 2 else (NUM_BUFFERS - 2) * wait_unit - 3
+    _wait_mxfp_scale_pipeline(prefetch_wait, ASYNC_COPY_SCALE)
     a_top = a_top_buf.index(0).load(layout=dot_a)
     if WITH_A_SCALE:
         as_top = _load_mxfp_scale(as_top_buf, 0, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
@@ -451,135 +427,93 @@ def mxfp_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, a_scale_ptr,
 
     iter_max = gl.cdiv(K, BLOCK_K)
     gl.assume(iter_max > 3)
-    load_k = 2
-    for _ in range(0, iter_max - 2, 2):
+    consume_k = 0
+    load_k = NUM_BUFFERS - 1
+    for _ in range(0, iter_max - (NUM_BUFFERS - 1)):
+        read_slot = consume_k % nbuf
+        next_slot = (consume_k + 1) % nbuf
+        write_slot = load_k % nbuf
         acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_left, bs_left, DTYPE_B, acc_tl)
-        _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        a_bot = a_bot_buf.index(0).load(layout=dot_a)
+        _wait_mxfp_scale_pipeline(steady_wait, ASYNC_COPY_SCALE)
+        a_bot = a_bot_buf.index(read_slot).load(layout=dot_a)
         if WITH_A_SCALE:
-            as_bot = _load_mxfp_scale(as_bot_buf, 0, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
+            as_bot = _load_mxfp_scale(as_bot_buf, read_slot, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
                                       PRESHUFFLE_FACTOR, SCALE_KWIDTH)
         else:
             as_bot = as_top
-        tdm.async_load(b_left_desc, [0, load_k * BK_B], b_left_buf.index(0))
-        _issue_mxfp_scale_load(bs_left_desc, bs_left_ptrs, load_k, bs_left_buf, 0, BK_SCALE_PRESHUFFLED,
+        tdm.async_load(b_left_desc, [0, load_k * BK_B], b_left_buf.index(write_slot))
+        _issue_mxfp_scale_load(bs_left_desc, bs_left_ptrs, load_k, bs_left_buf, write_slot, BK_SCALE_PRESHUFFLED,
                                ASYNC_COPY_SCALE)
 
         acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_left, bs_left, DTYPE_B, acc_bl)
-        _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        b_right = b_right_buf.index(0).permute([1, 0]).load(layout=dot_b)
-        bs_right = _load_mxfp_scale(bs_right_buf, 0, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
+        _wait_mxfp_scale_pipeline(steady_wait, ASYNC_COPY_SCALE)
+        b_right = b_right_buf.index(read_slot).permute([1, 0]).load(layout=dot_b)
+        bs_right = _load_mxfp_scale(bs_right_buf, read_slot, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
                                     PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-        tdm.async_load(a_top_desc, [0, load_k * BK_A], a_top_buf.index(0))
+        tdm.async_load(a_top_desc, [0, load_k * BK_A], a_top_buf.index(write_slot))
         if WITH_A_SCALE:
-            _issue_mxfp_scale_load(as_top_desc, as_top_ptrs, load_k, as_top_buf, 0, BK_SCALE_PRESHUFFLED,
+            _issue_mxfp_scale_load(as_top_desc, as_top_ptrs, load_k, as_top_buf, write_slot, BK_SCALE_PRESHUFFLED,
                                    ASYNC_COPY_SCALE)
 
         acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_right, bs_right, DTYPE_B, acc_tr)
-        _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        b_left = b_left_buf.index(1).permute([1, 0]).load(layout=dot_b)
-        bs_left = _load_mxfp_scale(bs_left_buf, 1, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
+        _wait_mxfp_scale_pipeline(steady_wait, ASYNC_COPY_SCALE)
+        b_left = b_left_buf.index(next_slot).permute([1, 0]).load(layout=dot_b)
+        bs_left = _load_mxfp_scale(bs_left_buf, next_slot, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
                                    PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-        tdm.async_load(a_bot_desc, [0, load_k * BK_A], a_bot_buf.index(0))
+        tdm.async_load(a_bot_desc, [0, load_k * BK_A], a_bot_buf.index(write_slot))
         if WITH_A_SCALE:
-            _issue_mxfp_scale_load(as_bot_desc, as_bot_ptrs, load_k, as_bot_buf, 0, BK_SCALE_PRESHUFFLED,
+            _issue_mxfp_scale_load(as_bot_desc, as_bot_ptrs, load_k, as_bot_buf, write_slot, BK_SCALE_PRESHUFFLED,
                                    ASYNC_COPY_SCALE)
 
         acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_right, bs_right, DTYPE_B, acc_br)
-        _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        a_top = a_top_buf.index(1).load(layout=dot_a)
+        _wait_mxfp_scale_pipeline(steady_wait, ASYNC_COPY_SCALE)
+        a_top = a_top_buf.index(next_slot).load(layout=dot_a)
         if WITH_A_SCALE:
-            as_top = _load_mxfp_scale(as_top_buf, 1, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
+            as_top = _load_mxfp_scale(as_top_buf, next_slot, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
                                       PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-        tdm.async_load(b_right_desc, [0, load_k * BK_B], b_right_buf.index(0))
-        _issue_mxfp_scale_load(bs_right_desc, bs_right_ptrs, load_k, bs_right_buf, 0, BK_SCALE_PRESHUFFLED,
+        tdm.async_load(b_right_desc, [0, load_k * BK_B], b_right_buf.index(write_slot))
+        _issue_mxfp_scale_load(bs_right_desc, bs_right_ptrs, load_k, bs_right_buf, write_slot, BK_SCALE_PRESHUFFLED,
                                ASYNC_COPY_SCALE)
-
+        consume_k += 1
         load_k += 1
+
+    # Drain the prefetched K tiles using the same quadrant order.
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        read_slot = (iter_max - (NUM_BUFFERS - 1 - i)) % nbuf
         acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_left, bs_left, DTYPE_B, acc_tl)
-        _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        a_bot = a_bot_buf.index(1).load(layout=dot_a)
+        if i < NUM_BUFFERS - 2:
+            _wait_mxfp_scale_pipeline((NUM_BUFFERS - 2 - i) * wait_unit - 3, ASYNC_COPY_SCALE)
+        else:
+            _wait_mxfp_scale_pipeline(1, ASYNC_COPY_SCALE)
+        a_bot = a_bot_buf.index(read_slot).load(layout=dot_a)
         if WITH_A_SCALE:
-            as_bot = _load_mxfp_scale(as_bot_buf, 1, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
+            as_bot = _load_mxfp_scale(as_bot_buf, read_slot, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
                                       PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-        tdm.async_load(b_left_desc, [0, load_k * BK_B], b_left_buf.index(1))
-        _issue_mxfp_scale_load(bs_left_desc, bs_left_ptrs, load_k, bs_left_buf, 1, BK_SCALE_PRESHUFFLED,
-                               ASYNC_COPY_SCALE)
-
+        else:
+            as_bot = as_top
         acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_left, bs_left, DTYPE_B, acc_bl)
-        _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        b_right = b_right_buf.index(1).permute([1, 0]).load(layout=dot_b)
-        bs_right = _load_mxfp_scale(bs_right_buf, 1, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
+        if i < NUM_BUFFERS - 2:
+            _wait_mxfp_scale_pipeline((NUM_BUFFERS - 2 - i) * wait_unit - 4, ASYNC_COPY_SCALE)
+        else:
+            _wait_mxfp_scale_pipeline(0, ASYNC_COPY_SCALE)
+        b_right = b_right_buf.index(read_slot).permute([1, 0]).load(layout=dot_b)
+        bs_right = _load_mxfp_scale(bs_right_buf, read_slot, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
                                     PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-        tdm.async_load(a_top_desc, [0, load_k * BK_A], a_top_buf.index(1))
-        if WITH_A_SCALE:
-            _issue_mxfp_scale_load(as_top_desc, as_top_ptrs, load_k, as_top_buf, 1, BK_SCALE_PRESHUFFLED,
-                                   ASYNC_COPY_SCALE)
-
         acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_right, bs_right, DTYPE_B, acc_tr)
-        _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
-        bs_left = _load_mxfp_scale(bs_left_buf, 0, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
-                                   PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-        tdm.async_load(a_bot_desc, [0, load_k * BK_A], a_bot_buf.index(1))
-        if WITH_A_SCALE:
-            _issue_mxfp_scale_load(as_bot_desc, as_bot_ptrs, load_k, as_bot_buf, 1, BK_SCALE_PRESHUFFLED,
-                                   ASYNC_COPY_SCALE)
-
-        acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_right, bs_right, DTYPE_B, acc_br)
-        _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-        a_top = a_top_buf.index(0).load(layout=dot_a)
-        if WITH_A_SCALE:
-            as_top = _load_mxfp_scale(as_top_buf, 0, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
-                                      PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-        tdm.async_load(b_right_desc, [0, load_k * BK_B], b_right_buf.index(1))
-        _issue_mxfp_scale_load(bs_right_desc, bs_right_ptrs, load_k, bs_right_buf, 1, BK_SCALE_PRESHUFFLED,
-                               ASYNC_COPY_SCALE)
-        load_k += 1
-
-    # Drain the last two prefetched K tiles using the same quadrant order.
-    acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_left, bs_left, DTYPE_B, acc_tl)
-    _wait_mxfp_scale_pipeline(wait_unit - 3, ASYNC_COPY_SCALE)
-    l_idx = (iter_max - 2) % 2
-    a_bot = a_bot_buf.index(l_idx).load(layout=dot_a)
-    if WITH_A_SCALE:
-        as_bot = _load_mxfp_scale(as_bot_buf, l_idx, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
-                                  PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-    else:
-        as_bot = as_top
-    acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_left, bs_left, DTYPE_B, acc_bl)
-    _wait_mxfp_scale_pipeline(wait_unit - 4, ASYNC_COPY_SCALE)
-    b_right = b_right_buf.index(l_idx).permute([1, 0]).load(layout=dot_b)
-    bs_right = _load_mxfp_scale(bs_right_buf, l_idx, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
-                                PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-    acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_right, bs_right, DTYPE_B, acc_tr)
-    _wait_mxfp_scale_pipeline(wait_unit - 5, ASYNC_COPY_SCALE)
-    g_idx = 1 - l_idx
-    b_left = b_left_buf.index(g_idx).permute([1, 0]).load(layout=dot_b)
-    bs_left = _load_mxfp_scale(bs_left_buf, g_idx, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
-                               PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-    acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_right, bs_right, DTYPE_B, acc_br)
-    _wait_mxfp_scale_pipeline(wait_unit - 6, ASYNC_COPY_SCALE)
-    a_top = a_top_buf.index(g_idx).load(layout=dot_a)
-    if WITH_A_SCALE:
-        as_top = _load_mxfp_scale(as_top_buf, g_idx, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
-                                  PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-
-    acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_left, bs_left, DTYPE_B, acc_tl)
-    _wait_mxfp_scale_pipeline(1, ASYNC_COPY_SCALE)
-    a_bot = a_bot_buf.index(g_idx).load(layout=dot_a)
-    if WITH_A_SCALE:
-        as_bot = _load_mxfp_scale(as_bot_buf, g_idx, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
-                                  PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-    else:
-        as_bot = as_top
-    acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_left, bs_left, DTYPE_B, acc_bl)
-    _wait_mxfp_scale_pipeline(0, ASYNC_COPY_SCALE)
-    b_right = b_right_buf.index(g_idx).permute([1, 0]).load(layout=dot_b)
-    bs_right = _load_mxfp_scale(bs_right_buf, g_idx, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
-                                PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-    acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_right, bs_right, DTYPE_B, acc_tr)
-    acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_right, bs_right, DTYPE_B, acc_br)
+        if i < NUM_BUFFERS - 2:
+            next_slot = (iter_max - (NUM_BUFFERS - 1 - i) + 1) % nbuf
+            _wait_mxfp_scale_pipeline((NUM_BUFFERS - 2 - i) * wait_unit - 5, ASYNC_COPY_SCALE)
+            b_left = b_left_buf.index(next_slot).permute([1, 0]).load(layout=dot_b)
+            bs_left = _load_mxfp_scale(bs_left_buf, next_slot, scale_b_layout, HALF_N, BK_SCALE, SCALE_PRESHUFFLE,
+                                       PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_right, bs_right, DTYPE_B, acc_br)
+            _wait_mxfp_scale_pipeline((NUM_BUFFERS - 2 - i) * wait_unit - 6, ASYNC_COPY_SCALE)
+            a_top = a_top_buf.index(next_slot).load(layout=dot_a)
+            if WITH_A_SCALE:
+                as_top = _load_mxfp_scale(as_top_buf, next_slot, scale_a_layout, HALF_M, BK_SCALE, SCALE_PRESHUFFLE,
+                                          PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        else:
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_right, bs_right, DTYPE_B, acc_br)
 
     _store_quadrants(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc_tl, acc_bl, acc_tr, acc_br, store_layout,
                      BLOCK_M, BLOCK_N)
