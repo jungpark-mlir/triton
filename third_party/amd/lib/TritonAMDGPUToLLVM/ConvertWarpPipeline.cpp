@@ -24,13 +24,18 @@
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
+#include "third_party/amd/include/Analysis/RangeAnalysis.h"
+#include "triton/Analysis/BufferIndexAnalysis.h"
+#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -39,6 +44,8 @@
 #include "triton/Analysis/Membar.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+
+#include <optional>
 
 #define DEBUG_TYPE "convert-warp-pipeline"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -53,12 +60,251 @@ namespace mlir::triton {
 
 namespace {
 
+static bool allValuesStable(Value) { return true; }
+
+static Value resolveExecuteRegionResult(Value value) {
+  llvm::SmallPtrSet<Value, 8> seen;
+  while (seen.insert(value).second) {
+    auto result = dyn_cast<OpResult>(value);
+    if (!result)
+      break;
+    auto exec = dyn_cast<scf::ExecuteRegionOp>(result.getOwner());
+    if (!exec || !llvm::hasSingleElement(exec.getRegion()))
+      break;
+    auto yield =
+        dyn_cast<scf::YieldOp>(exec.getRegion().front().getTerminator());
+    if (!yield || result.getResultNumber() >= yield.getNumOperands())
+      break;
+    value = yield.getOperand(result.getResultNumber());
+  }
+  return value;
+}
+
+struct AffineValue {
+  Value base;
+  int64_t offset;
+};
+
+static std::optional<int64_t> getConstantInt(Value value) {
+  APInt constant;
+  if (matchPattern(resolveExecuteRegionResult(value), m_ConstantInt(&constant)))
+    return constant.getSExtValue();
+  return std::nullopt;
+}
+
+static std::optional<ConstantIntRanges>
+getInferredRange(const DataFlowSolver &solver, Value value) {
+  auto ranges = triton::AMD::collectRanges(solver, ValueRange{value});
+  if (!ranges || ranges->empty() || !ranges->front())
+    return std::nullopt;
+  return *ranges->front();
+}
+
+static bool isSignedAddNoOverflow(const DataFlowSolver &solver, Value value,
+                                  int64_t constant) {
+  if (constant == 0)
+    return true;
+  auto range = getInferredRange(solver, value);
+  if (!range)
+    return false;
+
+  unsigned width = ConstantIntRanges::getStorageBitwidth(value.getType());
+  APInt offset(width, constant, /*isSigned=*/true);
+  bool minOverflows, maxOverflows;
+  (void)range->smin().sadd_ov(offset, minOverflows);
+  (void)range->smax().sadd_ov(offset, maxOverflows);
+  return !minOverflows && !maxOverflows;
+}
+
+static std::optional<AffineValue>
+decomposeAffineValue(Value value, const DataFlowSolver &rangeSolver) {
+  value = resolveExecuteRegionResult(value);
+  if (auto constant = getConstantInt(value))
+    return AffineValue{Value(), *constant};
+
+  auto add = value.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return AffineValue{value, 0};
+
+  Value base = add.getLhs();
+  auto constant = getConstantInt(add.getRhs());
+  if (!constant) {
+    base = add.getRhs();
+    constant = getConstantInt(add.getLhs());
+  }
+  if (!constant)
+    return AffineValue{value, 0};
+  if (!isSignedAddNoOverflow(rangeSolver, base, *constant))
+    return AffineValue{value, 0};
+
+  auto decomposedBase = decomposeAffineValue(base, rangeSolver);
+  if (!decomposedBase)
+    return std::nullopt;
+  int64_t offset;
+  if (__builtin_add_overflow(decomposedBase->offset, *constant, &offset))
+    return std::nullopt;
+  return AffineValue{decomposedBase->base, offset};
+}
+
+static std::optional<int64_t>
+matchCounterStep(BlockArgument iterArg, Value yielded,
+                 const DataFlowSolver &rangeSolver) {
+  yielded = resolveExecuteRegionResult(yielded);
+  if (yielded == iterArg)
+    return 0;
+
+  auto add = yielded.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return std::nullopt;
+  std::optional<int64_t> step;
+  if (resolveExecuteRegionResult(add.getLhs()) == iterArg)
+    step = getConstantInt(add.getRhs());
+  else if (resolveExecuteRegionResult(add.getRhs()) == iterArg)
+    step = getConstantInt(add.getLhs());
+  if (!step || !isSignedAddNoOverflow(rangeSolver, iterArg, *step))
+    return std::nullopt;
+  return step;
+}
+
+struct WarpPipelineCounterRelation {
+  BlockArgument value;
+  BlockArgument canonical;
+  int64_t currentOffset;
+  int64_t step;
+};
+
+// Prove lockstep relationships between integer iter-args. If two counters
+// start from the same affine base with a constant difference and each yields
+// itself plus the same constant step, that difference is invariant. Express
+// both through one canonical block argument so slot disjointness can compare
+// their offsets directly.
+//
+// Soundness policy:
+//   1. Range analysis must prove every matched add cannot signed-wrap.
+//   2. llvm.assume (including lowered tl.assume) may refine those ranges.
+//   3. If a proof is unavailable, leave the counter unrelated and retain the
+//      conservative barrier.
+static SmallVector<WarpPipelineCounterRelation>
+inferWarpPipelineCounterRelations(scf::ForOp forOp,
+                                  const DataFlowSolver &rangeSolver) {
+  struct Candidate {
+    BlockArgument value;
+    Type type;
+    Value initialBase;
+    int64_t initialOffset;
+    int64_t step;
+  };
+
+  SmallVector<Candidate> candidates;
+  for (auto [index, iterArg] : llvm::enumerate(forOp.getRegionIterArgs())) {
+    if (!iterArg.getType().isIntOrIndex())
+      continue;
+    auto initial =
+        decomposeAffineValue(forOp.getInitArgs()[index], rangeSolver);
+    auto step = matchCounterStep(iterArg, forOp.getYieldedValues()[index],
+                                 rangeSolver);
+    if (!initial || !step)
+      continue;
+    candidates.push_back(Candidate{iterArg, iterArg.getType(), initial->base,
+                                   initial->offset, *step});
+  }
+
+  SmallVector<WarpPipelineCounterRelation> relations;
+  for (auto [index, candidate] : llvm::enumerate(candidates)) {
+    const Candidate *canonical = &candidate;
+    for (const Candidate &prior :
+         ArrayRef<Candidate>(candidates).take_front(index)) {
+      if (prior.type == candidate.type &&
+          prior.initialBase == candidate.initialBase &&
+          prior.step == candidate.step) {
+        canonical = &prior;
+        break;
+      }
+    }
+
+    int64_t offset;
+    if (__builtin_sub_overflow(candidate.initialOffset,
+                               canonical->initialOffset, &offset))
+      continue;
+    relations.push_back(WarpPipelineCounterRelation{
+        candidate.value, canonical->value, offset, candidate.step});
+  }
+  return relations;
+}
+
+static const WarpPipelineCounterRelation *
+findCounterRelation(Value value,
+                    ArrayRef<WarpPipelineCounterRelation> relations) {
+  auto it = llvm::find_if(relations, [&](const auto &relation) {
+    return relation.value == value;
+  });
+  return it == relations.end() ? nullptr : &*it;
+}
+
+static std::optional<BufferIndexValueSubstitution>
+getWarpPipelineValueSubstitution(
+    Value value, scf::ForOp forOp,
+    ArrayRef<WarpPipelineCounterRelation> counterRelations,
+    bool nextIteration) {
+  if (forOp) {
+    if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+      if (blockArg.getOwner() == forOp.getBody() &&
+          blockArg.getArgNumber() > 0) {
+        if (auto *relation =
+                findCounterRelation(blockArg, counterRelations)) {
+          int64_t offset = relation->currentOffset;
+          if (nextIteration &&
+              __builtin_add_overflow(offset, relation->step, &offset))
+            return std::nullopt;
+          if (nextIteration || relation->canonical != blockArg ||
+              offset != 0)
+            return BufferIndexValueSubstitution{
+                relation->canonical, /*stopAfterReplacement=*/true, offset};
+        }
+
+        if (!nextIteration)
+          return std::nullopt;
+        unsigned iterArgIdx = blockArg.getArgNumber() - 1;
+        ValueRange yieldedValues = forOp.getYieldedValues();
+        if (iterArgIdx < yieldedValues.size()) {
+          Value replacement =
+              resolveExecuteRegionResult(yieldedValues[iterArgIdx]);
+          return BufferIndexValueSubstitution{
+              replacement, /*stopAfterReplacement=*/true};
+        }
+      }
+    }
+  }
+
+  Value replacement = resolveExecuteRegionResult(value);
+  if (replacement != value)
+    return BufferIndexValueSubstitution{replacement,
+                                        /*stopAfterReplacement=*/false};
+  return std::nullopt;
+}
+
+static bool isStableAcrossLoopIteration(Value value, scf::ForOp forOp) {
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    if (blockArg.getOwner() == forOp.getBody())
+      return false;
+    Operation *parentOp = blockArg.getOwner()->getParentOp();
+    return !parentOp || !forOp->isAncestor(parentOp);
+  }
+  Operation *def = value.getDefiningOp();
+  return !def || !forOp->isAncestor(def);
+}
+
 // Construct a virtual block describing a pipeline cluster's buffer R/W set.
 // Walks recursively so that LDS effects inside nested non-loop regions
 // (scf.if / tt.reduce / tt.scan / etc.) are accounted for.  Loops (scf.for /
 // scf.while) cannot legally appear inside a cluster, so this walk never has
 // to reason about iteration-multiplied effects.
-static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
+static BlockInfo
+buildBlockInfoFromBlock(Block *block, Allocation *allocation,
+                        BufferIndexAnalysis *bufferIndexAnalysis,
+                        BufferIndexAnalysis::ValueSubstitutionFn
+                            valueSubstitution,
+                        BufferIndexAnalysis::ValueStabilityFn isStable) {
   BlockInfo info;
   block->walk([&](MemoryEffectOpInterface mei) {
     Operation *op = mei.getOperation();
@@ -72,7 +318,10 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
         if (bufId == Allocation::InvalidBufferId)
           continue;
         auto interval = allocation->getAllocatedInterval(bufId);
-        auto slice = AllocationSlice(v, interval, bufId);
+        auto slice = bufferIndexAnalysis
+                         ? bufferIndexAnalysis->makeSliceWithValueSubstitution(
+                               v, interval, bufId, valueSubstitution, isStable)
+                         : AllocationSlice(v, interval, bufId);
         if (isa<MemoryEffects::Write>(eff.getEffect()))
           info.syncWriteSlices[slice].insert(op);
         else if (isa<MemoryEffects::Read>(eff.getEffect()))
@@ -81,6 +330,20 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
     }
   });
   return info;
+}
+
+// RAW dependencies are completed by backend fine-grained waits. Warp-pipeline
+// cluster barriers only need to cover WAR and WAW hazards.
+static bool ignoreWarpPipelineRaw(
+    const AllocationSlice &, const AllocationSlice &, bool lhsIsRead,
+    bool rhsIsRead, Allocation *) {
+  return !lhsIsRead && rhsIsRead;
+}
+
+static bool hasWarpPipelineHazard(const BlockInfo &src, const BlockInfo &dst,
+                                  Allocation *allocation) {
+  return src.isIntersected(dst, mlir::triton::AMD::membarFilter, allocation,
+                           ignoreWarpPipelineRaw);
 }
 
 // Pre-existing barrier/wait ops that may legally appear at cluster
@@ -172,10 +435,10 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
 //
 // GOAL
 // ----
-//   For every ordered pair (src, dst) whose LDS effects intersect, guarantee
-//   that the schedule has at least one LOCAL (ds_wait + s_barrier) barrier
-//   somewhere on the path src → dst.  If no existing slot on the path is
-//   LOCAL, mark one as LOCAL.
+//   For every ordered pair (src, dst) with an intersecting LDS WAR or WAW
+//   hazard, guarantee that the schedule has at least one LOCAL barrier
+//   somewhere on the path src → dst. RAW completion is delegated to backend
+//   fine-grained waits and therefore does not make a slot LOCAL.
 //
 // PLACEMENT CHOICE
 // ----------------
@@ -197,17 +460,18 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
 // ---------------
 //   We sweep `dist` from 1 up to `maxDist`:
 //     * circular: maxDist = N.  dist == N is the self-loop (src == dst),
-//       which captures iter-i write vs iter-(i+1) read across the
-//       wrap-around when only one cluster touches the buffer.
+//       which captures loop-carried WAR/WAW hazards when only one cluster
+//       touches the buffer.
 //     * linear:   maxDist = N - 1.  No wrap.
 //   Walking by increasing distance ensures the shorter-range LOCAL
 //   barriers we just placed are visible when checking longer-range pairs,
 //   skipping many redundant placements.
-static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
-                                        SmallVectorImpl<bool> &bars,
-                                        Allocation *allocation, bool circular) {
+static void analyzePipelineDependencies(
+    ArrayRef<BlockInfo> clusterInfo, ArrayRef<BlockInfo> nextIterationClusterInfo,
+    SmallVectorImpl<bool> &bars, Allocation *allocation, bool circular) {
   const int N = clusterInfo.size();
   const int maxDist = circular ? N : N - 1;
+  assert(!circular || nextIterationClusterInfo.size() == clusterInfo.size());
 
   // Modular wrap; a no-op in linear mode where indices stay in range.
   auto wrap = [&](int i) -> int { return circular ? (i % N + N) % N : i; };
@@ -235,8 +499,10 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
       const int barrierLoc = (dist == 1) ? dst : wrap(dst - 1);
       if (isCovered(src, barrierLoc))
         continue;
-      if (!clusterInfo[src].isIntersected(
-              clusterInfo[dst], mlir::triton::AMD::membarFilter, allocation))
+      bool crossesIteration = circular && src + dist >= N;
+      const BlockInfo &dstInfo =
+          crossesIteration ? nextIterationClusterInfo[dst] : clusterInfo[dst];
+      if (!hasWarpPipelineHazard(clusterInfo[src], dstInfo, allocation))
         continue;
       bars[barrierLoc] = true;
       LDBG("cluster " << src << " need fence to " << dst
@@ -316,10 +582,12 @@ static void emitPipelinePostlude(OpBuilder &b, Location loc,
 class ConvertPipelinedForPattern : public OpRewritePattern<scf::ForOp> {
 public:
   ConvertPipelinedForPattern(MLIRContext *ctx, ModuleAllocation &moduleAlloc,
-                             int threadsPerPipelineGroup)
+                             int threadsPerPipelineGroup,
+                             const DataFlowSolver &rangeSolver)
       : OpRewritePattern<scf::ForOp>(ctx, /*benefit=*/2),
         moduleAllocation(moduleAlloc),
-        threadsPerPipelineGroup(threadsPerPipelineGroup) {}
+        threadsPerPipelineGroup(threadsPerPipelineGroup),
+        rangeSolver(rangeSolver) {}
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
                                 PatternRewriter &rewriter) const override {
@@ -334,17 +602,19 @@ public:
     Allocation *allocation = moduleAllocation.getFuncData(func);
     if (!allocation)
       return rewriter.notifyMatchFailure(forOp, "no Allocation for function");
+    BufferIndexAnalysis bufferIndexAnalysis(func);
 
     forOp->removeAttr("triton.warp_pipeline.pipelined_for");
     emitPipelinedFor(rewriter, forOp.getLoc(), forOp, allocation,
-                     threadsPerPipelineGroup);
+                     threadsPerPipelineGroup, &bufferIndexAnalysis);
     return success();
   }
 
 private:
   void emitPipelinedFor(PatternRewriter &b, Location loc, scf::ForOp forOp,
                         Allocation *allocation,
-                        int threadsPerPipelineGroup) const {
+                        int threadsPerPipelineGroup,
+                        BufferIndexAnalysis *bufferIndexAnalysis) const {
     // 1. Pre-barrier, thread partitioning, and phase shift.
     b.setInsertionPoint(forOp);
     auto [warpLow, warpHigh] =
@@ -371,9 +641,29 @@ private:
       }
     }
 
+    auto counterRelations =
+        inferWarpPipelineCounterRelations(forOp, rangeSolver);
+    auto sameIterationSubstitution = [&](Value value) {
+      return getWarpPipelineValueSubstitution(
+          value, forOp, counterRelations, /*nextIteration=*/false);
+    };
+    auto nextIterationSubstitution = [&](Value value) {
+      return getWarpPipelineValueSubstitution(
+          value, forOp, counterRelations, /*nextIteration=*/true);
+    };
+    auto nextIterationStability = [&](Value value) {
+      return isStableAcrossLoopIteration(value, forOp);
+    };
     SmallVector<BlockInfo> clusterInfo;
-    for (auto cb : clusterBlocks)
-      clusterInfo.push_back(buildBlockInfoFromBlock(cb, allocation));
+    SmallVector<BlockInfo> nextIterationClusterInfo;
+    for (auto cb : clusterBlocks) {
+      clusterInfo.push_back(buildBlockInfoFromBlock(
+          cb, allocation, bufferIndexAnalysis, sameIterationSubstitution,
+          allValuesStable));
+      nextIterationClusterInfo.push_back(buildBlockInfoFromBlock(
+          cb, allocation, bufferIndexAnalysis, nextIterationSubstitution,
+          nextIterationStability));
+    }
     int numClusters = clusterInfo.size();
 
     // Check if any cluster has explicit priority.
@@ -397,7 +687,8 @@ private:
     }
 
     // 3. Circular dependency analysis (wrap-around for loop pipelines).
-    analyzePipelineDependencies(clusterInfo, bars, allocation,
+    analyzePipelineDependencies(clusterInfo, nextIterationClusterInfo, bars,
+                                allocation,
                                 /*circular=*/true);
 
     // 4. Materializing final cluster-scope barriers.  For each cluster index:
@@ -447,6 +738,7 @@ private:
 
   ModuleAllocation &moduleAllocation;
   int threadsPerPipelineGroup;
+  const DataFlowSolver &rangeSolver;
 };
 
 class InlineWarpPipelineExecuteRegionPattern
@@ -516,7 +808,8 @@ public:
 //
 static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
                               Allocation *allocation,
-                              int threadsPerPipelineGroup) {
+                              int threadsPerPipelineGroup,
+                              BufferIndexAnalysis *bufferIndexAnalysis) {
   Location loc = clusterOps.front().getLoc();
   OpBuilder b(clusterOps.front().getContext());
   int numClusters = clusterOps.size();
@@ -535,16 +828,24 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     clusterBlocks.push_back(&exec->getRegion(0).front());
   }
 
+  auto sameIterationSubstitution = [](Value value) {
+    return getWarpPipelineValueSubstitution(
+        value, scf::ForOp(), /*counterRelations=*/{},
+        /*nextIteration=*/false);
+  };
   SmallVector<BlockInfo> clusterInfo;
   for (auto *cb : clusterBlocks)
-    clusterInfo.push_back(buildBlockInfoFromBlock(cb, allocation));
+    clusterInfo.push_back(buildBlockInfoFromBlock(
+        cb, allocation, bufferIndexAnalysis, sameIterationSubstitution,
+        allValuesStable));
 
   bool anyHasPriority = llvm::any_of(clusterOps, [](scf::ExecuteRegionOp op) {
     return op->hasAttr("triton.warp_pipeline.priority");
   });
 
   // 3. Linear dependency analysis (no wrap-around for flat pipelines).
-  analyzePipelineDependencies(clusterInfo, bars, allocation,
+  analyzePipelineDependencies(clusterInfo, /*nextIterationClusterInfo=*/{}, bars,
+                              allocation,
                               /*circular=*/false);
 
   // 4. Materialize cluster barriers.
@@ -592,6 +893,7 @@ static void processUnrolledPipelineRegions(ModuleOp m,
     Allocation *allocation = moduleAllocation.getFuncData(funcOp);
     if (!allocation)
       return;
+    BufferIndexAnalysis bufferIndexAnalysis(funcOp);
 
     // NOTE: We only iterate the function's top-level blocks; flat-pipeline
     // execute_regions inside nested non-loop regions (e.g. scf.if bodies)
@@ -622,7 +924,8 @@ static void processUnrolledPipelineRegions(ModuleOp m,
         if (seq.size() < 2)
           continue;
         LDBG("processing flat pipeline with " << seq.size() << " stages");
-        emitPipelinedFlat(seq, allocation, threadsPerPipelineGroup);
+        emitPipelinedFlat(seq, allocation, threadsPerPipelineGroup,
+                          &bufferIndexAnalysis);
       }
     }
   });
@@ -755,14 +1058,10 @@ static bool collectNextPipelineClusters(Operation *startOp,
 //   sidesteps the ambiguity entirely.
 //
 // Cross-warp concurrency vs intra-warp ordering:
-//   With a one-stage phase offset the only truly concurrent cross-warp
-//   pair at the boundary is (a_{K-1}, b_0).  All other (a_i, b_j) pairs
-//   execute sequentially within a single warp.  Both kinds, however,
-//   require a LOCAL barrier on AMD: the concurrent pair needs cross-warp
-//   sync, and the sequential pair needs ds_wait to order async ds_read /
-//   ds_write within a warp (pre-existing async_tdm_wait does *not*
-//   guarantee ds completion ordering in general).  So the coverage check
-//   uses LOCAL-only mergedBars uniformly across all pairs.
+//   With a one-stage phase offset the only truly concurrent cross-warp pair
+//   at the boundary is (a_{K-1}, b_0). All cross-pipeline pairs are checked for
+//   WAR/WAW hazards and require LOCAL coverage when they intersect. RAW
+//   completion is delegated to backend fine-grained waits.
 //
 // Layout of mergedBars (linear, LOCAL-only):
 //   i < K      A's internal LOCAL barriers (loopBars[i]).
@@ -777,17 +1076,27 @@ static bool isCrossPipelineSafe(ArrayRef<Block *> loopBlocks,
                                 ArrayRef<bool> loopBars,
                                 ArrayRef<Block *> nextBlocks,
                                 ArrayRef<bool> nextBars,
-                                Allocation *allocation) {
+                                Allocation *allocation,
+                                BufferIndexAnalysis *bufferIndexAnalysis) {
   int K = loopBlocks.size();
   int M = nextBlocks.size();
   assert(!loopBars.empty() &&
          "expected at least one cluster in the prior loop");
 
+  auto sameIterationSubstitution = [](Value value) {
+    return getWarpPipelineValueSubstitution(
+        value, scf::ForOp(), /*counterRelations=*/{},
+        /*nextIteration=*/false);
+  };
   SmallVector<BlockInfo> mergedInfo;
   for (auto *b : loopBlocks)
-    mergedInfo.push_back(buildBlockInfoFromBlock(b, allocation));
+    mergedInfo.push_back(buildBlockInfoFromBlock(
+        b, allocation, bufferIndexAnalysis, sameIterationSubstitution,
+        allValuesStable));
   for (auto *b : nextBlocks)
-    mergedInfo.push_back(buildBlockInfoFromBlock(b, allocation));
+    mergedInfo.push_back(buildBlockInfoFromBlock(
+        b, allocation, bufferIndexAnalysis, sameIterationSubstitution,
+        allValuesStable));
 
   SmallVector<bool> mergedBars;
   mergedBars.reserve(K + M);
@@ -814,8 +1123,7 @@ static bool isCrossPipelineSafe(ArrayRef<Block *> loopBlocks,
       int barrierLoc = (dist == 1) ? dst : dst - 1;
       if (isCovered(src, barrierLoc))
         continue;
-      if (!mergedInfo[src].isIntersected(
-              mergedInfo[dst], mlir::triton::AMD::membarFilter, allocation))
+      if (!hasWarpPipelineHazard(mergedInfo[src], mergedInfo[dst], allocation))
         continue;
       LDBG("cross-pipeline LDS dep (a_"
            << i << ", b_" << j << ") uncovered at slot " << barrierLoc);
@@ -867,6 +1175,7 @@ static void eliminateRedundantCondBarriers(ModuleOp m,
     Allocation *allocation = moduleAllocation.getFuncData(funcOp);
     if (!allocation)
       return;
+    BufferIndexAnalysis bufferIndexAnalysis(funcOp);
 
     for (Block &block : funcOp.getBody()) {
       SmallVector<triton::amdgpu::CondBarrierOp> condBarriers;
@@ -928,7 +1237,7 @@ static void eliminateRedundantCondBarriers(ModuleOp m,
           continue;
         }
         if (!isCrossPipelineSafe(loopBlocks, loopBars, nextBlocks, nextBars,
-                                 allocation)) {
+                                 allocation, &bufferIndexAnalysis)) {
           LDBG("cross-pipeline LDS dependency at boundary — keeping barriers");
           continue;
         }
@@ -990,10 +1299,22 @@ public:
     if (malformed)
       return signalPassFailure();
 
+    // Lockstep counter normalization is enabled only when the assumption-aware
+    // integer range analysis proves that its affine recurrences cannot wrap.
+    auto assumptions =
+        triton::AMD::TritonIntegerRangeAnalysis::collectAssumptions(m);
+    std::unique_ptr<DataFlowSolver> rangeSolver = createDataFlowSolver();
+    auto *rangeAnalysis =
+        rangeSolver->load<triton::AMD::TritonIntegerRangeAnalysis>(
+            assumptions, &getAnalysis<DominanceInfo>());
+    triton::AMD::initializeFuncOps(m, rangeAnalysis);
+    if (failed(rangeSolver->initializeAndRun(m)))
+      return signalPassFailure();
+
     RewritePatternSet patternFor(&getContext());
     RewritePatternSet patternInline(&getContext());
-    patternFor.add<ConvertPipelinedForPattern>(&getContext(), moduleAllocation,
-                                               threadsPerPipelineGroup);
+    patternFor.add<ConvertPipelinedForPattern>(
+        &getContext(), moduleAllocation, threadsPerPipelineGroup, *rangeSolver);
     patternInline.add<InlineWarpPipelineExecuteRegionPattern>(&getContext());
 
     if (failed(applyPatternsGreedily(m, std::move(patternFor))))

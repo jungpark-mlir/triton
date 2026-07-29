@@ -137,7 +137,8 @@ tt.func @three_stage_backend(%n: index, %ptr0: !tt.ptr<f32>, %ptr1: !tt.ptr<f32>
 // CHECK: tt.dot
 // CHECK: s.barrier
 // CHECK-COUNT-2: local_store
-// CHECK: ttg.barrier local
+// RAW into the following dot is covered by backend waits.
+// CHECK: s.barrier
 // CHECK: tt.dot
 // CHECK: s.barrier
 // CHECK: scf.yield
@@ -450,15 +451,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // ---- Back-to-back: cross-pipeline LDS dep covered by A's wrap-around ----
 //
-// Both loops access the same shared buffer (read + write).  Loop 1's
-// stage1 writes smem and loop 2's stage0 reads it — a cross-pipeline RAW.
+// Both loops access the same shared buffer (read + write). Loop 1's stage1
+// writes smem and loop 2's stage0 reads it, but that cross-pipeline RAW is
+// backend-managed.
 //
-// Loop 1's wrap-around barrier (bars[0]) is LOCAL because of the in-loop
-// RAW between stage1 (write) and the next iteration's stage0 (read).
+// Loop 1's wrap-around barrier (bars[0]) is LOCAL because consecutive
+// iterations both write the same slot (WAW).
 // That barrier physically sits at the bottom of loop 1's body and is the
-// most recent LDS sync after the loop exits, so it already covers the
-// (a1, b0) cross-pipeline dep at the boundary.  The boundary barriers
-// can therefore be eliminated.
+// most recent LDS sync after the loop exits. No additional boundary barrier
+// is needed for the backend-managed RAW.
 //
 // Expected:
 //   ttg.barrier local          (pre-barrier for loop 1)
@@ -501,7 +502,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
       scf.yield %a1, %st1 : tensor<256x256xf32, #b2b_mma>, !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>
     } {triton.warp_pipeline.pipelined_for}
 
-    // Loop 2: same structure — reads+writes the SAME buffer → cross-pipeline RAW
+    // Loop 2: same structure, accessing the same buffer.
     %r2:2 = scf.for %j = %lb to %ub step %step
         iter_args(%a2 = %r1#0, %s2 = %r1#1)
         -> (tensor<256x256xf32, #b2b_mma>, !ttg.memdesc<256x64xf16, #b2b_shared, #b2b_smem, mutable>) : i32 {
@@ -530,11 +531,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK: ttg.barrier local
 // CHECK: amdg.cond_barrier
 // CHECK: scf.for
-// Wrap-around barrier inside loop 1 (LOCAL — covers cross-pipeline dep).
+// Wrap-around barrier inside loop 1 (LOCAL for loop-carried WAW).
 // CHECK: ttg.barrier local
 // CHECK: scf.yield
-// Boundary barriers are eliminated: A's wrap-around already provides the
-// LDS sync needed for loop 2's first read; phase carries over.
+// Boundary barriers are eliminated; the cross-pipeline RAW is backend-managed
+// and the phase carries over.
 // CHECK-NOT: amdg.cond_barrier
 // CHECK-NOT: ttg.barrier local
 // CHECK: scf.for
@@ -890,9 +891,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // stage0 wrote).
 //
 // Loop 2 has 2 stages: stage0 reads the SAME LDS buffer, stage1 is
-// compute-only.  There IS a cross-pipeline dependency (loop1.stage0 writes
-// smem that loop2.stage0 reads), but it is already covered by loop 1's
-// barrier between stage1 and stage2.
+// compute-only. The cross-pipeline RAW from loop1.stage0 to loop2.stage0 is
+// backend-managed, so it does not require a boundary barrier.
 //
 // At the boundary with no barrier: warp0 runs b0, warp1 runs a2.
 // Since a2 has no LDS access and the LOCAL barrier before a2 already
@@ -951,8 +951,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     } {triton.warp_pipeline.pipelined_for}
 
     // Loop 2: stage0 reads the SAME LDS buffer, stage1 is compute-only.
-    // Cross-pipeline dep (a0 writes → b0 reads) is covered by loop 1's
-    // barrier between stage1 and stage2.
+    // Cross-pipeline RAW (a0 writes → b0 reads) is backend-managed.
     %r2:2 = scf.for %j = %lb to %ub step %step
         iter_args(%a2 = %r1#0, %s2 = %r1#1)
         -> (tensor<256x256xf32, #b2bcov_mma>, !ttg.memdesc<256x64xf16, #b2bcov_shared, #b2bcov_smem, mutable>) : i32 {
@@ -980,11 +979,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // CHECK: ttg.barrier local
 // CHECK: amdg.cond_barrier
 // CHECK: scf.for
-// Loop 1 has 3 stages; barrier between stage1→stage2 is LOCAL (covers dep).
+// Loop 1 has 3 stages; barrier between stage1→stage2 covers loop-carried WAR.
 // CHECK: ttg.barrier local
 // CHECK: scf.yield
-// Cross-pipeline dep IS covered by loop 1's internal barrier →
-// boundary barriers eliminated, phase carries over.
+// The cross-pipeline RAW is backend-managed, so boundary barriers are
+// eliminated and the phase carries over.
 // CHECK-NOT: amdg.cond_barrier
 // CHECK-NOT: ttg.barrier local
 // CHECK: scf.for
@@ -994,25 +993,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
-// ---- Adjacent-stage LDS dependency: barrier must be LOCAL ----
+// ---- Adjacent RAW uses backend wait; loop-carried WAR stays LOCAL ----
 //
 // 3-stage loop pipeline where stage0 writes LDS and stage1 reads it.
 // Stage2 has no LDS access.
 //
-// The distance-2+ analysis only checks pairs separated by ≥2 clusters,
-// so it never examines (stage0, stage1) directly.  Without the adjacent-
-// stage check, the barrier between stage0 and stage1 would be emitted as
-// a plain s_barrier, and ModuleMembarAnalysis would later insert a
-// redundant ttg.barrier local inside the pipeline — breaking timing.
-//
-// With the adjacent-stage check:
+// With RAW delegated to backend fine-grained waits:
 //   bars[0] (wrap-around) = false  (a2 no LDS, a0 writes — no conflict)
-//   bars[1] (a0→a1)       = true   (a0 writes, a1 reads — RAW)
+//   bars[1] (a0→a1)       = false  (RAW is backend-managed)
 //   bars[2] (a1→a2)       = true   (a1→a0 WAR via distance-2)
 //
 // Expected inside the loop body:
 //   stage0 ops  (local_store)
-//   ttg.barrier local             (bars[1] — adjacent dep)
+//   rocdl.s.barrier               (bars[1] — RAW is backend-managed)
 //   stage1 ops  (local_load)
 //   ttg.barrier local             (bars[2] — distance-2 dep)
 //   stage2 ops  (global store)
@@ -1075,12 +1068,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Stage 0 ops (local_store).
 // CHECK: ttg.local_store
 //
-// Barrier between stage0→stage1 is LOCAL (adjacent RAW: write→read).
+// Barrier between stage0→stage1 is wave-only; backend waits cover RAW.
 // The per-mem-op barrier (non_mem_non_sideeffect) follows stage 0's store; the
 // cluster barrier (none) is next.
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
-// CHECK-NEXT: ttg.barrier local
+// CHECK-NEXT: rocdl.s.barrier
 // CHECK-NEXT: rocdl.sched.barrier none
 //
 // Stage 1 ops (local_load).
@@ -1322,10 +1315,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 //
 // Stage 0 wraps its ttg.local_store inside an scf.if, so the effect is not
 // visible on the top-level op.  buildBlockInfoFromBlock must walk
-// recursively to discover it; otherwise the cross-cluster RAW (stage0
-// writes, stage1 reads) is missed and the cluster barriers degrade from
-// ttg.barrier local to plain rocdl.s.barrier — leaving the LDS race
-// uncovered.
+// recursively to discover the loop-carried WAR/WAW hazards.
 
 #nest_blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [8, 1], order = [1, 0]}>
 #nest_mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 4], instrShape = [16, 16, 16], isTransposed = true}>
@@ -1376,7 +1366,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Stage 0 with the nested scf.if + local_store.
 // CHECK: scf.if
 // CHECK:   ttg.local_store
-// Cluster barrier between stage 0 and stage 1 is LOCAL (nested write seen).
+// Cluster barrier between stage 0 and stage 1 is LOCAL. Although the adjacent
+// RAW is backend-managed, this slot covers stage0's WAW across iterations.
 // Stage 0's mem ops are nested in the scf.if (not top-level), so there is no
 // per-mem-op barrier here — just the cluster barrier (none).
 // CHECK: rocdl.sched.barrier none
@@ -1387,6 +1378,379 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Wrap-around barrier is also LOCAL (stage1 read vs stage0 write next iter).
 // The per-mem-op barrier (non_mem_non_sideeffect) follows stage 1's load; the
 // cluster barrier (none) is next.
+// CHECK: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: ttg.barrier local
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK: scf.yield
+
+// -----
+
+// ---- Buffer-index disjointness: lockstep loop counters ----
+//
+// `%consume` and `%load` both advance by one and start two apart, so
+// load == consume + 2 is an invariant. With three slots, the read and write
+// stages are disjoint in the current iteration and across the relevant
+// leading/following-warp wrap-around pairs.
+
+#wpidx5_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#wpidx5_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#wpidx5_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @lockstep_iter_args_assumed(
+      %n: i32,
+      %data: tensor<16x16xf16, #wpidx5_blocked>,
+      %out: tensor<16x16x!tt.ptr<f16>, #wpidx5_blocked>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c3 = arith.constant 3 : i32
+    %c17 = arith.constant 17 : i32
+    %nonnegative = arith.cmpi sge, %n, %c0 : i32
+    llvm.intr.assume %nonnegative : i1
+    %bounded = arith.cmpi slt, %n, %c17 : i32
+    llvm.intr.assume %bounded : i1
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+
+    %result:3 = scf.for %i = %c0 to %n step %c1
+        iter_args(%consume = %c0, %load = %c2, %keep = %data)
+        -> (i32, i32, tensor<16x16xf16, #wpidx5_blocked>) : i32 {
+      %loaded = scf.execute_region -> tensor<16x16xf16, #wpidx5_blocked> no_inline {
+        %read_idx = arith.remsi %consume, %c3 : i32
+        %read_slot = ttg.memdesc_index %alloc[%read_idx] : !ttg.memdesc<3x16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+        %value = ttg.local_load %read_slot : !ttg.memdesc<16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable> -> tensor<16x16xf16, #wpidx5_blocked>
+        scf.yield %value : tensor<16x16xf16, #wpidx5_blocked>
+      } {triton.warp_pipeline.stage = "read_consume"}
+
+      scf.execute_region no_inline {
+        %write_idx = arith.remsi %load, %c3 : i32
+        %write_slot = ttg.memdesc_index %alloc[%write_idx] : !ttg.memdesc<3x16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+        ttg.local_store %data, %write_slot : tensor<16x16xf16, #wpidx5_blocked> -> !ttg.memdesc<16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "write_load"}
+
+      %next:2 = scf.execute_region -> (i32, i32) no_inline {
+        %next_consume = arith.addi %consume, %c1 : i32
+        %next_load = arith.addi %load, %c1 : i32
+        scf.yield %next_consume, %next_load : i32, i32
+      } {triton.warp_pipeline.stage = "advance"}
+
+      scf.yield %next#0, %next#1, %loaded : i32, i32, tensor<16x16xf16, #wpidx5_blocked>
+    } {triton.warp_pipeline.pipelined_for}
+
+    tt.store %out, %result#2 : tensor<16x16x!tt.ptr<f16>, #wpidx5_blocked>
+    ttg.local_dealloc %alloc : !ttg.memdesc<3x16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+    tt.return
+  }
+
+  // Without a range bound, the recurrence may signed-wrap. The counters must
+  // remain unrelated and the WAR barrier must be retained.
+  tt.func @lockstep_iter_args_unproven(
+      %n: i32,
+      %data: tensor<16x16xf16, #wpidx5_blocked>,
+      %out: tensor<16x16x!tt.ptr<f16>, #wpidx5_blocked>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c3 = arith.constant 3 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+
+    %result:3 = scf.for %i = %c0 to %n step %c1
+        iter_args(%consume = %c0, %load = %c2, %keep = %data)
+        -> (i32, i32, tensor<16x16xf16, #wpidx5_blocked>) : i32 {
+      %loaded = scf.execute_region -> tensor<16x16xf16, #wpidx5_blocked> no_inline {
+        %read_idx = arith.remsi %consume, %c3 : i32
+        %read_slot = ttg.memdesc_index %alloc[%read_idx] : !ttg.memdesc<3x16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+        %value = ttg.local_load %read_slot : !ttg.memdesc<16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable> -> tensor<16x16xf16, #wpidx5_blocked>
+        scf.yield %value : tensor<16x16xf16, #wpidx5_blocked>
+      } {triton.warp_pipeline.stage = "read_consume"}
+
+      scf.execute_region no_inline {
+        %write_idx = arith.remsi %load, %c3 : i32
+        %write_slot = ttg.memdesc_index %alloc[%write_idx] : !ttg.memdesc<3x16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+        ttg.local_store %data, %write_slot : tensor<16x16xf16, #wpidx5_blocked> -> !ttg.memdesc<16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "write_load"}
+
+      %next:2 = scf.execute_region -> (i32, i32) no_inline {
+        %next_consume = arith.addi %consume, %c1 : i32
+        %next_load = arith.addi %load, %c1 : i32
+        scf.yield %next_consume, %next_load : i32, i32
+      } {triton.warp_pipeline.stage = "advance"}
+
+      scf.yield %next#0, %next#1, %loaded : i32, i32, tensor<16x16xf16, #wpidx5_blocked>
+    } {triton.warp_pipeline.pipelined_for}
+
+    tt.store %out, %result#2 : tensor<16x16x!tt.ptr<f16>, #wpidx5_blocked>
+    ttg.local_dealloc %alloc : !ttg.memdesc<3x16x16xf16, #wpidx5_shared, #wpidx5_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @lockstep_iter_args_assumed
+// CHECK: scf.for
+// CHECK-NOT: ttg.barrier local
+// CHECK: scf.yield
+
+// CHECK-LABEL: tt.func @lockstep_iter_args_unproven
+// CHECK: scf.for
+// CHECK: ttg.local_load
+// CHECK: ttg.barrier local
+// CHECK: scf.yield
+
+// -----
+
+// ---- Next-iteration safety: IV and unsupported loop-local roots ----
+
+#wpidx4_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#wpidx4_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#wpidx4_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // The same-iteration slots are i and i + 1, but stage1(i) aliases stage0
+  // at i + 1. The IV cannot retain the same SSA epoch across the backedge.
+  tt.func @wrap_iv_alias(%n: i32, %out: !tt.ptr<i32>, %data: tensor<16x16xf16, #wpidx4_blocked>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      scf.execute_region no_inline {
+        %slot_idx = arith.remsi %i, %c2 : i32
+        %slot = ttg.memdesc_index %alloc[%slot_idx] : !ttg.memdesc<2x16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+        ttg.local_store %data, %slot : tensor<16x16xf16, #wpidx4_blocked> -> !ttg.memdesc<16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "store_iv"}
+
+      scf.execute_region no_inline {
+        %next_i = arith.addi %i, %c1 : i32
+        %slot_idx = arith.remsi %next_i, %c2 : i32
+        %slot = ttg.memdesc_index %alloc[%slot_idx] : !ttg.memdesc<2x16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+        ttg.local_store %data, %slot : tensor<16x16xf16, #wpidx4_blocked> -> !ttg.memdesc<16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "store_next_iv"}
+
+      scf.execute_region no_inline {
+        tt.store %out, %i : !tt.ptr<i32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "compute"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+    tt.return
+  }
+
+  // `muli` is intentionally outside BufferIndexAnalysis's affine subset.
+  // Its loop-local result must become unknown across the backedge rather than
+  // being reused as though it represented the same dynamic value.
+  tt.func @wrap_unknown_loop_local(%n: i32, %data: tensor<16x16xf16, #wpidx4_blocked>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %root = scf.execute_region -> i32 no_inline {
+        %value = arith.muli %i, %c1 : i32
+        scf.yield %value : i32
+      } {triton.warp_pipeline.stage = "make_unknown"}
+
+      scf.execute_region no_inline {
+        %slot_idx = arith.remsi %root, %c2 : i32
+        %slot = ttg.memdesc_index %alloc[%slot_idx] : !ttg.memdesc<2x16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+        ttg.local_store %data, %slot : tensor<16x16xf16, #wpidx4_blocked> -> !ttg.memdesc<16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "store_unknown"}
+
+      scf.execute_region no_inline {
+        %next = arith.addi %root, %c1 : i32
+        %slot_idx = arith.remsi %next, %c2 : i32
+        %slot = ttg.memdesc_index %alloc[%slot_idx] : !ttg.memdesc<2x16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+        ttg.local_store %data, %slot : tensor<16x16xf16, #wpidx4_blocked> -> !ttg.memdesc<16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "store_unknown_next"}
+
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #wpidx4_shared, #wpidx4_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @wrap_iv_alias
+// CHECK: scf.for
+// Same-iteration WAW is disjoint.
+// CHECK: ttg.local_store
+// CHECK: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier none
+// The next-iteration IV is conservatively unknown, so the cross-iteration
+// hazard remains locally synchronized.
+// CHECK: ttg.local_store
+// CHECK: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: ttg.barrier local
+// CHECK-NEXT: rocdl.sched.barrier none
+
+// CHECK-LABEL: tt.func @wrap_unknown_loop_local
+// CHECK: scf.for
+// CHECK: ttg.local_store
+// CHECK: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK: ttg.local_store
+// CHECK: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: ttg.barrier local
+// CHECK-NEXT: rocdl.sched.barrier none
+
+// -----
+
+// ---- Buffer-index disjointness: flat same-iteration stages ----
+
+#wpidx_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#wpidx_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#wpidx_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @flat_disjoint_buffer_slots(%data: tensor<16x16xf16, #wpidx_blocked>) {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x16x16xf16, #wpidx_shared, #wpidx_smem, mutable>
+    %slot0 = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<2x16x16xf16, #wpidx_shared, #wpidx_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx_shared, #wpidx_smem, mutable>
+    %slot1 = ttg.memdesc_index %alloc[%c1_i32] : !ttg.memdesc<2x16x16xf16, #wpidx_shared, #wpidx_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx_shared, #wpidx_smem, mutable>
+
+    scf.execute_region no_inline {
+      ttg.local_store %data, %slot0 : tensor<16x16xf16, #wpidx_blocked> -> !ttg.memdesc<16x16xf16, #wpidx_shared, #wpidx_smem, mutable>
+      scf.yield
+    } {triton.warp_pipeline.stage = "store_slot0"}
+
+    scf.execute_region no_inline {
+      ttg.local_store %data, %slot1 : tensor<16x16xf16, #wpidx_blocked> -> !ttg.memdesc<16x16xf16, #wpidx_shared, #wpidx_smem, mutable>
+      scf.yield
+    } {triton.warp_pipeline.stage = "store_slot1"}
+
+    ttg.local_dealloc %alloc : !ttg.memdesc<2x16x16xf16, #wpidx_shared, #wpidx_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @flat_disjoint_buffer_slots
+// CHECK: ttg.barrier local
+// CHECK: ttg.local_store
+// Same-iteration store(slot0) -> store(slot1) is disjoint, so the cluster
+// barrier is wave-only.
+// CHECK: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK: ttg.local_store
+// CHECK: tt.return
+
+// -----
+
+// ---- Buffer-index disjointness: circular next-iteration positive ----
+
+#wpidx2_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#wpidx2_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#wpidx2_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @wrap_disjoint_after_one_step(%n: index, %data: tensor<16x16xf16, #wpidx2_blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c3_i32 = arith.constant 3 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x16x16xf16, #wpidx2_shared, #wpidx2_smem, mutable>
+
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%phase = %c0_i32) -> i32 {
+      %next_stage = scf.execute_region -> i32 no_inline {
+        %sum = arith.addi %phase, %c1_i32 : i32
+        %next = arith.remsi %sum, %c3_i32 : i32
+        scf.yield %next : i32
+      } {triton.warp_pipeline.stage = "advance_phase"}
+
+      scf.execute_region no_inline {
+        %phase_mod = arith.remsi %phase, %c3_i32 : i32
+        %write_slot = ttg.memdesc_index %alloc[%phase_mod] : !ttg.memdesc<3x16x16xf16, #wpidx2_shared, #wpidx2_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx2_shared, #wpidx2_smem, mutable>
+        ttg.local_store %data, %write_slot : tensor<16x16xf16, #wpidx2_blocked> -> !ttg.memdesc<16x16xf16, #wpidx2_shared, #wpidx2_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "store_phase"}
+
+      scf.yield %next_stage : i32
+    } {triton.warp_pipeline.pipelined_for}
+
+    ttg.local_dealloc %alloc : !ttg.memdesc<3x16x16xf16, #wpidx2_shared, #wpidx2_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @wrap_disjoint_after_one_step
+// CHECK: ttg.barrier local
+// CHECK: scf.for
+// CHECK-NOT: ttg.barrier local
+// CHECK: scf.yield
+// CHECK: tt.return
+
+// -----
+
+// ---- Buffer-index disjointness: circular next-iteration negative ----
+
+#wpidx3_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#wpidx3_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#wpidx3_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @wrap_alias_after_one_step(%n: index, %data: tensor<16x16xf16, #wpidx3_blocked>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c3_i32 = arith.constant 3 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x16x16xf16, #wpidx3_shared, #wpidx3_smem, mutable>
+
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%phase = %c0_i32) -> i32 {
+      %phase_alias = scf.execute_region -> i32 no_inline {
+        scf.yield %phase : i32
+      } {triton.warp_pipeline.stage = "alias_phase"}
+
+      scf.execute_region no_inline {
+        %phase_mod = arith.remsi %phase_alias, %c3_i32 : i32
+        %read_slot = ttg.memdesc_index %alloc[%phase_mod] : !ttg.memdesc<3x16x16xf16, #wpidx3_shared, #wpidx3_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx3_shared, #wpidx3_smem, mutable>
+        ttg.local_store %data, %read_slot : tensor<16x16xf16, #wpidx3_blocked> -> !ttg.memdesc<16x16xf16, #wpidx3_shared, #wpidx3_smem, mutable>
+        scf.yield
+      } {triton.warp_pipeline.stage = "store_phase"}
+
+      %next_stage = scf.execute_region -> i32 no_inline {
+        %sum = arith.addi %phase, %c1_i32 : i32
+        %next = arith.remsi %sum, %c3_i32 : i32
+        %write_slot = ttg.memdesc_index %alloc[%next] : !ttg.memdesc<3x16x16xf16, #wpidx3_shared, #wpidx3_smem, mutable> -> !ttg.memdesc<16x16xf16, #wpidx3_shared, #wpidx3_smem, mutable>
+        ttg.local_store %data, %write_slot : tensor<16x16xf16, #wpidx3_blocked> -> !ttg.memdesc<16x16xf16, #wpidx3_shared, #wpidx3_smem, mutable>
+        scf.yield %next : i32
+      } {triton.warp_pipeline.stage = "store_next"}
+
+      scf.yield %next_stage : i32
+    } {triton.warp_pipeline.pipelined_for}
+
+    ttg.local_dealloc %alloc : !ttg.memdesc<3x16x16xf16, #wpidx3_shared, #wpidx3_smem, mutable>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @wrap_alias_after_one_step
+// CHECK: scf.for
+// Same-iteration store(phase) -> store(phase + 1) is disjoint.
+// CHECK: ttg.local_store
+// CHECK: rocdl.sched.barrier non_mem_non_sideeffect
+// CHECK-NEXT: rocdl.sched.barrier none
+// CHECK-NEXT: rocdl.s.barrier
+// CHECK-NEXT: rocdl.sched.barrier none
+// The execute-region alias composes with the iter-arg recurrence, so
+// store(phase + 1) -> next-iteration store(phase_alias) aliases.
+// CHECK: ttg.local_store
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK-NEXT: ttg.barrier local

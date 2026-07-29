@@ -3,10 +3,13 @@
 
 #include "triton/Analysis/Membar.h"
 
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace mlir {
@@ -14,6 +17,12 @@ namespace mlir {
 class Block;
 class Operation;
 struct BufferIndexExpr;
+
+struct BufferIndexValueSubstitution {
+  Value replacement;
+  bool stopAfterReplacement = false;
+  int64_t constantOffset = 0;
+};
 
 /// Extends membar's slice disjointness check for multi-buffered shared-memory
 /// allocations selected by `ttg.memdesc_index`.
@@ -47,6 +56,10 @@ struct BufferIndexExpr;
 /// of this analysis.
 class BufferIndexAnalysis {
 public:
+  using ValueSubstitutionFn =
+      llvm::function_ref<std::optional<BufferIndexValueSubstitution>(Value)>;
+  using ValueStabilityFn = llvm::function_ref<bool(Value)>;
+
   explicit BufferIndexAnalysis(FunctionOpInterface funcOp);
   ~BufferIndexAnalysis();
 
@@ -56,6 +69,19 @@ public:
   /// consistently.
   AllocationSlice makeSlice(Value value, Interval<size_t> allocationInterval,
                             Allocation::BufferId bufferId);
+
+  /// Builds a slice while interpreting selected SSA values through
+  /// `substitute`. The replacement is analyzed with substitution still enabled
+  /// unless `stopAfterReplacement` is set, which is useful for callers that
+  /// model a single temporal step and do not want that step applied again to
+  /// operands inside the replacement expression. `constantOffset` is added to
+  /// the replacement's analyzed offset. When substitution remains enabled, an
+  /// expression rooted at a value for which `isStable` is false is treated as
+  /// unknown rather than reusing its SSA identity across dynamic iterations.
+  AllocationSlice makeSliceWithValueSubstitution(
+      Value value, Interval<size_t> allocationInterval,
+      Allocation::BufferId bufferId, ValueSubstitutionFn substitute,
+      ValueStabilityFn isStable);
 
   /// Returns true if `successor` is reached by a cf-form loop backedge from
   /// `terminator`, using the standard dominance rule.
@@ -69,6 +95,9 @@ public:
 
 private:
   void attachBufferIndex(AllocationSlice &slice, Value value);
+  void attachBufferIndex(AllocationSlice &slice, Value value,
+                         ValueSubstitutionFn substitute,
+                         ValueStabilityFn isStable);
   const BufferIndexExpr *intern(BufferIndexExpr expr);
 
   DominanceInfo dominanceInfo;
