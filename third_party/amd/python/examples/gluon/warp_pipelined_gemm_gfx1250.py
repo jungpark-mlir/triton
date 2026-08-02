@@ -593,8 +593,7 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
                                              DTYPE_B: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
                                              BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr,
                                              GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr,
-                                             NUM_WARPS: gl.constexpr,
-                                             RESOLVE_PARTITION_CONFLICTS: gl.constexpr):
+                                             NUM_WARPS: gl.constexpr):
     gl.static_assert(DTYPE_A != "e2m1" and DTYPE_B != "e2m1",
                      "fp8_slice_mn_warp_pipeline_kernel_gfx1250 requires FP8 inputs")
     gl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128)
@@ -607,16 +606,11 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
                                                                     [1, 0])
     padded_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_n, BLOCK_K],
                                                                     [1, 0])
-    if RESOLVE_PARTITION_CONFLICTS:
-        layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
-            half_m, half_n, padded_a, padded_b, NUM_WARPS, [16, 16, 128], a_transposed=False, b_transposed=True)
-        shared_a: gl.constexpr = layouts[0]
-        shared_b: gl.constexpr = layouts[1]
-        wmma: gl.constexpr = layouts[2]
-    else:
-        shared_a: gl.constexpr = padded_a
-        shared_b: gl.constexpr = padded_b
-        wmma: gl.constexpr = gl.amd.AMDWMMALayout(3, True, ((0, 1), (1, 0), (2, 0)), (), [16, 16, 128])
+    layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        half_m, half_n, padded_a, padded_b, NUM_WARPS, [16, 16, 128], a_transposed=False, b_transposed=True)
+    shared_a: gl.constexpr = layouts[0]
+    shared_b: gl.constexpr = layouts[1]
+    wmma: gl.constexpr = layouts[2]
     dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma, 16)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma, 16)
 
@@ -753,6 +747,138 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
                      BLOCK_M, BLOCK_N)
 
 
+@gluon.jit
+def fp8_slice_mn_warp_pipeline_kernelC_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk,
+                                              stride_bn, stride_cm, stride_cn, DTYPE_A: gl.constexpr,
+                                              DTYPE_B: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+                                              BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr,
+                                              GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr,
+                                              NUM_WARPS: gl.constexpr, NUM_BUFFERS: gl.constexpr,
+                                              TDM_WARP_USED_HINT: gl.constexpr):
+    gl.static_assert(DTYPE_A != "e2m1" and DTYPE_B != "e2m1",
+                     "fp8_slice_mn_warp_pipeline_kernelC_gfx1250 requires FP8 inputs")
+    gl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128)
+    gl.static_assert(NUM_WARPS == 8)
+    gl.static_assert(NUM_BUFFERS == 3 or NUM_BUFFERS == 4, "FP8 kernelC requires three or four LDS buffers")
+    pid_m, pid_n = get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    half_m: gl.constexpr = BLOCK_M // 2
+    half_n: gl.constexpr = BLOCK_N // 2
+    padded_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_m, BLOCK_K],
+                                                                    [1, 0])
+    padded_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_n, BLOCK_K],
+                                                                    [1, 0])
+    layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        half_m, half_n, padded_a, padded_b, NUM_WARPS, [16, 16, 128], a_transposed=False, b_transposed=True)
+    shared_a: gl.constexpr = layouts[0]
+    shared_b: gl.constexpr = layouts[1]
+    wmma: gl.constexpr = layouts[2]
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma, 16)
+
+    nbuf: gl.constexpr = NUM_BUFFERS
+    a_top_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, half_m, BLOCK_K], shared_a)
+    a_bot_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, half_m, BLOCK_K], shared_a)
+    b_left_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, half_n, BLOCK_K], shared_b)
+    b_right_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, half_n, BLOCK_K], shared_b)
+
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_top_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K), strides=(stride_am, stride_ak),
+                                            block_shape=(half_m, BLOCK_K), layout=shared_a)
+    a_bot_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base + half_m * stride_am, shape=(M, K),
+                                            strides=(stride_am, stride_ak), block_shape=(half_m, BLOCK_K),
+                                            layout=shared_a)
+    b_left_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K), strides=(stride_bn, stride_bk),
+                                             block_shape=(half_n, BLOCK_K), layout=shared_b)
+    b_right_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base + half_n * stride_bn, shape=(N, K),
+                                              strides=(stride_bn, stride_bk), block_shape=(half_n, BLOCK_K),
+                                              layout=shared_b)
+
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        tdm.async_load(b_left_desc, [0, i * BLOCK_K], b_left_buf.index(i),
+                       warp_used_hint=TDM_WARP_USED_HINT)
+        tdm.async_load(a_top_desc, [0, i * BLOCK_K], a_top_buf.index(i), warp_used_hint=TDM_WARP_USED_HINT)
+        tdm.async_load(a_bot_desc, [0, i * BLOCK_K], a_bot_buf.index(i), warp_used_hint=TDM_WARP_USED_HINT)
+        tdm.async_load(b_right_desc, [0, i * BLOCK_K], b_right_buf.index(i),
+                       warp_used_hint=TDM_WARP_USED_HINT)
+
+    prefetch_wait: gl.constexpr = 4 * (NUM_BUFFERS - 1) - 2
+    steady_wait: gl.constexpr = 4 * (NUM_BUFFERS - 1) - 3
+    tdm.async_wait(prefetch_wait)
+    a_top = a_top_buf.index(0).load(layout=dot_a)
+    b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
+
+    acc_tl = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_bl = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_tr = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_br = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+
+    iter_max = gl.cdiv(K, BLOCK_K)
+    gl.assume(iter_max > 3)
+    consume_k = 0
+    load_k = NUM_BUFFERS - 1
+    for _ in range(0, iter_max - (NUM_BUFFERS - 1)):
+        read_slot = consume_k % nbuf
+        next_slot = (consume_k + 1) % nbuf
+        write_slot = load_k % nbuf
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_left, None, DTYPE_B, acc_tl)
+        tdm.async_wait(steady_wait)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a_bot = a_bot_buf.index(read_slot).load(layout=dot_a)
+            tdm.async_load(b_left_desc, [0, load_k * BLOCK_K], b_left_buf.index(write_slot),
+                           warp_used_hint=TDM_WARP_USED_HINT)
+
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_left, None, DTYPE_B, acc_bl)
+        tdm.async_wait(steady_wait)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            b_right = b_right_buf.index(read_slot).permute([1, 0]).load(layout=dot_b)
+            tdm.async_load(a_top_desc, [0, load_k * BLOCK_K], a_top_buf.index(write_slot),
+                           warp_used_hint=TDM_WARP_USED_HINT)
+
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_right, None, DTYPE_B, acc_tr)
+        tdm.async_wait(steady_wait)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            b_left = b_left_buf.index(next_slot).permute([1, 0]).load(layout=dot_b)
+            tdm.async_load(a_bot_desc, [0, load_k * BLOCK_K], a_bot_buf.index(write_slot),
+                           warp_used_hint=TDM_WARP_USED_HINT)
+
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_right, None, DTYPE_B, acc_br)
+        tdm.async_wait(steady_wait)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a_top = a_top_buf.index(next_slot).load(layout=dot_a)
+            tdm.async_load(b_right_desc, [0, load_k * BLOCK_K], b_right_buf.index(write_slot),
+                           warp_used_hint=TDM_WARP_USED_HINT)
+        consume_k += 1
+        load_k += 1
+
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        read_slot = (iter_max - (NUM_BUFFERS - 1 - i)) % nbuf
+        acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_left, None, DTYPE_B, acc_tl)
+        tdm.async_wait(4 * (NUM_BUFFERS - 1 - i) - 3)
+        a_bot = a_bot_buf.index(read_slot).load(layout=dot_a)
+        acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_left, None, DTYPE_B, acc_bl)
+        tdm.async_wait(4 * (NUM_BUFFERS - 1 - i) - 4)
+        b_right = b_right_buf.index(read_slot).permute([1, 0]).load(layout=dot_b)
+        acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_right, None, DTYPE_B, acc_tr)
+        if i < NUM_BUFFERS - 2:
+            next_slot = (iter_max - (NUM_BUFFERS - 1 - i) + 1) % nbuf
+            tdm.async_wait(4 * (NUM_BUFFERS - 2 - i) - 1)
+            b_left = b_left_buf.index(next_slot).permute([1, 0]).load(layout=dot_b)
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_right, None, DTYPE_B, acc_br)
+            tdm.async_wait(4 * (NUM_BUFFERS - 2 - i) - 2)
+            a_top = a_top_buf.index(next_slot).load(layout=dot_a)
+        else:
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_right, None, DTYPE_B, acc_br)
+
+    _store_quadrants(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc_tl, acc_bl, acc_tr, acc_br, wmma,
+                     BLOCK_M, BLOCK_N)
+
+
 def _event_probe(fn, iters):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -872,8 +998,10 @@ def _make_fp8_case(args):
     if (args.BM, args.BN, args.BK) != (256, 256, 128):
         raise ValueError("The tutorial FP8 path requires -BM 256 -BN 256 -BK 128")
     if args.num_warps != 8:
-        raise ValueError("The tutorial FP8 path requires --num-warps 8")
-    if args.num_buffers != 2:
+        raise ValueError("The dedicated plain-FP8 path requires --num-warps 8")
+    if args.kernel_c and args.num_buffers not in (3, 4):
+        raise ValueError("FP8 kernelC requires --num-buffers 3 or 4")
+    if not args.kernel_c and args.num_buffers != 2:
         raise ValueError("The tutorial FP8 path uses fixed double buffering; pass --num-buffers 2")
     if args.M % args.BM or args.N % args.BN or args.K % args.BK:
         raise ValueError("The tutorial FP8 path requires M, N, and K to be divisible by their block sizes")
@@ -893,13 +1021,22 @@ def _make_fp8_case(args):
     grid = (triton.cdiv(args.M, args.BM) * triton.cdiv(args.N, args.BN), 1)
 
     def launch():
-        return fp8_slice_mn_warp_pipeline_kernel_gfx1250[grid](
+        kernel_args = (
             a_d, b_d, c_d, args.M, args.N, args.K, a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
             c_d.stride(0), c_d.stride(1), MXFP_DTYPE_TO_KERNEL[args.dtype_a], MXFP_DTYPE_TO_KERNEL[args.dtype_b],
-            args.BM, args.BN, args.BK, args.group_size_m, GRID_MN=grid[0], NUM_XCDS=args.num_xcds,
-            NUM_WARPS=args.num_warps, num_warps=args.num_warps, llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
-            RESOLVE_PARTITION_CONFLICTS=args.resolve_partition_conflicts,
-            waves_per_eu=args.num_warps // 4)
+            args.BM, args.BN, args.BK, args.group_size_m)
+        launch_options = {
+            "GRID_MN": grid[0],
+            "NUM_XCDS": args.num_xcds,
+            "NUM_WARPS": args.num_warps,
+            "num_warps": args.num_warps,
+            "llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), ),
+            "waves_per_eu": args.num_warps // 4,
+        }
+        if args.kernel_c:
+            return fp8_slice_mn_warp_pipeline_kernelC_gfx1250[grid](
+                *kernel_args, NUM_BUFFERS=args.num_buffers, TDM_WARP_USED_HINT=0b00001111, **launch_options)
+        return fp8_slice_mn_warp_pipeline_kernel_gfx1250[grid](*kernel_args, **launch_options)
 
     def check():
         c_d.zero_()
@@ -1023,8 +1160,10 @@ def _build_arg_parser():
                         help="Use preshuffled MXFP scale tensors")
     parser.add_argument("--async-copy-scale", "--async_copy_scale", dest="async_copy_scale", action="store_true",
                         help="Stage MXFP scale tensors with async copy instead of TDM")
+    parser.add_argument("--kernelC", dest="kernel_c", action="store_true",
+                        help="Use the plain-FP8 KernelC variant with four-warp TDM load issue")
     parser.add_argument("--resolve-partition-conflicts", action="store_true",
-                        help="Use partition-aware gfx1250 WMMA/shared layouts")
+                        help="Use partition-aware gfx1250 WMMA/shared layouts for FP16/MXFP; plain FP8 always uses them")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check", action="store_true", help="Check output against torch")
     parser.add_argument("--benchmark", action="store_true", help="Benchmark with CUDA graph replay")
@@ -1040,8 +1179,11 @@ if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
     if args.dtype_b is None:
         args.dtype_b = args.dtype_a
+    plain_fp8 = not args.mxfp and args.dtype_a.startswith("float8") and args.dtype_b.startswith("float8")
+    if args.kernel_c and not plain_fp8:
+        raise ValueError("--kernelC is supported only by the dedicated plain-FP8 path")
+    partition_conflict_avoidance = plain_fp8 or args.resolve_partition_conflicts
     if args.BK is None:
-        plain_fp8 = not args.mxfp and args.dtype_a.startswith("float8") and args.dtype_b.startswith("float8")
         args.BK = 128 if plain_fp8 else 64
     if not args.check and not args.benchmark:
         args.check = True
@@ -1050,7 +1192,7 @@ if __name__ == "__main__":
         f"({args.M=}, {args.N=}, {args.K=}), ({args.BM=}, {args.BN=}, {args.BK=}), "
         f"{args.dtype_a=}, {args.dtype_b=}, {args.num_warps=}, {args.num_buffers=}, "
         f"{args.transpose_b=}, {args.mxfp=}, {args.scale_preshuffled=}, {args.async_copy_scale=}, "
-        f"{args.resolve_partition_conflicts=}, sliceMN=True"
+        f"{args.kernel_c=}, {partition_conflict_avoidance=}, sliceMN=True"
     )
 
     if args.dtype_a == "float16":
