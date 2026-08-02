@@ -602,7 +602,6 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
 
     half_m: gl.constexpr = BLOCK_M // 2
     half_n: gl.constexpr = BLOCK_N // 2
-    copy_layout: gl.constexpr = gl.BlockedLayout([1, 16], [4, 8], [8, 1], [1, 0])
     shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_m, BLOCK_K],
                                                                     [1, 0])
     shared_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_n, BLOCK_K],
@@ -617,13 +616,18 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
     b_left_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, half_n, BLOCK_K], shared_b)
     b_right_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, half_n, BLOCK_K], shared_b)
 
-    offs_m = gl.arange(0, half_m, layout=gl.SliceLayout(1, copy_layout))
-    offs_n = gl.arange(0, half_n, layout=gl.SliceLayout(1, copy_layout))
-    offs_k = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, copy_layout))
-    a_top_ptrs = a_ptr + (pid_m * BLOCK_M + offs_m[:, None]) * stride_am + offs_k[None, :] * stride_ak
-    a_bot_ptrs = a_top_ptrs + half_m * stride_am
-    b_left_ptrs = b_ptr + (pid_n * BLOCK_N + offs_n[:, None]) * stride_bn + offs_k[None, :] * stride_bk
-    b_right_ptrs = b_left_ptrs + half_n * stride_bn
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_top_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K), strides=(stride_am, stride_ak),
+                                            block_shape=(half_m, BLOCK_K), layout=shared_a)
+    a_bot_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base + half_m * stride_am, shape=(M, K),
+                                            strides=(stride_am, stride_ak), block_shape=(half_m, BLOCK_K),
+                                            layout=shared_a)
+    b_left_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K), strides=(stride_bn, stride_bk),
+                                             block_shape=(half_n, BLOCK_K), layout=shared_b)
+    b_right_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base + half_n * stride_bn, shape=(N, K),
+                                              strides=(stride_bn, stride_bk), block_shape=(half_n, BLOCK_K),
+                                              layout=shared_b)
 
     acc_tl = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
     acc_bl = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
@@ -633,129 +637,103 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
     iter_max = gl.cdiv(K, BLOCK_K)
 
     # Prologue: K-steps 0 and 1 occupy fixed LDS slots 0 and 1.
-    cp.global_to_shared(b_left_buf.index(0), b_left_ptrs)
-    cp.commit_group()
-    cp.global_to_shared(a_top_buf.index(0), a_top_ptrs)
-    cp.commit_group()
-    cp.global_to_shared(a_bot_buf.index(0), a_bot_ptrs)
-    cp.commit_group()
-    cp.global_to_shared(b_right_buf.index(0), b_right_ptrs)
-    cp.commit_group()
+    tdm.async_load(b_left_desc, [0, 0], b_left_buf.index(0))
+    tdm.async_load(a_top_desc, [0, 0], a_top_buf.index(0))
+    tdm.async_load(a_bot_desc, [0, 0], a_bot_buf.index(0))
+    tdm.async_load(b_right_desc, [0, 0], b_right_buf.index(0))
+    tdm.async_load(b_left_desc, [0, BLOCK_K], b_left_buf.index(1))
+    tdm.async_load(a_top_desc, [0, BLOCK_K], a_top_buf.index(1))
+    tdm.async_load(a_bot_desc, [0, BLOCK_K], a_bot_buf.index(1))
+    tdm.async_load(b_right_desc, [0, BLOCK_K], b_right_buf.index(1))
 
-    cp.global_to_shared(b_left_buf.index(1), b_left_ptrs + BLOCK_K * stride_bk)
-    cp.commit_group()
-    cp.global_to_shared(a_top_buf.index(1), a_top_ptrs + BLOCK_K * stride_ak)
-    cp.commit_group()
-    cp.global_to_shared(a_bot_buf.index(1), a_bot_ptrs + BLOCK_K * stride_ak)
-    cp.commit_group()
-    cp.global_to_shared(b_right_buf.index(1), b_right_ptrs + BLOCK_K * stride_bk)
-    cp.commit_group()
-
-    a_top_ptrs += 2 * BLOCK_K * stride_ak
-    a_bot_ptrs += 2 * BLOCK_K * stride_ak
-    b_left_ptrs += 2 * BLOCK_K * stride_bk
-    b_right_ptrs += 2 * BLOCK_K * stride_bk
-
-    cp.wait_group(6)
+    tdm.async_wait(6)
     b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
     a_top = a_top_buf.index(0).load(layout=dot_a)
     gl.assume(iter_max > 3)
 
     # Tutorial schedule: two K-steps and eight MFMA/memory stage pairs per loop.
-    for _ in range(0, iter_max - 2, 2):
-        cp.wait_group(5)
+    for k in range(0, iter_max - 2, 2):
+        tdm.async_wait(5)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_left, None, DTYPE_B, acc_tl)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             a_bot = a_bot_buf.index(0).load(layout=dot_a)
-            cp.global_to_shared(b_left_buf.index(0), b_left_ptrs)
-            cp.commit_group()
+            tdm.async_load(b_left_desc, [0, (k + 2) * BLOCK_K], b_left_buf.index(0))
 
-        cp.wait_group(5)
+        tdm.async_wait(5)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_left, None, DTYPE_B, acc_bl)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             b_right = b_right_buf.index(0).permute([1, 0]).load(layout=dot_b)
-            cp.global_to_shared(a_top_buf.index(0), a_top_ptrs)
-            cp.commit_group()
+            tdm.async_load(a_top_desc, [0, (k + 2) * BLOCK_K], a_top_buf.index(0))
 
-        cp.wait_group(5)
+        tdm.async_wait(5)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_right, None, DTYPE_B, acc_tr)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             b_left = b_left_buf.index(1).permute([1, 0]).load(layout=dot_b)
-            cp.global_to_shared(a_bot_buf.index(0), a_bot_ptrs)
-            cp.commit_group()
+            tdm.async_load(a_bot_desc, [0, (k + 2) * BLOCK_K], a_bot_buf.index(0))
 
-        cp.wait_group(5)
+        tdm.async_wait(5)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_right, None, DTYPE_B, acc_br)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             a_top = a_top_buf.index(1).load(layout=dot_a)
-            cp.global_to_shared(b_right_buf.index(0), b_right_ptrs)
-            cp.commit_group()
+            tdm.async_load(b_right_desc, [0, (k + 2) * BLOCK_K], b_right_buf.index(0))
 
-        cp.wait_group(5)
+        tdm.async_wait(5)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_left, None, DTYPE_B, acc_tl)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             a_bot = a_bot_buf.index(1).load(layout=dot_a)
-            cp.global_to_shared(b_left_buf.index(1), b_left_ptrs + BLOCK_K * stride_bk)
-            cp.commit_group()
+            tdm.async_load(b_left_desc, [0, (k + 3) * BLOCK_K], b_left_buf.index(1))
 
-        cp.wait_group(5)
+        tdm.async_wait(5)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_left, None, DTYPE_B, acc_bl)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             b_right = b_right_buf.index(1).permute([1, 0]).load(layout=dot_b)
-            cp.global_to_shared(a_top_buf.index(1), a_top_ptrs + BLOCK_K * stride_ak)
-            cp.commit_group()
+            tdm.async_load(a_top_desc, [0, (k + 3) * BLOCK_K], a_top_buf.index(1))
 
-        cp.wait_group(5)
+        tdm.async_wait(5)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_right, None, DTYPE_B, acc_tr)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
-            cp.global_to_shared(a_bot_buf.index(1), a_bot_ptrs + BLOCK_K * stride_ak)
-            cp.commit_group()
+            tdm.async_load(a_bot_desc, [0, (k + 3) * BLOCK_K], a_bot_buf.index(1))
 
-        cp.wait_group(5)
+        tdm.async_wait(5)
         with gl.amd.warp_pipeline_stage("mfma", priority=0):
             acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_right, None, DTYPE_B, acc_br)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             a_top = a_top_buf.index(0).load(layout=dot_a)
-            cp.global_to_shared(b_right_buf.index(1), b_right_ptrs + BLOCK_K * stride_bk)
-            cp.commit_group()
-            a_top_ptrs += 2 * BLOCK_K * stride_ak
-            a_bot_ptrs += 2 * BLOCK_K * stride_ak
-            b_left_ptrs += 2 * BLOCK_K * stride_bk
-            b_right_ptrs += 2 * BLOCK_K * stride_bk
+            tdm.async_load(b_right_desc, [0, (k + 3) * BLOCK_K], b_right_buf.index(1))
 
     # Drain the final two prefetched K-steps.
     acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_left, None, DTYPE_B, acc_tl)
-    cp.wait_group(5)
+    tdm.async_wait(5)
     l_idx = (iter_max - 2) % 2
     a_bot = a_bot_buf.index(l_idx).load(layout=dot_a)
 
     acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_left, None, DTYPE_B, acc_bl)
-    cp.wait_group(4)
+    tdm.async_wait(4)
     b_right = b_right_buf.index(l_idx).permute([1, 0]).load(layout=dot_b)
 
     acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_right, None, DTYPE_B, acc_tr)
-    cp.wait_group(3)
+    tdm.async_wait(3)
     g_idx = 1 - l_idx
     b_left = b_left_buf.index(g_idx).permute([1, 0]).load(layout=dot_b)
 
     acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_right, None, DTYPE_B, acc_br)
-    cp.wait_group(2)
+    tdm.async_wait(2)
     a_top = a_top_buf.index(g_idx).load(layout=dot_a)
 
     acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_left, None, DTYPE_B, acc_tl)
-    cp.wait_group(1)
+    tdm.async_wait(1)
     a_bot = a_bot_buf.index(g_idx).load(layout=dot_a)
 
     acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, None, DTYPE_A, b_left, None, DTYPE_B, acc_bl)
-    cp.wait_group(0)
+    tdm.async_wait(0)
     b_right = b_right_buf.index(g_idx).permute([1, 0]).load(layout=dot_b)
 
     acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, None, DTYPE_A, b_right, None, DTYPE_B, acc_tr)
@@ -880,7 +858,7 @@ def _make_fp8_case(args):
     if args.scale_preshuffled or args.async_copy_scale or args.with_a_scale:
         raise ValueError("Scale options require --mxfp")
     if args.resolve_partition_conflicts:
-        raise ValueError("--resolve-partition-conflicts is not supported by the tutorial async-copy FP8 path")
+        raise ValueError("--resolve-partition-conflicts is not supported by the dedicated plain-FP8 path")
     if not args.transpose_b:
         raise ValueError("The tutorial FP8 kernel expects --transpose-b so K is contiguous in B")
     if (args.BM, args.BN, args.BK) != (256, 256, 128):
