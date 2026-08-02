@@ -593,7 +593,8 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
                                              DTYPE_B: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
                                              BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr,
                                              GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr,
-                                             NUM_WARPS: gl.constexpr):
+                                             NUM_WARPS: gl.constexpr,
+                                             RESOLVE_PARTITION_CONFLICTS: gl.constexpr):
     gl.static_assert(DTYPE_A != "e2m1" and DTYPE_B != "e2m1",
                      "fp8_slice_mn_warp_pipeline_kernel_gfx1250 requires FP8 inputs")
     gl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128)
@@ -602,11 +603,20 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
 
     half_m: gl.constexpr = BLOCK_M // 2
     half_n: gl.constexpr = BLOCK_N // 2
-    shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_m, BLOCK_K],
+    padded_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_m, BLOCK_K],
                                                                     [1, 0])
-    shared_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_n, BLOCK_K],
+    padded_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [half_n, BLOCK_K],
                                                                     [1, 0])
-    wmma: gl.constexpr = gl.amd.AMDWMMALayout(3, True, ((0, 1), (1, 0), (2, 0)), (), [16, 16, 128])
+    if RESOLVE_PARTITION_CONFLICTS:
+        layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+            half_m, half_n, padded_a, padded_b, NUM_WARPS, [16, 16, 128], a_transposed=False, b_transposed=True)
+        shared_a: gl.constexpr = layouts[0]
+        shared_b: gl.constexpr = layouts[1]
+        wmma: gl.constexpr = layouts[2]
+    else:
+        shared_a: gl.constexpr = padded_a
+        shared_b: gl.constexpr = padded_b
+        wmma: gl.constexpr = gl.amd.AMDWMMALayout(3, True, ((0, 1), (1, 0), (2, 0)), (), [16, 16, 128])
     dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma, 16)
     dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma, 16)
 
@@ -857,8 +867,6 @@ def _make_fp8_case(args):
         raise ValueError("The plain FP8 path requires FP8 inputs for both operands")
     if args.scale_preshuffled or args.async_copy_scale or args.with_a_scale:
         raise ValueError("Scale options require --mxfp")
-    if args.resolve_partition_conflicts:
-        raise ValueError("--resolve-partition-conflicts is not supported by the dedicated plain-FP8 path")
     if not args.transpose_b:
         raise ValueError("The tutorial FP8 kernel expects --transpose-b so K is contiguous in B")
     if (args.BM, args.BN, args.BK) != (256, 256, 128):
@@ -890,6 +898,7 @@ def _make_fp8_case(args):
             c_d.stride(0), c_d.stride(1), MXFP_DTYPE_TO_KERNEL[args.dtype_a], MXFP_DTYPE_TO_KERNEL[args.dtype_b],
             args.BM, args.BN, args.BK, args.group_size_m, GRID_MN=grid[0], NUM_XCDS=args.num_xcds,
             NUM_WARPS=args.num_warps, num_warps=args.num_warps, llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+            RESOLVE_PARTITION_CONFLICTS=args.resolve_partition_conflicts,
             waves_per_eu=args.num_warps // 4)
 
     def check():
