@@ -2257,7 +2257,8 @@ def _build_arg_parser():
     parser.add_argument("--dtype-a", default="float16", choices=["float16", "float8_e4m3", "float8_e5m2", "float4"])
     parser.add_argument("--dtype-b", default=None, choices=["float16", "float8_e4m3", "float8_e5m2", "float4"])
     parser.add_argument("--num-warps", type=int, default=8, choices=[4, 8])
-    parser.add_argument("--num-buffers", type=int, default=2, choices=[2, 3, 4])
+    parser.add_argument("--num-buffers", type=int, default=None, choices=[2, 3, 4],
+                        help="LDS buffer count (defaults to 3 for MXFP4 KernelC, otherwise 2)")
     parser.add_argument("--group-size-m", type=int, default=4, choices=[1, 2, 4, 8])
     parser.add_argument("--num-xcds", type=int, default=8)
     parser.add_argument("--transpose-b", action="store_true", default=True)
@@ -2302,6 +2303,8 @@ if __name__ == "__main__":
         args.dtype_a = "float4"
         args.dtype_b = "float4"
         args.scale_preshuffled = True
+    if args.num_buffers is None:
+        args.num_buffers = 3 if args.mxfp4_kernel_c else 2
     if args.dtype_b is None:
         args.dtype_b = args.dtype_a
     plain_fp8 = not args.mxfp and args.dtype_a.startswith("float8") and args.dtype_b.startswith("float8")
