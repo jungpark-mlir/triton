@@ -135,6 +135,23 @@ def _issue_mxfp_scale_load(scale_desc, scale_ptrs, load_k, scale_buffer, slot, B
 
 
 @gluon.jit
+def _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, load_k, as_top_buf,
+                                  as_bot_buf, bs_left_buf, bs_right_buf, slot,
+                                  BK_SCALE_PRESHUFFLED: gl.constexpr):
+    scale_k = load_k * BK_SCALE_PRESHUFFLED
+    as_top_load_desc = tdm.update_tensor_descriptor(as_top_desc, add_offsets=[0, scale_k])
+    as_bot_load_desc = tdm.update_tensor_descriptor(as_bot_desc, add_offsets=[0, scale_k])
+    bs_left_load_desc = tdm.update_tensor_descriptor(bs_left_desc, add_offsets=[0, scale_k])
+    bs_right_load_desc = tdm.update_tensor_descriptor(bs_right_desc, add_offsets=[0, scale_k])
+    tdm.async_load_fused([
+        (as_top_load_desc, as_top_buf.index(slot), 0b00000011),
+        (as_bot_load_desc, as_bot_buf.index(slot), 0b00001100),
+        (bs_left_load_desc, bs_left_buf.index(slot), 0b00110000),
+        (bs_right_load_desc, bs_right_buf.index(slot), 0b11000000),
+    ])
+
+
+@gluon.jit
 def f16_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk,
                                              stride_bn, stride_cm, stride_cn, BLOCK_M: gl.constexpr,
                                              BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, GRID_MN: gl.constexpr,
@@ -1011,6 +1028,234 @@ def fp8_scaled_slice_mn_warp_pipeline_kernel_gfx1250(
 
 
 @gluon.jit
+def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
+        a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
+        stride_cn, stride_scale, SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr, GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr,
+        NUM_WARPS: gl.constexpr):
+    gl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128)
+    gl.static_assert(SCALE_BLOCK == 16 or SCALE_BLOCK == 32)
+    gl.static_assert(NUM_WARPS == 8)
+    pid_m, pid_n = get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    half_m: gl.constexpr = BLOCK_M // 2
+    half_n: gl.constexpr = BLOCK_N // 2
+    bk_packed: gl.constexpr = BLOCK_K // 2
+    bk_scale: gl.constexpr = BLOCK_K // SCALE_BLOCK
+    preshuffle_factor: gl.constexpr = 128
+    bk_scale_preshuffled: gl.constexpr = bk_scale * preshuffle_factor
+    half_m_preshuffled: gl.constexpr = half_m // preshuffle_factor
+    half_n_preshuffled: gl.constexpr = half_n // preshuffle_factor
+    scale_kwidth: gl.constexpr = 4 if bk_scale >= 4 else bk_scale
+
+    padded_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[bk_packed if bk_packed >= 256 else 256, 16]], [half_m, bk_packed], [1, 0])
+    padded_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[bk_packed if bk_packed >= 256 else 256, 16]], [half_n, bk_packed], [1, 0])
+    shared_scale: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 8]], [half_m_preshuffled, bk_scale_preshuffled], [1, 0])
+    layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        half_m, half_n, padded_a, padded_b, NUM_WARPS, [32, 16, 128], a_transposed=False, b_transposed=True)
+    shared_a: gl.constexpr = layouts[0]
+    shared_b: gl.constexpr = layouts[1]
+    wmma: gl.constexpr = layouts[2]
+    wmma_packed: gl.constexpr = gl.amd.AMDWMMALayout(3, True, wmma.warp_bases, wmma.reg_bases, [32, 16, 64])
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma_packed, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma_packed, 16)
+    scale_a_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_a, [half_m, bk_scale])
+    scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_b, [half_n, bk_scale])
+
+    nbuf: gl.constexpr = 2
+    a_top_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, half_m, bk_packed], shared_a)
+    a_bot_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, half_m, bk_packed], shared_a)
+    b_left_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, half_n, bk_packed], shared_b)
+    b_right_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, half_n, bk_packed], shared_b)
+    as_top_buf = gl.allocate_shared_memory(a_scale_ptr.type.element_ty,
+                                           [nbuf, half_m_preshuffled, bk_scale_preshuffled], shared_scale)
+    as_bot_buf = gl.allocate_shared_memory(a_scale_ptr.type.element_ty,
+                                           [nbuf, half_m_preshuffled, bk_scale_preshuffled], shared_scale)
+    bs_left_buf = gl.allocate_shared_memory(b_scale_ptr.type.element_ty,
+                                            [nbuf, half_n_preshuffled, bk_scale_preshuffled], shared_scale)
+    bs_right_buf = gl.allocate_shared_memory(b_scale_ptr.type.element_ty,
+                                             [nbuf, half_n_preshuffled, bk_scale_preshuffled], shared_scale)
+
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_top_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K // 2),
+                                            strides=(stride_am, stride_ak), block_shape=(half_m, bk_packed),
+                                            layout=shared_a)
+    a_bot_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base + half_m * stride_am, shape=(M, K // 2),
+                                            strides=(stride_am, stride_ak), block_shape=(half_m, bk_packed),
+                                            layout=shared_a)
+    b_left_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K // 2),
+                                             strides=(stride_bn, stride_bk), block_shape=(half_n, bk_packed),
+                                             layout=shared_b)
+    b_right_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base + half_n * stride_bn, shape=(N, K // 2),
+                                              strides=(stride_bn, stride_bk), block_shape=(half_n, bk_packed),
+                                              layout=shared_b)
+
+    as_top_base = (pid_m * BLOCK_M) // preshuffle_factor * stride_scale
+    as_bot_base = (pid_m * BLOCK_M + half_m) // preshuffle_factor * stride_scale
+    bs_left_base = (pid_n * BLOCK_N) // preshuffle_factor * stride_scale
+    bs_right_base = (pid_n * BLOCK_N + half_n) // preshuffle_factor * stride_scale
+    as_top_desc = tdm.make_tensor_descriptor(
+        base=a_scale_ptr + as_top_base, shape=(M // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(half_m_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+    as_bot_desc = tdm.make_tensor_descriptor(
+        base=a_scale_ptr + as_bot_base, shape=(M // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(half_m_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+    bs_left_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + bs_left_base, shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(half_n_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+    bs_right_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + bs_right_base, shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(half_n_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+
+    for i in gl.static_range(2):
+        _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, i, as_top_buf, as_bot_buf,
+                                      bs_left_buf, bs_right_buf, i, bk_scale_preshuffled)
+        tdm.async_load(b_left_desc, [0, i * bk_packed], b_left_buf.index(i))
+        tdm.async_load(a_top_desc, [0, i * bk_packed], a_top_buf.index(i))
+        tdm.async_load(a_bot_desc, [0, i * bk_packed], a_bot_buf.index(i))
+        tdm.async_load(b_right_desc, [0, i * bk_packed], b_right_buf.index(i))
+
+    tdm.async_wait(7)
+    b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
+    bs_left = _load_mxfp_scale(bs_left_buf, 0, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                               scale_kwidth)
+    a_top = a_top_buf.index(0).load(layout=dot_a)
+    as_top = _load_mxfp_scale(as_top_buf, 0, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                              scale_kwidth)
+
+    acc_tl = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_bl = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_tr = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_br = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    iter_max = gl.cdiv(K, BLOCK_K)
+    gl.assume(iter_max > 3)
+
+    for k in range(0, iter_max - 2, 2):
+        tdm.async_wait(6)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            as_bot = _load_mxfp_scale(as_bot_buf, 0, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                                      scale_kwidth)
+            bs_right = _load_mxfp_scale(bs_right_buf, 0, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                                        scale_kwidth)
+            acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a_bot = a_bot_buf.index(0).load(layout=dot_a)
+            _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, k + 2, as_top_buf,
+                                          as_bot_buf, bs_left_buf, bs_right_buf, 0, bk_scale_preshuffled)
+            tdm.async_load(b_left_desc, [0, (k + 2) * bk_packed], b_left_buf.index(0))
+
+        tdm.async_wait(6)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            b_right = b_right_buf.index(0).permute([1, 0]).load(layout=dot_b)
+            tdm.async_load(a_top_desc, [0, (k + 2) * bk_packed], a_top_buf.index(0))
+
+        tdm.async_wait(6)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            b_left = b_left_buf.index(1).permute([1, 0]).load(layout=dot_b)
+            bs_left = _load_mxfp_scale(bs_left_buf, 1, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                                       scale_kwidth)
+            tdm.async_load(a_bot_desc, [0, (k + 2) * bk_packed], a_bot_buf.index(0))
+
+        tdm.async_wait(6)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a_top = a_top_buf.index(1).load(layout=dot_a)
+            as_top = _load_mxfp_scale(as_top_buf, 1, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                                      scale_kwidth)
+            tdm.async_load(b_right_desc, [0, (k + 2) * bk_packed], b_right_buf.index(0))
+
+        tdm.async_wait(6)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            as_bot = _load_mxfp_scale(as_bot_buf, 1, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                                      scale_kwidth)
+            bs_right = _load_mxfp_scale(bs_right_buf, 1, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                                        scale_kwidth)
+            acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a_bot = a_bot_buf.index(1).load(layout=dot_a)
+            _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, k + 3, as_top_buf,
+                                          as_bot_buf, bs_left_buf, bs_right_buf, 1, bk_scale_preshuffled)
+            tdm.async_load(b_left_desc, [0, (k + 3) * bk_packed], b_left_buf.index(1))
+
+        tdm.async_wait(6)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            b_right = b_right_buf.index(1).permute([1, 0]).load(layout=dot_b)
+            tdm.async_load(a_top_desc, [0, (k + 3) * bk_packed], a_top_buf.index(1))
+
+        tdm.async_wait(6)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
+            bs_left = _load_mxfp_scale(bs_left_buf, 0, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                                       scale_kwidth)
+            tdm.async_load(a_bot_desc, [0, (k + 3) * bk_packed], a_bot_buf.index(1))
+
+        tdm.async_wait(6)
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a_top = a_top_buf.index(0).load(layout=dot_a)
+            as_top = _load_mxfp_scale(as_top_buf, 0, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                                      scale_kwidth)
+            tdm.async_load(b_right_desc, [0, (k + 3) * bk_packed], b_right_buf.index(1))
+
+    acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
+    tdm.async_wait(6)
+    l_idx = (iter_max - 2) % 2
+    a_bot = a_bot_buf.index(l_idx).load(layout=dot_a)
+    as_bot = _load_mxfp_scale(as_bot_buf, l_idx, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                              scale_kwidth)
+
+    acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl)
+    tdm.async_wait(5)
+    b_right = b_right_buf.index(l_idx).permute([1, 0]).load(layout=dot_b)
+    bs_right = _load_mxfp_scale(bs_right_buf, l_idx, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                                scale_kwidth)
+
+    acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr)
+    tdm.async_wait(3)
+    g_idx = 1 - l_idx
+    b_left = b_left_buf.index(g_idx).permute([1, 0]).load(layout=dot_b)
+    bs_left = _load_mxfp_scale(bs_left_buf, g_idx, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                               scale_kwidth)
+
+    acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br)
+    tdm.async_wait(2)
+    a_top = a_top_buf.index(g_idx).load(layout=dot_a)
+    as_top = _load_mxfp_scale(as_top_buf, g_idx, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                              scale_kwidth)
+
+    acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
+    tdm.async_wait(1)
+    a_bot = a_bot_buf.index(g_idx).load(layout=dot_a)
+    as_bot = _load_mxfp_scale(as_bot_buf, g_idx, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                              scale_kwidth)
+
+    acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl)
+    tdm.async_wait(0)
+    b_right = b_right_buf.index(g_idx).permute([1, 0]).load(layout=dot_b)
+    bs_right = _load_mxfp_scale(bs_right_buf, g_idx, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                                scale_kwidth)
+
+    acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr)
+    acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br)
+    _store_quadrants(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc_tl, acc_bl, acc_tr, acc_br, wmma,
+                     BLOCK_M, BLOCK_N)
+
+
+@gluon.jit
 def fp8_slice_mn_warp_pipeline_kernelC_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk,
                                               stride_bn, stride_cm, stride_cn, DTYPE_A: gl.constexpr,
                                               DTYPE_B: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
@@ -1359,6 +1604,211 @@ def fp8_scaled_slice_mn_warp_pipeline_kernelC_gfx1250(
                      BLOCK_M, BLOCK_N)
 
 
+@gluon.jit
+def mxfp4_slice_mn_warp_pipeline_kernelC_gfx1250(
+        a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
+        stride_cn, stride_scale, SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr, GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr,
+        NUM_WARPS: gl.constexpr, NUM_BUFFERS: gl.constexpr, TDM_WARP_USED_HINT: gl.constexpr):
+    gl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128)
+    gl.static_assert(SCALE_BLOCK == 16 or SCALE_BLOCK == 32)
+    gl.static_assert(NUM_WARPS == 8)
+    gl.static_assert(NUM_BUFFERS == 3 or NUM_BUFFERS == 4,
+                     "MXFP4 kernelC requires three or four LDS buffers")
+    pid_m, pid_n = get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    half_m: gl.constexpr = BLOCK_M // 2
+    half_n: gl.constexpr = BLOCK_N // 2
+    bk_packed: gl.constexpr = BLOCK_K // 2
+    bk_scale: gl.constexpr = BLOCK_K // SCALE_BLOCK
+    preshuffle_factor: gl.constexpr = 128
+    bk_scale_preshuffled: gl.constexpr = bk_scale * preshuffle_factor
+    half_m_preshuffled: gl.constexpr = half_m // preshuffle_factor
+    half_n_preshuffled: gl.constexpr = half_n // preshuffle_factor
+    scale_kwidth: gl.constexpr = 4 if bk_scale >= 4 else bk_scale
+
+    padded_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[bk_packed if bk_packed >= 256 else 256, 16]], [half_m, bk_packed], [1, 0])
+    padded_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[bk_packed if bk_packed >= 256 else 256, 16]], [half_n, bk_packed], [1, 0])
+    shared_scale: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 8]], [half_m_preshuffled, bk_scale_preshuffled], [1, 0])
+    layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        half_m, half_n, padded_a, padded_b, NUM_WARPS, [32, 16, 128], a_transposed=False, b_transposed=True)
+    shared_a: gl.constexpr = layouts[0]
+    shared_b: gl.constexpr = layouts[1]
+    wmma: gl.constexpr = layouts[2]
+    wmma_packed: gl.constexpr = gl.amd.AMDWMMALayout(3, True, wmma.warp_bases, wmma.reg_bases, [32, 16, 64])
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma_packed, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma_packed, 16)
+    scale_a_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_a, [half_m, bk_scale])
+    scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_b, [half_n, bk_scale])
+
+    nbuf: gl.constexpr = NUM_BUFFERS
+    a_top_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, half_m, bk_packed], shared_a)
+    a_bot_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, half_m, bk_packed], shared_a)
+    b_left_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, half_n, bk_packed], shared_b)
+    b_right_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, half_n, bk_packed], shared_b)
+    as_top_buf = gl.allocate_shared_memory(a_scale_ptr.type.element_ty,
+                                           [nbuf, half_m_preshuffled, bk_scale_preshuffled], shared_scale)
+    as_bot_buf = gl.allocate_shared_memory(a_scale_ptr.type.element_ty,
+                                           [nbuf, half_m_preshuffled, bk_scale_preshuffled], shared_scale)
+    bs_left_buf = gl.allocate_shared_memory(b_scale_ptr.type.element_ty,
+                                            [nbuf, half_n_preshuffled, bk_scale_preshuffled], shared_scale)
+    bs_right_buf = gl.allocate_shared_memory(b_scale_ptr.type.element_ty,
+                                             [nbuf, half_n_preshuffled, bk_scale_preshuffled], shared_scale)
+
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_top_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K // 2),
+                                            strides=(stride_am, stride_ak), block_shape=(half_m, bk_packed),
+                                            layout=shared_a)
+    a_bot_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base + half_m * stride_am, shape=(M, K // 2),
+                                            strides=(stride_am, stride_ak), block_shape=(half_m, bk_packed),
+                                            layout=shared_a)
+    b_left_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K // 2),
+                                             strides=(stride_bn, stride_bk), block_shape=(half_n, bk_packed),
+                                             layout=shared_b)
+    b_right_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base + half_n * stride_bn, shape=(N, K // 2),
+                                              strides=(stride_bn, stride_bk), block_shape=(half_n, bk_packed),
+                                              layout=shared_b)
+
+    as_top_base = (pid_m * BLOCK_M) // preshuffle_factor * stride_scale
+    as_bot_base = (pid_m * BLOCK_M + half_m) // preshuffle_factor * stride_scale
+    bs_left_base = (pid_n * BLOCK_N) // preshuffle_factor * stride_scale
+    bs_right_base = (pid_n * BLOCK_N + half_n) // preshuffle_factor * stride_scale
+    as_top_desc = tdm.make_tensor_descriptor(
+        base=a_scale_ptr + as_top_base, shape=(M // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(half_m_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+    as_bot_desc = tdm.make_tensor_descriptor(
+        base=a_scale_ptr + as_bot_base, shape=(M // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(half_m_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+    bs_left_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + bs_left_base, shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(half_n_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+    bs_right_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + bs_right_base, shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(half_n_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, i, as_top_buf, as_bot_buf,
+                                      bs_left_buf, bs_right_buf, i, bk_scale_preshuffled)
+        tdm.async_load(b_left_desc, [0, i * bk_packed], b_left_buf.index(i),
+                       warp_used_hint=TDM_WARP_USED_HINT)
+        tdm.async_load(a_top_desc, [0, i * bk_packed], a_top_buf.index(i), warp_used_hint=TDM_WARP_USED_HINT)
+        tdm.async_load(a_bot_desc, [0, i * bk_packed], a_bot_buf.index(i), warp_used_hint=TDM_WARP_USED_HINT)
+        tdm.async_load(b_right_desc, [0, i * bk_packed], b_right_buf.index(i),
+                       warp_used_hint=TDM_WARP_USED_HINT)
+
+    wait_unit: gl.constexpr = 5
+    prefetch_wait: gl.constexpr = (NUM_BUFFERS - 2) * wait_unit - 2
+    steady_wait: gl.constexpr = (NUM_BUFFERS - 2) * wait_unit - 3
+    tdm.async_wait(prefetch_wait)
+    a_top = a_top_buf.index(0).load(layout=dot_a)
+    as_top = _load_mxfp_scale(as_top_buf, 0, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                              scale_kwidth)
+    b_left = b_left_buf.index(0).permute([1, 0]).load(layout=dot_b)
+    bs_left = _load_mxfp_scale(bs_left_buf, 0, scale_b_layout, half_n, bk_scale, True, preshuffle_factor,
+                               scale_kwidth)
+
+    acc_tl = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_bl = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_tr = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    acc_br = gl.zeros((half_m, half_n), dtype=gl.float32, layout=wmma)
+    iter_max = gl.cdiv(K, BLOCK_K)
+    gl.assume(iter_max > 3)
+    consume_k = 0
+    load_k = NUM_BUFFERS - 1
+
+    for _ in range(0, iter_max - (NUM_BUFFERS - 1)):
+        read_slot = consume_k % nbuf
+        next_slot = (consume_k + 1) % nbuf
+        write_slot = load_k % nbuf
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
+        tdm.async_wait(steady_wait)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a_bot = a_bot_buf.index(read_slot).load(layout=dot_a)
+            as_bot = _load_mxfp_scale(as_bot_buf, read_slot, scale_a_layout, half_m, bk_scale, True,
+                                      preshuffle_factor, scale_kwidth)
+            _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, load_k, as_top_buf,
+                                          as_bot_buf, bs_left_buf, bs_right_buf, write_slot, bk_scale_preshuffled)
+            tdm.async_load(b_left_desc, [0, load_k * bk_packed], b_left_buf.index(write_slot),
+                           warp_used_hint=TDM_WARP_USED_HINT)
+
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl)
+        tdm.async_wait(steady_wait)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            b_right = b_right_buf.index(read_slot).permute([1, 0]).load(layout=dot_b)
+            bs_right = _load_mxfp_scale(bs_right_buf, read_slot, scale_b_layout, half_n, bk_scale, True,
+                                        preshuffle_factor, scale_kwidth)
+            tdm.async_load(a_top_desc, [0, load_k * bk_packed], a_top_buf.index(write_slot),
+                           warp_used_hint=TDM_WARP_USED_HINT)
+
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr)
+        tdm.async_wait(steady_wait)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            b_left = b_left_buf.index(next_slot).permute([1, 0]).load(layout=dot_b)
+            bs_left = _load_mxfp_scale(bs_left_buf, next_slot, scale_b_layout, half_n, bk_scale, True,
+                                       preshuffle_factor, scale_kwidth)
+            tdm.async_load(a_bot_desc, [0, load_k * bk_packed], a_bot_buf.index(write_slot),
+                           warp_used_hint=TDM_WARP_USED_HINT)
+
+        with gl.amd.warp_pipeline_stage("mfma", priority=0):
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br)
+        tdm.async_wait(steady_wait)
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            a_top = a_top_buf.index(next_slot).load(layout=dot_a)
+            as_top = _load_mxfp_scale(as_top_buf, next_slot, scale_a_layout, half_m, bk_scale, True,
+                                      preshuffle_factor, scale_kwidth)
+            tdm.async_load(b_right_desc, [0, load_k * bk_packed], b_right_buf.index(write_slot),
+                           warp_used_hint=TDM_WARP_USED_HINT)
+        consume_k += 1
+        load_k += 1
+
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        read_slot = (iter_max - (NUM_BUFFERS - 1 - i)) % nbuf
+        acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
+        if i < NUM_BUFFERS - 2:
+            tdm.async_wait((NUM_BUFFERS - 2 - i) * wait_unit - 3)
+        else:
+            tdm.async_wait(1)
+        a_bot = a_bot_buf.index(read_slot).load(layout=dot_a)
+        as_bot = _load_mxfp_scale(as_bot_buf, read_slot, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
+                                  scale_kwidth)
+        acc_bl = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_left, bs_left, "e2m1", acc_bl)
+        if i < NUM_BUFFERS - 2:
+            tdm.async_wait((NUM_BUFFERS - 2 - i) * wait_unit - 4)
+        else:
+            tdm.async_wait(0)
+        b_right = b_right_buf.index(read_slot).permute([1, 0]).load(layout=dot_b)
+        bs_right = _load_mxfp_scale(bs_right_buf, read_slot, scale_b_layout, half_n, bk_scale, True,
+                                    preshuffle_factor, scale_kwidth)
+        acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_right, bs_right, "e2m1", acc_tr)
+        if i < NUM_BUFFERS - 2:
+            next_slot = (iter_max - (NUM_BUFFERS - 1 - i) + 1) % nbuf
+            if (NUM_BUFFERS - 2 - i) * wait_unit - 5 > 0:
+                tdm.async_wait((NUM_BUFFERS - 2 - i) * wait_unit - 5)
+            else:
+                tdm.async_wait(0)
+            b_left = b_left_buf.index(next_slot).permute([1, 0]).load(layout=dot_b)
+            bs_left = _load_mxfp_scale(bs_left_buf, next_slot, scale_b_layout, half_n, bk_scale, True,
+                                       preshuffle_factor, scale_kwidth)
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br)
+            if (NUM_BUFFERS - 2 - i) * wait_unit - 6 > 0:
+                tdm.async_wait((NUM_BUFFERS - 2 - i) * wait_unit - 6)
+            a_top = a_top_buf.index(next_slot).load(layout=dot_a)
+            as_top = _load_mxfp_scale(as_top_buf, next_slot, scale_a_layout, half_m, bk_scale, True,
+                                      preshuffle_factor, scale_kwidth)
+        else:
+            acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, "e2m1", b_right, bs_right, "e2m1", acc_br)
+
+    _store_quadrants(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc_tl, acc_bl, acc_tr, acc_br, wmma,
+                     BLOCK_M, BLOCK_N)
+
+
 def _event_probe(fn, iters):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -1628,6 +2078,84 @@ def _make_fp8_scaled_case(args):
     return launch, check
 
 
+def _make_mxfp4_pipeline_case(args):
+    is_kernel_c = args.mxfp4_kernel_c
+    if not args.transpose_b:
+        raise ValueError("The dedicated MXFP4 kernels require --transpose-b so packed K is contiguous in B")
+    if (args.BM, args.BN, args.BK) != (256, 256, 128):
+        raise ValueError("The dedicated MXFP4 kernels require -BM 256 -BN 256 -BK 128")
+    if args.num_warps != 8:
+        raise ValueError("The dedicated MXFP4 kernels require --num-warps 8")
+    if is_kernel_c and args.num_buffers not in (3, 4):
+        raise ValueError("MXFP4 kernelC requires --num-buffers 3 or 4")
+    if not is_kernel_c and args.num_buffers != 2:
+        raise ValueError("The MXFP4 tutorial kernel requires --num-buffers 2")
+    if args.M % args.BM or args.N % args.BN or args.K % args.BK:
+        raise ValueError("The dedicated MXFP4 kernels require M, N, and K to be divisible by their block sizes")
+    num_k_tiles = triton.cdiv(args.K, args.BK)
+    if num_k_tiles <= 3:
+        raise ValueError("K/BLOCK_K must be greater than 3")
+    if not is_kernel_c and num_k_tiles % 2:
+        raise ValueError("The MXFP4 tutorial kernel requires an even number of K tiles")
+    if args.scale_block not in (16, 32):
+        raise ValueError("The MXFP4 kernels support --scale-block 16 or 32")
+
+    scale_k = args.K // args.scale_block
+    block_scale_k = args.BK // args.scale_block
+    scale_kwidth = 4 if block_scale_k >= 4 else block_scale_k
+    if args.M % 128 or args.N % 128 or scale_k % scale_kwidth:
+        raise ValueError("MXFP4 preshuffled scales require M/N divisible by 128 and a compatible scale K-width")
+
+    torch.manual_seed(args.seed)
+    a = init_data("float4", args.M, args.K)
+    b = init_data("float4", args.K, args.N)
+    a_scale_obj = MXScaleTensor(size=(args.M, scale_k)).random(low=1.0, high=32.0)
+    b_scale_obj = MXScaleTensor(size=(args.N, scale_k)).random(low=1.0, high=32.0)
+
+    c_ref = None
+    if args.check:
+        c_ref = torch_gemm_mxfp(a, b, a_scale_obj, b_scale_obj, args.scale_block, args.M, args.N,
+                                args.K).to(torch.float16)
+
+    a_scale = _pack_fp8_scale(a_scale_obj.data, scale_kwidth)
+    b_scale = _pack_fp8_scale(b_scale_obj.data, scale_kwidth)
+    a = a.to_packed_tensor(dim=1)
+    b = b.to_packed_tensor(dim=0)
+    a_d = a.data.contiguous().cuda()
+    b_d = b.data.T.contiguous().cuda()
+    a_scale_d = a_scale.cuda()
+    b_scale_d = b_scale.cuda()
+    c_d = torch.empty((args.M, args.N), dtype=torch.float16, device="cuda")
+    grid = (triton.cdiv(args.M, args.BM) * triton.cdiv(args.N, args.BN), 1)
+
+    def launch():
+        kernel_args = (
+            a_d, b_d, c_d, a_scale_d, b_scale_d, args.M, args.N, args.K, a_d.stride(0), a_d.stride(1),
+            b_d.stride(1), b_d.stride(0), c_d.stride(0), c_d.stride(1), b_scale_d.stride(0), args.scale_block,
+            args.BM, args.BN, args.BK, args.group_size_m)
+        launch_options = {
+            "GRID_MN": grid[0],
+            "NUM_XCDS": args.num_xcds,
+            "NUM_WARPS": args.num_warps,
+            "num_warps": args.num_warps,
+            "llvm_fn_attrs": (("amdgpu-agpr-alloc", "0,0"), ),
+            "waves_per_eu": args.num_warps // 4,
+        }
+        if is_kernel_c:
+            return mxfp4_slice_mn_warp_pipeline_kernelC_gfx1250[grid](
+                *kernel_args, NUM_BUFFERS=args.num_buffers, TDM_WARP_USED_HINT=0b00001111, **launch_options)
+        return mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250[grid](*kernel_args, **launch_options)
+
+    def check():
+        c_d.zero_()
+        launch()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(c_d.cpu(), c_ref.cpu(), rtol=1e-3, atol=1e-3)
+        print("result verified", flush=True)
+
+    return launch, check
+
+
 def _make_mxfp_case(args):
     if args.dtype_a not in MXFP_DTYPE_TO_KERNEL or args.dtype_b not in MXFP_DTYPE_TO_KERNEL:
         raise ValueError("The 8/4-bit path supports float8_e5m2, float8_e4m3, and float4 inputs")
@@ -1724,7 +2252,8 @@ def _build_arg_parser():
     parser.add_argument("-K", type=int, default=1024, help="problem K size")
     parser.add_argument("-BM", type=int, default=256, help="BLOCK_M")
     parser.add_argument("-BN", type=int, default=256, help="BLOCK_N")
-    parser.add_argument("-BK", type=int, default=None, help="BLOCK_K (defaults to 128 for plain FP8, otherwise 64)")
+    parser.add_argument("-BK", type=int, default=None,
+                        help="BLOCK_K (defaults to 128 for plain FP8/dedicated MXFP4, otherwise 64)")
     parser.add_argument("--dtype-a", default="float16", choices=["float16", "float8_e4m3", "float8_e5m2", "float4"])
     parser.add_argument("--dtype-b", default=None, choices=["float16", "float8_e4m3", "float8_e5m2", "float4"])
     parser.add_argument("--num-warps", type=int, default=8, choices=[4, 8])
@@ -1744,6 +2273,11 @@ def _build_arg_parser():
                         help="Stage E8M0 scale tensors with async copy instead of TDM")
     parser.add_argument("--kernelC", dest="kernel_c", action="store_true",
                         help="Use the plain-FP8 KernelC variant with four-warp TDM load issue")
+    mxfp4_group = parser.add_mutually_exclusive_group()
+    mxfp4_group.add_argument("--mxfp4-tutorial", action="store_true",
+                             help="Use the fixed two-buffer fused-scale MXFP4 tutorial kernel")
+    mxfp4_group.add_argument("--mxfp4-kernelC", dest="mxfp4_kernel_c", action="store_true",
+                             help="Use the three/four-buffer fused-scale MXFP4 KernelC kernel")
     parser.add_argument("--resolve-partition-conflicts", action="store_true",
                         help="Use partition-aware gfx1250 WMMA/shared layouts for FP16/MXFP; plain FP8 always uses them")
     parser.add_argument("--seed", type=int, default=0)
@@ -1759,6 +2293,15 @@ def _build_arg_parser():
 
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
+    dedicated_mxfp4 = args.mxfp4_tutorial or args.mxfp4_kernel_c
+    if dedicated_mxfp4:
+        if args.mxfp or args.with_scale or args.with_a_scale or args.kernel_c or args.async_copy_scale:
+            raise ValueError(
+                "Dedicated MXFP4 selectors cannot be combined with --mxfp, --with-scale, --with-a-scale, "
+                "--kernelC, or --async-copy-scale")
+        args.dtype_a = "float4"
+        args.dtype_b = "float4"
+        args.scale_preshuffled = True
     if args.dtype_b is None:
         args.dtype_b = args.dtype_a
     plain_fp8 = not args.mxfp and args.dtype_a.startswith("float8") and args.dtype_b.startswith("float8")
@@ -1768,9 +2311,9 @@ if __name__ == "__main__":
         raise ValueError("--with-scale and --with-a-scale are mutually exclusive")
     if args.kernel_c and not plain_fp8:
         raise ValueError("--kernelC is supported only by the dedicated plain-FP8 path")
-    partition_conflict_avoidance = plain_fp8 or args.resolve_partition_conflicts
+    partition_conflict_avoidance = plain_fp8 or dedicated_mxfp4 or args.resolve_partition_conflicts
     if args.BK is None:
-        args.BK = 128 if plain_fp8 else 64
+        args.BK = 128 if plain_fp8 or dedicated_mxfp4 else 64
     if not args.check and not args.benchmark:
         args.check = True
 
@@ -1779,10 +2322,13 @@ if __name__ == "__main__":
         f"{args.dtype_a=}, {args.dtype_b=}, {args.num_warps=}, {args.num_buffers=}, "
         f"{args.transpose_b=}, {args.mxfp=}, {args.with_scale=}, {args.scale_preshuffled=}, "
         f"{args.async_copy_scale=}, "
-        f"{args.kernel_c=}, {partition_conflict_avoidance=}, sliceMN=True"
+        f"{args.kernel_c=}, {args.mxfp4_tutorial=}, {args.mxfp4_kernel_c=}, "
+        f"{partition_conflict_avoidance=}, sliceMN=True"
     )
 
-    if args.dtype_a == "float16":
+    if dedicated_mxfp4:
+        launch, check = _make_mxfp4_pipeline_case(args)
+    elif args.dtype_a == "float16":
         if args.mxfp:
             raise ValueError("--mxfp does not apply to float16")
         launch, check = _make_f16_case(args)
