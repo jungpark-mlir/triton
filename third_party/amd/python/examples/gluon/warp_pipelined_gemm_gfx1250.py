@@ -776,7 +776,7 @@ def fp8_slice_mn_warp_pipeline_kernel_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stri
 
 
 @gluon.jit
-def fp8_scaled_slice_mn_warp_pipeline_kernel_gfx1250(
+def _fp8_scaled_slice_mn_warp_pipeline_bk128_gfx1250(
         a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
         stride_cn, stride_scale, DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr, SCALE_BLOCK: gl.constexpr,
         BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr,
@@ -1023,6 +1023,217 @@ def fp8_scaled_slice_mn_warp_pipeline_kernel_gfx1250(
 
     acc_tr = gl.amd.gfx1250.wmma_scaled(a_top, as_top, DTYPE_A, b_right, bs_right, DTYPE_B, acc_tr)
     acc_br = gl.amd.gfx1250.wmma_scaled(a_bot, as_bot, DTYPE_A, b_right, bs_right, DTYPE_B, acc_br)
+    _store_quadrants(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc_tl, acc_bl, acc_tr, acc_br, wmma,
+                     BLOCK_M, BLOCK_N)
+
+
+@gluon.jit
+def _load_fp8_scaled_slice_mnk_scale(scale_buffer, slot, start_nonk: gl.constexpr, start_k: gl.constexpr,
+                                     LAYOUT: gl.constexpr, BLOCK_NONK: gl.constexpr, BK_SCALE: gl.constexpr,
+                                     SUBTILE_NONK: gl.constexpr, SUBTILE_SCALE_K: gl.constexpr,
+                                     PRESHUFFLE_FACTOR: gl.constexpr, SCALE_KWIDTH: gl.constexpr):
+    scale_slice = scale_buffer.index(slot).reshape(
+        (BLOCK_NONK // PRESHUFFLE_FACTOR, BK_SCALE // SCALE_KWIDTH, PRESHUFFLE_FACTOR // 4, 4,
+         SCALE_KWIDTH)).permute((0, 3, 2, 1, 4)).reshape((BLOCK_NONK, BK_SCALE))
+    return scale_slice.slice(start_nonk, SUBTILE_NONK, 0).slice(
+        start_k, SUBTILE_SCALE_K, 1).load(layout=LAYOUT)
+
+
+@gluon.jit
+def _consume_fp8_scaled_slice_mnk_tile(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc_tl, acc_bl, acc_tr, acc_br, DTYPE_A: gl.constexpr,
+        DTYPE_B: gl.constexpr, DOT_A: gl.constexpr, DOT_B: gl.constexpr, SCALE_A_LAYOUT: gl.constexpr,
+        SCALE_B_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
+        BK_SCALE: gl.constexpr, SUBTILE_M: gl.constexpr, SUBTILE_N: gl.constexpr, SUBTILE_K: gl.constexpr,
+        SUBTILE_SCALE_K: gl.constexpr, PRESHUFFLE_FACTOR: gl.constexpr, SCALE_KWIDTH: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("mem", priority=1):
+        a00 = a_buf.index(slot).slice(0, SUBTILE_M, 0).slice(0, SUBTILE_K, 1).load(layout=DOT_A)
+        as00 = _load_fp8_scaled_slice_mnk_scale(as_buf, slot, 0, 0, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE,
+                                               SUBTILE_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        b00 = b_buf.index(slot).slice(0, SUBTILE_N, 0).slice(
+            0, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+        bs00 = _load_fp8_scaled_slice_mnk_scale(bs_buf, slot, 0, 0, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE,
+                                               SUBTILE_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+        acc_tl = gl.amd.gfx1250.wmma_scaled(a00, as00, DTYPE_A, b00, bs00, DTYPE_B, acc_tl)
+
+    with gl.amd.warp_pipeline_stage("mem", priority=1):
+        b01 = b_buf.index(slot).slice(SUBTILE_N, SUBTILE_N, 0).slice(
+            0, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+        bs01 = _load_fp8_scaled_slice_mnk_scale(bs_buf, slot, SUBTILE_N, 0, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE,
+                                               SUBTILE_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+        acc_tr = gl.amd.gfx1250.wmma_scaled(a00, as00, DTYPE_A, b01, bs01, DTYPE_B, acc_tr)
+
+    with gl.amd.warp_pipeline_stage("mem", priority=1):
+        a10 = a_buf.index(slot).slice(SUBTILE_M, SUBTILE_M, 0).slice(
+            0, SUBTILE_K, 1).load(layout=DOT_A)
+        as10 = _load_fp8_scaled_slice_mnk_scale(as_buf, slot, SUBTILE_M, 0, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE,
+                                               SUBTILE_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+        acc_bl = gl.amd.gfx1250.wmma_scaled(a10, as10, DTYPE_A, b00, bs00, DTYPE_B, acc_bl)
+
+    with gl.amd.warp_pipeline_stage("mem", priority=1):
+        b10 = b_buf.index(slot).slice(0, SUBTILE_N, 0).slice(
+            SUBTILE_K, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+        bs10 = _load_fp8_scaled_slice_mnk_scale(bs_buf, slot, 0, SUBTILE_SCALE_K, SCALE_B_LAYOUT, BLOCK_N,
+                                               BK_SCALE, SUBTILE_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR,
+                                               SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+        acc_br = gl.amd.gfx1250.wmma_scaled(a10, as10, DTYPE_A, b01, bs01, DTYPE_B, acc_br)
+
+    with gl.amd.warp_pipeline_stage("mem", priority=1):
+        a01 = a_buf.index(slot).slice(0, SUBTILE_M, 0).slice(
+            SUBTILE_K, SUBTILE_K, 1).load(layout=DOT_A)
+        as01 = _load_fp8_scaled_slice_mnk_scale(as_buf, slot, 0, SUBTILE_SCALE_K, SCALE_A_LAYOUT, BLOCK_M,
+                                               BK_SCALE, SUBTILE_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR,
+                                               SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+        acc_tl = gl.amd.gfx1250.wmma_scaled(a01, as01, DTYPE_A, b10, bs10, DTYPE_B, acc_tl)
+
+    with gl.amd.warp_pipeline_stage("mem", priority=1):
+        b11 = b_buf.index(slot).slice(SUBTILE_N, SUBTILE_N, 0).slice(
+            SUBTILE_K, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+        bs11 = _load_fp8_scaled_slice_mnk_scale(bs_buf, slot, SUBTILE_N, SUBTILE_SCALE_K, SCALE_B_LAYOUT,
+                                               BLOCK_N, BK_SCALE, SUBTILE_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR,
+                                               SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+        acc_tr = gl.amd.gfx1250.wmma_scaled(a01, as01, DTYPE_A, b11, bs11, DTYPE_B, acc_tr)
+
+    with gl.amd.warp_pipeline_stage("mem", priority=1):
+        a11 = a_buf.index(slot).slice(SUBTILE_M, SUBTILE_M, 0).slice(
+            SUBTILE_K, SUBTILE_K, 1).load(layout=DOT_A)
+        as11 = _load_fp8_scaled_slice_mnk_scale(as_buf, slot, SUBTILE_M, SUBTILE_SCALE_K, SCALE_A_LAYOUT,
+                                               BLOCK_M, BK_SCALE, SUBTILE_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR,
+                                               SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+        acc_bl = gl.amd.gfx1250.wmma_scaled(a11, as11, DTYPE_A, b10, bs10, DTYPE_B, acc_bl)
+    with gl.amd.warp_pipeline_stage("mfma", priority=0):
+        acc_br = gl.amd.gfx1250.wmma_scaled(a11, as11, DTYPE_A, b11, bs11, DTYPE_B, acc_br)
+    return acc_tl, acc_bl, acc_tr, acc_br
+
+
+@gluon.jit
+def fp8_scaled_slice_mn_warp_pipeline_kernel_gfx1250(
+        a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
+        stride_cn, stride_scale, DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr, SCALE_BLOCK: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr,
+        GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr, NUM_WARPS: gl.constexpr, SCALE_PRESHUFFLE: gl.constexpr,
+        ASYNC_COPY_SCALE: gl.constexpr):
+    gl.static_assert(DTYPE_A != "e2m1" and DTYPE_B != "e2m1",
+                     "fp8_scaled_slice_mn_warp_pipeline_kernel_gfx1250 requires FP8 inputs")
+    gl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 256)
+    gl.static_assert(SCALE_BLOCK == 16 or SCALE_BLOCK == 32)
+    gl.static_assert(NUM_WARPS == 8)
+    gl.static_assert(SCALE_PRESHUFFLE, "the BK256 scaled FP8 tutorial requires preshuffled scales")
+    gl.static_assert(not ASYNC_COPY_SCALE, "the BK256 scaled FP8 tutorial stages scales with TDM")
+    pid_m, pid_n = get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    # Group two K=128 WMMA steps into each BK=256 tile. Full-block descriptors
+    # reduce each slot to four TDM requests, while partition-aware slices retain
+    # the 128x128 operand layouts. Refills happen only after all eight WMMAs
+    # consume a slot so asynchronous scale copies cannot overwrite live scales.
+    num_subtiles: gl.constexpr = (2, 2, 2)
+    subtile_m: gl.constexpr = BLOCK_M // num_subtiles[0]
+    subtile_n: gl.constexpr = BLOCK_N // num_subtiles[1]
+    subtile_k: gl.constexpr = BLOCK_K // num_subtiles[2]
+    bk_scale: gl.constexpr = BLOCK_K // SCALE_BLOCK
+    subtile_scale_k: gl.constexpr = bk_scale // num_subtiles[2]
+    preshuffle_factor: gl.constexpr = 128
+    bk_scale_preshuffled: gl.constexpr = bk_scale * preshuffle_factor
+    block_m_preshuffled: gl.constexpr = BLOCK_M // preshuffle_factor
+    block_n_preshuffled: gl.constexpr = BLOCK_N // preshuffle_factor
+    scale_kwidth: gl.constexpr = 4 if bk_scale >= 4 else bk_scale
+
+    padded_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0])
+    padded_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [BLOCK_N, BLOCK_K], [1, 0])
+    shared_scale: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 8]], [block_m_preshuffled, bk_scale_preshuffled], [1, 0])
+    layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        BLOCK_M, BLOCK_N, padded_a, padded_b, NUM_WARPS, [16, 16, 128], a_transposed=False, b_transposed=True,
+        slice_m=subtile_m, slice_n=subtile_n)
+    shared_a: gl.constexpr = layouts[0]
+    shared_b: gl.constexpr = layouts[1]
+    wmma: gl.constexpr = layouts[2]
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma, 16)
+    scale_a_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_a,
+                                                                       [subtile_m, subtile_scale_k])
+    scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(dot_b,
+                                                                       [subtile_n, subtile_scale_k])
+
+    nbuf: gl.constexpr = 2
+    a_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, BLOCK_M, BLOCK_K], shared_a)
+    b_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, BLOCK_N, BLOCK_K], shared_b)
+    as_buf = gl.allocate_shared_memory(a_scale_ptr.type.element_ty,
+                                       [nbuf, block_m_preshuffled, bk_scale_preshuffled], shared_scale)
+    bs_buf = gl.allocate_shared_memory(b_scale_ptr.type.element_ty,
+                                       [nbuf, block_n_preshuffled, bk_scale_preshuffled], shared_scale)
+
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K), strides=(stride_am, stride_ak),
+                                        block_shape=(BLOCK_M, BLOCK_K), layout=shared_a)
+    b_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K), strides=(stride_bn, stride_bk),
+                                        block_shape=(BLOCK_N, BLOCK_K), layout=shared_b)
+    as_base = (pid_m * BLOCK_M) // preshuffle_factor * stride_scale
+    bs_base = (pid_n * BLOCK_N) // preshuffle_factor * stride_scale
+    as_desc = tdm.make_tensor_descriptor(
+        base=a_scale_ptr + as_base, shape=(M // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(block_m_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+    bs_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + bs_base, shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1), block_shape=(block_n_preshuffled, bk_scale_preshuffled), layout=shared_scale)
+
+    for prefetch_idx in gl.static_range(2):
+        tdm.async_load(as_desc, [0, prefetch_idx * bk_scale_preshuffled], as_buf.index(prefetch_idx),
+                       warp_used_hint=0b00001111)
+        tdm.async_load(bs_desc, [0, prefetch_idx * bk_scale_preshuffled], bs_buf.index(prefetch_idx),
+                       warp_used_hint=0b00001111)
+        tdm.async_load(a_desc, [0, prefetch_idx * BLOCK_K], a_buf.index(prefetch_idx),
+                       warp_used_hint=0b00001111)
+        tdm.async_load(b_desc, [0, prefetch_idx * BLOCK_K], b_buf.index(prefetch_idx),
+                       warp_used_hint=0b00001111)
+
+    tdm.async_wait(4)
+    acc_tl = gl.zeros((subtile_m, subtile_n), dtype=gl.float32, layout=wmma)
+    acc_bl = gl.zeros((subtile_m, subtile_n), dtype=gl.float32, layout=wmma)
+    acc_tr = gl.zeros((subtile_m, subtile_n), dtype=gl.float32, layout=wmma)
+    acc_br = gl.zeros((subtile_m, subtile_n), dtype=gl.float32, layout=wmma)
+
+    iter_max = gl.cdiv(K, BLOCK_K)
+    gl.assume(iter_max >= 2)
+    for tile_idx in range(0, iter_max - 2):
+        slot = tile_idx % nbuf
+        acc_tl, acc_bl, acc_tr, acc_br = _consume_fp8_scaled_slice_mnk_tile(
+            a_buf, b_buf, as_buf, bs_buf, slot, acc_tl, acc_bl, acc_tr, acc_br, DTYPE_A, DTYPE_B, dot_a, dot_b,
+            scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_m, subtile_n, subtile_k,
+            subtile_scale_k, preshuffle_factor, scale_kwidth)
+
+        refill_idx = tile_idx + 2
+        with gl.amd.warp_pipeline_stage("mem", priority=1):
+            tdm.async_load(as_desc, [0, refill_idx * bk_scale_preshuffled], as_buf.index(slot),
+                           warp_used_hint=0b00001111)
+            tdm.async_load(bs_desc, [0, refill_idx * bk_scale_preshuffled], bs_buf.index(slot),
+                           warp_used_hint=0b00001111)
+            tdm.async_load(a_desc, [0, refill_idx * BLOCK_K], a_buf.index(slot), warp_used_hint=0b00001111)
+            tdm.async_load(b_desc, [0, refill_idx * BLOCK_K], b_buf.index(slot), warp_used_hint=0b00001111)
+        tdm.async_wait(4)
+
+    penultimate_idx = iter_max - 2
+    penultimate_slot = penultimate_idx % nbuf
+    acc_tl, acc_bl, acc_tr, acc_br = _consume_fp8_scaled_slice_mnk_tile(
+        a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc_tl, acc_bl, acc_tr, acc_br, DTYPE_A, DTYPE_B, dot_a,
+        dot_b, scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_m, subtile_n,
+        subtile_k, subtile_scale_k, preshuffle_factor, scale_kwidth)
+
+    tdm.async_wait(0)
+    last_slot = (iter_max - 1) % nbuf
+    acc_tl, acc_bl, acc_tr, acc_br = _consume_fp8_scaled_slice_mnk_tile(
+        a_buf, b_buf, as_buf, bs_buf, last_slot, acc_tl, acc_bl, acc_tr, acc_br, DTYPE_A, DTYPE_B, dot_a, dot_b,
+        scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_m, subtile_n, subtile_k,
+        subtile_scale_k, preshuffle_factor, scale_kwidth)
+
     _store_quadrants(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc_tl, acc_bl, acc_tr, acc_br, wmma,
                      BLOCK_M, BLOCK_N)
 
@@ -2228,8 +2439,10 @@ def _make_fp8_scaled_case(args):
         raise ValueError("--with-scale always scales both operands; do not pass --with-a-scale")
     if not args.transpose_b:
         raise ValueError("The scaled FP8 kernels expect --transpose-b so K is contiguous in B")
-    if (args.BM, args.BN, args.BK) != (256, 256, 128):
-        raise ValueError("The scaled FP8 kernels require -BM 256 -BN 256 -BK 128")
+    expected_bk = 128 if args.kernel_c else 256
+    if (args.BM, args.BN, args.BK) != (256, 256, expected_bk):
+        kernel_name = "kernelC" if args.kernel_c else "tutorial"
+        raise ValueError(f"The scaled FP8 {kernel_name} kernel requires -BM 256 -BN 256 -BK {expected_bk}")
     if args.num_warps != 8:
         raise ValueError("The scaled FP8 kernels require --num-warps 8")
     if args.kernel_c and args.num_buffers not in (3, 4):
@@ -2238,14 +2451,18 @@ def _make_fp8_scaled_case(args):
         raise ValueError("The scaled tutorial FP8 kernel requires --num-buffers 2")
     if args.M % args.BM or args.N % args.BN or args.K % args.BK:
         raise ValueError("The scaled FP8 kernels require M, N, and K to be divisible by their block sizes")
-    if triton.cdiv(args.K, args.BK) <= 3:
-        raise ValueError("K/BLOCK_K must be greater than 3")
-    if not args.kernel_c and triton.cdiv(args.K, args.BK) % 2:
-        raise ValueError("The scaled tutorial FP8 kernel requires an even number of K tiles")
+    if args.kernel_c and triton.cdiv(args.K, args.BK) <= 3:
+        raise ValueError("Scaled FP8 kernelC requires K/BLOCK_K to be greater than 3")
+    if not args.kernel_c and triton.cdiv(args.K, args.BK) < 2:
+        raise ValueError("The scaled tutorial FP8 kernel requires at least two K tiles")
     if args.scale_block not in (16, 32):
         raise ValueError("The scaled WMMA kernels support --scale-block 16 or 32")
     if args.BK % args.scale_block:
         raise ValueError("BLOCK_K must be divisible by --scale-block")
+    if not args.kernel_c and not args.scale_preshuffled:
+        raise ValueError("The BK256 scaled tutorial FP8 kernel requires --scale-preshuffled")
+    if not args.kernel_c and args.async_copy_scale:
+        raise ValueError("The BK256 scaled tutorial FP8 kernel stages scales with TDM; do not pass --async-copy-scale")
 
     scale_k = triton.cdiv(args.K, args.scale_block)
     block_scale_k = args.BK // args.scale_block
@@ -2488,7 +2705,8 @@ def _build_arg_parser():
     parser.add_argument("-BM", type=int, default=256, help="BLOCK_M")
     parser.add_argument("-BN", type=int, default=256, help="BLOCK_N")
     parser.add_argument("-BK", type=int, default=None,
-                        help="BLOCK_K (defaults to 256 for MXFP4 tutorial, 128 for plain FP8/KernelC, otherwise 64)")
+                        help="BLOCK_K (defaults to 256 for MXFP4/scaled FP8 tutorials, 128 for plain FP8/KernelC, "
+                        "otherwise 64)")
     parser.add_argument("--dtype-a", default="float16", choices=["float16", "float8_e4m3", "float8_e5m2", "float4"])
     parser.add_argument("--dtype-b", default=None, choices=["float16", "float8_e4m3", "float8_e5m2", "float4"])
     parser.add_argument("--num-warps", type=int, default=8, choices=[4, 8])
@@ -2551,7 +2769,8 @@ if __name__ == "__main__":
         raise ValueError("--kernelC is supported only by the dedicated plain-FP8 path")
     partition_conflict_avoidance = plain_fp8 or dedicated_mxfp4 or args.resolve_partition_conflicts
     if args.BK is None:
-        args.BK = 256 if args.mxfp4_tutorial else 128 if plain_fp8 or args.mxfp4_kernel_c else 64
+        args.BK = 256 if args.mxfp4_tutorial or (plain_fp8 and args.with_scale and not args.kernel_c) else (
+            128 if plain_fp8 or args.mxfp4_kernel_c else 64)
     if not args.check and not args.benchmark:
         args.check = True
 
