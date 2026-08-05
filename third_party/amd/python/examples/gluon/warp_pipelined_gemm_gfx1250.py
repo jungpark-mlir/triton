@@ -1144,8 +1144,6 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
             acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             a_bot = a_bot_buf.index(0).load(layout=dot_a)
-            _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, k + 2, as_top_buf,
-                                          as_bot_buf, bs_left_buf, bs_right_buf, 0, bk_scale_preshuffled)
             tdm.async_load(b_left_desc, [0, (k + 2) * bk_packed], b_left_buf.index(0))
 
         tdm.async_wait(6)
@@ -1171,6 +1169,8 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
             a_top = a_top_buf.index(1).load(layout=dot_a)
             as_top = _load_mxfp_scale(as_top_buf, 1, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
                                       scale_kwidth)
+            _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, k + 2, as_top_buf,
+                                          as_bot_buf, bs_left_buf, bs_right_buf, 0, bk_scale_preshuffled)
             tdm.async_load(b_right_desc, [0, (k + 2) * bk_packed], b_right_buf.index(0))
 
         tdm.async_wait(6)
@@ -1182,8 +1182,6 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
             acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
         with gl.amd.warp_pipeline_stage("mem", priority=1):
             a_bot = a_bot_buf.index(1).load(layout=dot_a)
-            _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, k + 3, as_top_buf,
-                                          as_bot_buf, bs_left_buf, bs_right_buf, 1, bk_scale_preshuffled)
             tdm.async_load(b_left_desc, [0, (k + 3) * bk_packed], b_left_buf.index(1))
 
         tdm.async_wait(6)
@@ -1209,6 +1207,8 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
             a_top = a_top_buf.index(0).load(layout=dot_a)
             as_top = _load_mxfp_scale(as_top_buf, 0, scale_a_layout, half_m, bk_scale, True, preshuffle_factor,
                                       scale_kwidth)
+            _issue_mxfp4_fused_scale_load(as_top_desc, as_bot_desc, bs_left_desc, bs_right_desc, k + 3, as_top_buf,
+                                          as_bot_buf, bs_left_buf, bs_right_buf, 1, bk_scale_preshuffled)
             tdm.async_load(b_right_desc, [0, (k + 3) * bk_packed], b_right_buf.index(1))
 
     acc_tl = gl.amd.gfx1250.wmma_scaled(a_top, as_top, "e2m1", b_left, bs_left, "e2m1", acc_tl)
