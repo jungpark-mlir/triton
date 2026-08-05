@@ -1474,18 +1474,19 @@ def _mxfp4_slice_mn_warp_pipeline_tutorial_bk128_gfx1250(
 #   output accumulators while rotating partition bases for each 128-row/column
 #   subview.
 # * Use one full A and one full B TDM descriptor, plus full non-partitioned scale
-#   descriptors. Four requests now fill a BK=256 slot, amortizing descriptor,
-#   wait, and refill overhead across the work of two original BK=128 steps.
-# * Interleave local SliceMNK operand loads with independent scaled WMMAs, and
-#   let four waves issue TDM transfers while all eight waves participate in
-#   compute.
+#   descriptors. Fusing the A/B scale copies reduces each BK=256 slot from four
+#   requests to three, amortizing descriptor, wait, and refill overhead across
+#   the work of two original BK=128 steps.
+# * Interleave local SliceMNK operand loads with independent scaled WMMAs. A
+#   dedicated TDM stage keeps fused multi-destination refills ordered after all
+#   scale consumers while all eight waves participate in compute.
 # * Refill a slot only after every M/N/K subtile consumer has completed. This is
 #   required for scales as well as data because warp-pipeline phase shifting can
 #   move the effective LDS load later than its source position.
 #
-# On the development gfx1250 system this changed the 8192^3 benchmark median
-# from 5,572 to 6,855 TFLOPS (+23%), reduced the scale-block-16 kernel from 391
-# to 378 VGPRs, and retained zero scratch use.
+# On the development gfx1250 system the BK=256 conversion changed the 8192^3
+# benchmark median from 5,572 to 6,855 TFLOPS. Later TDM scheduling changes and
+# fused scales reached 7,693 TFLOPS, with 378 VGPRs and zero scratch use.
 @gluon.jit
 def _load_mxfp4_slice_mnk_scale(scale_buffer, slot, start_nonk: gl.constexpr, start_k: gl.constexpr,
                                  LAYOUT: gl.constexpr, BLOCK_NONK: gl.constexpr, BK_SCALE: gl.constexpr,
@@ -1570,6 +1571,18 @@ def _consume_mxfp4_slice_mnk_tile(a_buf, b_buf, as_buf, bs_buf, slot, acc_tl, ac
 
 
 @gluon.jit
+def _issue_mxfp4_slice_mnk_fused_scale_load(as_desc, bs_desc, as_buf, bs_buf, tile_idx, slot,
+                                            BK_SCALE_PRESHUFFLED: gl.constexpr):
+    scale_k = tile_idx * BK_SCALE_PRESHUFFLED
+    as_load_desc = tdm.update_tensor_descriptor(as_desc, add_offsets=[0, scale_k])
+    bs_load_desc = tdm.update_tensor_descriptor(bs_desc, add_offsets=[0, scale_k])
+    tdm.async_load_fused([
+        (as_load_desc, as_buf.index(slot), 0b00001111),
+        (bs_load_desc, bs_buf.index(slot), 0b11110000),
+    ])
+
+
+@gluon.jit
 def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
         a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
         stride_cn, stride_scale, SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
@@ -1637,21 +1650,18 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
         base=b_scale_ptr + bs_base, shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
         strides=(stride_scale, 1), block_shape=(block_n_preshuffled, bk_scale_preshuffled), layout=shared_scale)
 
-    # Four requests form one complete slot. Issue the larger A/B data transfers
-    # first so the smaller scale transfers do not leave a long data request at
-    # the tail of the tensor queue observed by async_wait(4).
+    # Three requests form one complete slot. Keep the larger A/B data copies
+    # independent and fuse only the equally sized A/B scale transfers.
     for prefetch_idx in gl.static_range(2):
         tdm.async_load(b_desc, [0, prefetch_idx * bk_packed], b_buf.index(prefetch_idx),
                        warp_used_hint=0b00001111)
         tdm.async_load(a_desc, [0, prefetch_idx * bk_packed], a_buf.index(prefetch_idx),
                        warp_used_hint=0b00001111)
-        tdm.async_load(as_desc, [0, prefetch_idx * bk_scale_preshuffled], as_buf.index(prefetch_idx),
-                       warp_used_hint=0b00001111)
-        tdm.async_load(bs_desc, [0, prefetch_idx * bk_scale_preshuffled], bs_buf.index(prefetch_idx),
-                       warp_used_hint=0b00001111)
+        _issue_mxfp4_slice_mnk_fused_scale_load(as_desc, bs_desc, as_buf, bs_buf, prefetch_idx, prefetch_idx,
+                                                bk_scale_preshuffled)
 
-    # Complete slot 0 while retaining the four slot-1 requests.
-    tdm.async_wait(4)
+    # Complete slot 0 while retaining the three slot-1 requests.
+    tdm.async_wait(3)
     acc_tl = gl.zeros((subtile_m, subtile_n), dtype=gl.float32, layout=wmma)
     acc_bl = gl.zeros((subtile_m, subtile_n), dtype=gl.float32, layout=wmma)
     acc_tr = gl.zeros((subtile_m, subtile_n), dtype=gl.float32, layout=wmma)
@@ -1668,17 +1678,15 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
 
         # Refill only after all eight M/N/K consumer WMMAs have completed.
         refill_idx = tile_idx + 2
-        with gl.amd.warp_pipeline_stage("mem", priority=1):
+        with gl.amd.warp_pipeline_stage("tdm", priority=1):
             tdm.async_load(b_desc, [0, refill_idx * bk_packed], b_buf.index(slot),
                            warp_used_hint=0b00001111)
             tdm.async_load(a_desc, [0, refill_idx * bk_packed], a_buf.index(slot),
                            warp_used_hint=0b00001111)
-            tdm.async_load(as_desc, [0, refill_idx * bk_scale_preshuffled], as_buf.index(slot),
-                           warp_used_hint=0b00001111)
-            tdm.async_load(bs_desc, [0, refill_idx * bk_scale_preshuffled], bs_buf.index(slot),
-                           warp_used_hint=0b00001111)
-        # Complete the next read slot and retain exactly the four refill requests.
-        tdm.async_wait(4)
+            _issue_mxfp4_slice_mnk_fused_scale_load(as_desc, bs_desc, as_buf, bs_buf, refill_idx, slot,
+                                                    bk_scale_preshuffled)
+        # Complete the next read slot and retain exactly the three refill requests.
+        tdm.async_wait(3)
 
     penultimate_idx = iter_max - 2
     penultimate_slot = penultimate_idx % nbuf
