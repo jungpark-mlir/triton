@@ -1426,15 +1426,17 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
         base=b_scale_ptr + bs_base, shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
         strides=(stride_scale, 1), block_shape=(block_n_preshuffled, bk_scale_preshuffled), layout=shared_scale)
 
-    # Four requests form one complete slot: A/B scales followed by A/B data.
+    # Four requests form one complete slot. Issue the larger A/B data transfers
+    # first so the smaller scale transfers do not leave a long data request at
+    # the tail of the tensor queue observed by async_wait(4).
     for prefetch_idx in gl.static_range(2):
-        tdm.async_load(as_desc, [0, prefetch_idx * bk_scale_preshuffled], as_buf.index(prefetch_idx),
-                       warp_used_hint=0b00001111)
-        tdm.async_load(bs_desc, [0, prefetch_idx * bk_scale_preshuffled], bs_buf.index(prefetch_idx),
+        tdm.async_load(b_desc, [0, prefetch_idx * bk_packed], b_buf.index(prefetch_idx),
                        warp_used_hint=0b00001111)
         tdm.async_load(a_desc, [0, prefetch_idx * bk_packed], a_buf.index(prefetch_idx),
                        warp_used_hint=0b00001111)
-        tdm.async_load(b_desc, [0, prefetch_idx * bk_packed], b_buf.index(prefetch_idx),
+        tdm.async_load(as_desc, [0, prefetch_idx * bk_scale_preshuffled], as_buf.index(prefetch_idx),
+                       warp_used_hint=0b00001111)
+        tdm.async_load(bs_desc, [0, prefetch_idx * bk_scale_preshuffled], bs_buf.index(prefetch_idx),
                        warp_used_hint=0b00001111)
 
     # Complete slot 0 while retaining the four slot-1 requests.
@@ -1456,13 +1458,13 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
         # Refill only after all eight M/N/K consumer WMMAs have completed.
         refill_idx = tile_idx + 2
         with gl.amd.warp_pipeline_stage("mem", priority=1):
-            tdm.async_load(as_desc, [0, refill_idx * bk_scale_preshuffled], as_buf.index(slot),
-                           warp_used_hint=0b00001111)
-            tdm.async_load(bs_desc, [0, refill_idx * bk_scale_preshuffled], bs_buf.index(slot),
+            tdm.async_load(b_desc, [0, refill_idx * bk_packed], b_buf.index(slot),
                            warp_used_hint=0b00001111)
             tdm.async_load(a_desc, [0, refill_idx * bk_packed], a_buf.index(slot),
                            warp_used_hint=0b00001111)
-            tdm.async_load(b_desc, [0, refill_idx * bk_packed], b_buf.index(slot),
+            tdm.async_load(as_desc, [0, refill_idx * bk_scale_preshuffled], as_buf.index(slot),
+                           warp_used_hint=0b00001111)
+            tdm.async_load(bs_desc, [0, refill_idx * bk_scale_preshuffled], bs_buf.index(slot),
                            warp_used_hint=0b00001111)
         # Complete the next read slot and retain exactly the four refill requests.
         tdm.async_wait(4)
