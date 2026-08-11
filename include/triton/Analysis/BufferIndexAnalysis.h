@@ -1,12 +1,12 @@
 #ifndef TRITON_ANALYSIS_BUFFER_INDEX_ANALYSIS_H
 #define TRITON_ANALYSIS_BUFFER_INDEX_ANALYSIS_H
 
-#include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Allocation.h"
 
-#include "llvm/ADT/STLFunctionalExtras.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -16,6 +16,8 @@ namespace mlir {
 
 class Block;
 class Operation;
+struct AllocationSlice;
+struct BlockInfo;
 struct BufferIndexExpr;
 
 struct BufferIndexValueSubstitution {
@@ -46,6 +48,9 @@ struct BufferIndexValueSubstitution {
 /// pointers are stored on `AllocationSlice`. The select/cmpi recurrence base
 /// must be provably in `[-1, N)`, which is checked from the loop-header block
 /// argument's incoming operands.
+///
+/// Buffer-index reasoning is disabled for functions with irreducible control
+/// flow because not every cyclic edge is a dominance backedge in such CFGs.
 ///
 /// Unknown arithmetic, dynamic or non-positive moduli, nested moduli, different
 /// SSA bases, and slices carried across cf-form backedges all fail the
@@ -101,6 +106,7 @@ private:
   const BufferIndexExpr *intern(BufferIndexExpr expr);
 
   DominanceInfo dominanceInfo;
+  bool hasReducibleCFG;
   std::vector<std::unique_ptr<BufferIndexExpr>> expressions;
 };
 

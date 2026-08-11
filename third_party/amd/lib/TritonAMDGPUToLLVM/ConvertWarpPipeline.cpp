@@ -29,7 +29,6 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
-#include "llvm/ADT/SmallPtrSet.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -39,6 +38,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/Membar.h"
@@ -201,8 +201,8 @@ inferWarpPipelineCounterRelations(scf::ForOp forOp,
       continue;
     auto initial =
         decomposeAffineValue(forOp.getInitArgs()[index], rangeSolver);
-    auto step = matchCounterStep(iterArg, forOp.getYieldedValues()[index],
-                                 rangeSolver);
+    auto step =
+        matchCounterStep(iterArg, forOp.getYieldedValues()[index], rangeSolver);
     if (!initial || !step)
       continue;
     candidates.push_back(Candidate{iterArg, iterArg.getType(), initial->base,
@@ -235,9 +235,8 @@ inferWarpPipelineCounterRelations(scf::ForOp forOp,
 static const WarpPipelineCounterRelation *
 findCounterRelation(Value value,
                     ArrayRef<WarpPipelineCounterRelation> relations) {
-  auto it = llvm::find_if(relations, [&](const auto &relation) {
-    return relation.value == value;
-  });
+  auto it = llvm::find_if(
+      relations, [&](const auto &relation) { return relation.value == value; });
   return it == relations.end() ? nullptr : &*it;
 }
 
@@ -250,14 +249,12 @@ getWarpPipelineValueSubstitution(
     if (auto blockArg = dyn_cast<BlockArgument>(value)) {
       if (blockArg.getOwner() == forOp.getBody() &&
           blockArg.getArgNumber() > 0) {
-        if (auto *relation =
-                findCounterRelation(blockArg, counterRelations)) {
+        if (auto *relation = findCounterRelation(blockArg, counterRelations)) {
           int64_t offset = relation->currentOffset;
           if (nextIteration &&
               __builtin_add_overflow(offset, relation->step, &offset))
             return std::nullopt;
-          if (nextIteration || relation->canonical != blockArg ||
-              offset != 0)
+          if (nextIteration || relation->canonical != blockArg || offset != 0)
             return BufferIndexValueSubstitution{
                 relation->canonical, /*stopAfterReplacement=*/true, offset};
         }
@@ -269,8 +266,8 @@ getWarpPipelineValueSubstitution(
         if (iterArgIdx < yieldedValues.size()) {
           Value replacement =
               resolveExecuteRegionResult(yieldedValues[iterArgIdx]);
-          return BufferIndexValueSubstitution{
-              replacement, /*stopAfterReplacement=*/true};
+          return BufferIndexValueSubstitution{replacement,
+                                              /*stopAfterReplacement=*/true};
         }
       }
     }
@@ -299,12 +296,11 @@ static bool isStableAcrossLoopIteration(Value value, scf::ForOp forOp) {
 // (scf.if / tt.reduce / tt.scan / etc.) are accounted for.  Loops (scf.for /
 // scf.while) cannot legally appear inside a cluster, so this walk never has
 // to reason about iteration-multiplied effects.
-static BlockInfo
-buildBlockInfoFromBlock(Block *block, Allocation *allocation,
-                        BufferIndexAnalysis *bufferIndexAnalysis,
-                        BufferIndexAnalysis::ValueSubstitutionFn
-                            valueSubstitution,
-                        BufferIndexAnalysis::ValueStabilityFn isStable) {
+static BlockInfo buildBlockInfoFromBlock(
+    Block *block, Allocation *allocation,
+    BufferIndexAnalysis *bufferIndexAnalysis,
+    BufferIndexAnalysis::ValueSubstitutionFn valueSubstitution,
+    BufferIndexAnalysis::ValueStabilityFn isStable) {
   BlockInfo info;
   block->walk([&](MemoryEffectOpInterface mei) {
     Operation *op = mei.getOperation();
@@ -334,9 +330,9 @@ buildBlockInfoFromBlock(Block *block, Allocation *allocation,
 
 // RAW dependencies are completed by backend fine-grained waits. Warp-pipeline
 // cluster barriers only need to cover WAR and WAW hazards.
-static bool ignoreWarpPipelineRaw(
-    const AllocationSlice &, const AllocationSlice &, bool lhsIsRead,
-    bool rhsIsRead, Allocation *) {
+static bool ignoreWarpPipelineRaw(const AllocationSlice &,
+                                  const AllocationSlice &, bool lhsIsRead,
+                                  bool rhsIsRead, Allocation *) {
   return !lhsIsRead && rhsIsRead;
 }
 
@@ -351,8 +347,9 @@ static bool hasWarpPipelineHazard(const BlockInfo &src, const BlockInfo &dst,
 // isPipelineIgnorable in WarpPipeliner.cpp plus the ROCDL-lowered forms that
 // can appear after intermediate passes.
 static bool isWarpPipelineIgnorableBarrier(Operation *op) {
-  return isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::AsyncWaitOp,
-             triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait,
+  return isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::BarrierOp,
+             triton::gpu::AsyncWaitOp, triton::amdgpu::AsyncWaitOp,
+             triton::amdgpu::AsyncTDMWait,
              triton::amdgpu::AsyncTDMIntrinsicWait>(op);
 }
 
@@ -466,9 +463,11 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
 //   Walking by increasing distance ensures the shorter-range LOCAL
 //   barriers we just placed are visible when checking longer-range pairs,
 //   skipping many redundant placements.
-static void analyzePipelineDependencies(
-    ArrayRef<BlockInfo> clusterInfo, ArrayRef<BlockInfo> nextIterationClusterInfo,
-    SmallVectorImpl<bool> &bars, Allocation *allocation, bool circular) {
+static void
+analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
+                            ArrayRef<BlockInfo> nextIterationClusterInfo,
+                            SmallVectorImpl<bool> &bars, Allocation *allocation,
+                            bool circular) {
   const int N = clusterInfo.size();
   const int maxDist = circular ? N : N - 1;
   assert(!circular || nextIterationClusterInfo.size() == clusterInfo.size());
@@ -537,13 +536,47 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
 // cluster barrier when one already exists at the cluster boundary.
 static void wrapExistingBarrier(OpBuilder &b, Location loc,
                                 Operation *clusterOp,
-                                Operation *existingBarrier,
-                                bool anyHasPriority) {
+                                Operation *existingBarrier, bool anyHasPriority,
+                                bool emitPriority = true) {
   b.setInsertionPoint(existingBarrier);
-  emitClusterPriority(b, loc, clusterOp, anyHasPriority);
+  if (emitPriority)
+    emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
   b.setInsertionPointAfter(existingBarrier);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
+}
+
+static bool hasDotOp(Block *block) {
+  bool foundDot = false;
+  block->walk([&](triton::DotOp) {
+    foundDot = true;
+    return WalkResult::interrupt();
+  });
+  return foundDot;
+}
+
+// On CDNA4 four-stage pingpong attention kernels benefit from placing the
+// cluster-0 wraparound barrier at the loop head, while keeping the `setprio` at
+// section ends.  We limit this to matching on CDNA4 without explicit barrier
+// placement in the source, and with the four-stage pingpong design.
+static bool shouldPlaceBackedgeBarrierAtHead(
+    triton::amdgpu::ISAFamily isaFamily, ArrayRef<Operation *> clusterOps,
+    ArrayRef<Block *> clusterBlocks, ArrayRef<bool> bars, bool hasTopBarrier,
+    bool hasBottomBarrier) {
+  if (isaFamily != triton::amdgpu::ISAFamily::CDNA4 || hasTopBarrier ||
+      hasBottomBarrier || clusterOps.size() != 4 || bars.empty() || !bars[0])
+    return false;
+
+  for (auto [i, clusterOp] : llvm::enumerate(clusterOps)) {
+    auto priority =
+        clusterOp->getAttrOfType<IntegerAttr>("triton.warp_pipeline.priority");
+    int expectedPriority = (i % 2 == 0) ? 0 : 1;
+    if (!priority || priority.getInt() != expectedPriority)
+      return false;
+    if (expectedPriority == 0 && !hasDotOp(clusterBlocks[i]))
+      return false;
+  }
+  return true;
 }
 
 // Emit pre-barrier, thread-ID partitioning, and phase-shift cond_barrier.
@@ -573,7 +606,11 @@ emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup) {
 
 // Emit priority reset and reconverge cond_barrier after a pipeline.
 static void emitPipelinePostlude(OpBuilder &b, Location loc,
-                                 bool anyHasPriority, Value warpLow) {
+                                 bool anyHasPriority, Value warpLow,
+                                 bool emitPostludeBarrier = false,
+                                 bool needLocal = false) {
+  if (emitPostludeBarrier)
+    emitClusterBarrier(b, loc, needLocal);
   if (anyHasPriority)
     ROCDL::SetPrioOp::create(b, loc, 0);
   mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
@@ -583,10 +620,11 @@ class ConvertPipelinedForPattern : public OpRewritePattern<scf::ForOp> {
 public:
   ConvertPipelinedForPattern(MLIRContext *ctx, ModuleAllocation &moduleAlloc,
                              int threadsPerPipelineGroup,
+                             triton::amdgpu::ISAFamily isaFamily,
                              const DataFlowSolver &rangeSolver)
       : OpRewritePattern<scf::ForOp>(ctx, /*benefit=*/2),
         moduleAllocation(moduleAlloc),
-        threadsPerPipelineGroup(threadsPerPipelineGroup),
+        threadsPerPipelineGroup(threadsPerPipelineGroup), isaFamily(isaFamily),
         rangeSolver(rangeSolver) {}
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
@@ -612,8 +650,7 @@ public:
 
 private:
   void emitPipelinedFor(PatternRewriter &b, Location loc, scf::ForOp forOp,
-                        Allocation *allocation,
-                        int threadsPerPipelineGroup,
+                        Allocation *allocation, int threadsPerPipelineGroup,
                         BufferIndexAnalysis *bufferIndexAnalysis) const {
     // 1. Pre-barrier, thread partitioning, and phase shift.
     b.setInsertionPoint(forOp);
@@ -644,12 +681,12 @@ private:
     auto counterRelations =
         inferWarpPipelineCounterRelations(forOp, rangeSolver);
     auto sameIterationSubstitution = [&](Value value) {
-      return getWarpPipelineValueSubstitution(
-          value, forOp, counterRelations, /*nextIteration=*/false);
+      return getWarpPipelineValueSubstitution(value, forOp, counterRelations,
+                                              /*nextIteration=*/false);
     };
     auto nextIterationSubstitution = [&](Value value) {
-      return getWarpPipelineValueSubstitution(
-          value, forOp, counterRelations, /*nextIteration=*/true);
+      return getWarpPipelineValueSubstitution(value, forOp, counterRelations,
+                                              /*nextIteration=*/true);
     };
     auto nextIterationStability = [&](Value value) {
       return isStableAcrossLoopIteration(value, forOp);
@@ -657,9 +694,9 @@ private:
     SmallVector<BlockInfo> clusterInfo;
     SmallVector<BlockInfo> nextIterationClusterInfo;
     for (auto cb : clusterBlocks) {
-      clusterInfo.push_back(buildBlockInfoFromBlock(
-          cb, allocation, bufferIndexAnalysis, sameIterationSubstitution,
-          allValuesStable));
+      clusterInfo.push_back(
+          buildBlockInfoFromBlock(cb, allocation, bufferIndexAnalysis,
+                                  sameIterationSubstitution, allValuesStable));
       nextIterationClusterInfo.push_back(buildBlockInfoFromBlock(
           cb, allocation, bufferIndexAnalysis, nextIterationSubstitution,
           nextIterationStability));
@@ -677,6 +714,7 @@ private:
     auto topBar = existingBarrierMap.find(0);
     auto bottomBar = existingBarrierMap.find(numClusters);
     bool hasTopBarrier = topBar != existingBarrierMap.end();
+    bool hasBottomBarrier = bottomBar != existingBarrierMap.end();
     if (bottomBar != existingBarrierMap.end()) {
       // validatePipelinedForBody guarantees we cannot have both top and
       // bottom barriers, so rotating bottom -> 0 is unambiguous.
@@ -690,6 +728,9 @@ private:
     analyzePipelineDependencies(clusterInfo, nextIterationClusterInfo, bars,
                                 allocation,
                                 /*circular=*/true);
+    if (shouldPlaceBackedgeBarrierAtHead(isaFamily, clusterOps, clusterBlocks,
+                                         bars, hasTopBarrier, hasBottomBarrier))
+      hasTopBarrier = true;
 
     // 4. Materializing final cluster-scope barriers.  For each cluster index:
     //  • If there is a pre-existing barrier at that location, we wrap it with
@@ -703,12 +744,28 @@ private:
     //    the first cluster barrier must be inserted just before the loop’s
     //    terminator, forming the wrap-around dependency.
     for (int i = 0; i < numClusters; i++) {
-      if (i == 0 && !hasTopBarrier) {
-        // Prime the first iteration's priority.  The loop-carried cluster-0
-        // barrier sits at the bottom of the loop body, so it only controls
-        // the next iteration.
+      if (i == 0) {
+        // Prime the first iteration's priority.  Subsequent iterations switch
+        // to cluster 0 at the loop tail.
         b.setInsertionPoint(forOp);
         emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+      }
+
+      bool emitPriorityAtBoundary = true;
+      if (i == 0) {
+        if (hasTopBarrier) {
+          // The top barrier represents the loop backedge, so keep cluster-0
+          // priority at the loop tail for the next iteration.
+          b.setInsertionPoint(terminatorOp);
+          emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+          b.setInsertionPoint(clusterOps[i]);
+          emitPriorityAtBoundary = false;
+        } else {
+          // Insert just before yield (= end of the loop).
+          b.setInsertionPoint(terminatorOp);
+        }
+      } else {
+        b.setInsertionPoint(clusterOps[i]);
       }
 
       if (auto exBar = existingBarrierMap.find(i);
@@ -718,26 +775,24 @@ private:
         // the producer to place such barriers only where no local fence is
         // needed.
         wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
-                            anyHasPriority);
+                            anyHasPriority, emitPriorityAtBoundary);
       } else {
-        b.setInsertionPoint(clusterOps[i]);
-        // The first one wraps back to the last of the loop
-        if (i == 0 && !hasTopBarrier) {
-          // inserts just before yield (=End of the loop).
-          b.setInsertionPoint(terminatorOp);
-        }
-        emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
+        if (emitPriorityAtBoundary)
+          emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
         emitClusterBarrier(b, loc, /*needLocal=*/bars[i]);
       }
     }
 
     // 5. Post-loop priority reset and reconverge.
     b.setInsertionPointAfter(forOp);
-    emitPipelinePostlude(b, loc, anyHasPriority, warpLow);
+    bool emitPostludeBarrier = hasTopBarrier;
+    emitPipelinePostlude(b, loc, anyHasPriority, warpLow, emitPostludeBarrier,
+                         /*needLocal=*/bars[0]);
   }
 
   ModuleAllocation &moduleAllocation;
   int threadsPerPipelineGroup;
+  triton::amdgpu::ISAFamily isaFamily;
   const DataFlowSolver &rangeSolver;
 };
 
@@ -829,23 +884,23 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
   }
 
   auto sameIterationSubstitution = [](Value value) {
-    return getWarpPipelineValueSubstitution(
-        value, scf::ForOp(), /*counterRelations=*/{},
-        /*nextIteration=*/false);
+    return getWarpPipelineValueSubstitution(value, scf::ForOp(),
+                                            /*counterRelations=*/{},
+                                            /*nextIteration=*/false);
   };
   SmallVector<BlockInfo> clusterInfo;
   for (auto *cb : clusterBlocks)
-    clusterInfo.push_back(buildBlockInfoFromBlock(
-        cb, allocation, bufferIndexAnalysis, sameIterationSubstitution,
-        allValuesStable));
+    clusterInfo.push_back(
+        buildBlockInfoFromBlock(cb, allocation, bufferIndexAnalysis,
+                                sameIterationSubstitution, allValuesStable));
 
   bool anyHasPriority = llvm::any_of(clusterOps, [](scf::ExecuteRegionOp op) {
     return op->hasAttr("triton.warp_pipeline.priority");
   });
 
   // 3. Linear dependency analysis (no wrap-around for flat pipelines).
-  analyzePipelineDependencies(clusterInfo, /*nextIterationClusterInfo=*/{}, bars,
-                              allocation,
+  analyzePipelineDependencies(clusterInfo, /*nextIterationClusterInfo=*/{},
+                              bars, allocation,
                               /*circular=*/false);
 
   // 4. Materialize cluster barriers.
@@ -1075,8 +1130,7 @@ static bool collectNextPipelineClusters(Operation *startOp,
 static bool isCrossPipelineSafe(ArrayRef<Block *> loopBlocks,
                                 ArrayRef<bool> loopBars,
                                 ArrayRef<Block *> nextBlocks,
-                                ArrayRef<bool> nextBars,
-                                Allocation *allocation,
+                                ArrayRef<bool> nextBars, Allocation *allocation,
                                 BufferIndexAnalysis *bufferIndexAnalysis) {
   int K = loopBlocks.size();
   int M = nextBlocks.size();
@@ -1084,19 +1138,19 @@ static bool isCrossPipelineSafe(ArrayRef<Block *> loopBlocks,
          "expected at least one cluster in the prior loop");
 
   auto sameIterationSubstitution = [](Value value) {
-    return getWarpPipelineValueSubstitution(
-        value, scf::ForOp(), /*counterRelations=*/{},
-        /*nextIteration=*/false);
+    return getWarpPipelineValueSubstitution(value, scf::ForOp(),
+                                            /*counterRelations=*/{},
+                                            /*nextIteration=*/false);
   };
   SmallVector<BlockInfo> mergedInfo;
   for (auto *b : loopBlocks)
-    mergedInfo.push_back(buildBlockInfoFromBlock(
-        b, allocation, bufferIndexAnalysis, sameIterationSubstitution,
-        allValuesStable));
+    mergedInfo.push_back(
+        buildBlockInfoFromBlock(b, allocation, bufferIndexAnalysis,
+                                sameIterationSubstitution, allValuesStable));
   for (auto *b : nextBlocks)
-    mergedInfo.push_back(buildBlockInfoFromBlock(
-        b, allocation, bufferIndexAnalysis, sameIterationSubstitution,
-        allValuesStable));
+    mergedInfo.push_back(
+        buildBlockInfoFromBlock(b, allocation, bufferIndexAnalysis,
+                                sameIterationSubstitution, allValuesStable));
 
   SmallVector<bool> mergedBars;
   mergedBars.reserve(K + M);
@@ -1275,7 +1329,8 @@ public:
     };
     ModuleAllocation moduleAllocation(m, allocationFn, partitionSize);
 
-    if (targetInfo.getISAFamily() == triton::amdgpu::ISAFamily::Unknown) {
+    auto isaFamily = targetInfo.getISAFamily();
+    if (isaFamily == triton::amdgpu::ISAFamily::Unknown) {
       m.emitError("unsupported target: '") << gfxArch.getValue() << "'";
       return signalPassFailure();
     }
@@ -1313,8 +1368,9 @@ public:
 
     RewritePatternSet patternFor(&getContext());
     RewritePatternSet patternInline(&getContext());
-    patternFor.add<ConvertPipelinedForPattern>(
-        &getContext(), moduleAllocation, threadsPerPipelineGroup, *rangeSolver);
+    patternFor.add<ConvertPipelinedForPattern>(&getContext(), moduleAllocation,
+                                               threadsPerPipelineGroup,
+                                               isaFamily, *rangeSolver);
     patternInline.add<InlineWarpPipelineExecuteRegionPattern>(&getContext());
 
     if (failed(applyPatternsGreedily(m, std::move(patternFor))))

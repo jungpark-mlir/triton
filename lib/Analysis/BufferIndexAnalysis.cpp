@@ -1,10 +1,12 @@
 #include "triton/Analysis/BufferIndexAnalysis.h"
+#include "triton/Analysis/Membar.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
-#include "llvm/ADT/SmallPtrSet.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include <optional>
 
 namespace mlir {
@@ -46,6 +48,36 @@ struct BufferIndexExpr {
 };
 
 namespace {
+
+enum class DFSState { Visiting, Visited };
+
+/// A CFG is reducible iff every retreating edge in a depth-first traversal is
+/// a backedge, i.e. its target dominates its source. Only blocks reachable
+/// from the function entry matter to membar's forward dataflow analysis.
+bool isReducibleCFG(Block *block, DenseMap<Block *, DFSState> &states,
+                    DominanceInfo &dominanceInfo) {
+  states[block] = DFSState::Visiting;
+
+  for (Block *successor : block->getTerminator()->getSuccessors()) {
+    auto it = states.find(successor);
+    if (it == states.end()) {
+      if (!isReducibleCFG(successor, states, dominanceInfo))
+        return false;
+      continue;
+    }
+    if (it->second == DFSState::Visiting &&
+        !dominanceInfo.dominates(successor, block))
+      return false;
+  }
+
+  states[block] = DFSState::Visited;
+  return true;
+}
+
+bool isReducibleCFG(FunctionOpInterface funcOp, DominanceInfo &dominanceInfo) {
+  DenseMap<Block *, DFSState> states;
+  return isReducibleCFG(&funcOp.getBlocks().front(), states, dominanceInfo);
+}
 
 using ValueSubstitutionFn = BufferIndexAnalysis::ValueSubstitutionFn;
 using ValueStabilityFn = BufferIndexAnalysis::ValueStabilityFn;
@@ -197,8 +229,7 @@ matchModuloPattern(arith::SelectOp selectOp, ValueSubstitutionFn substitute,
     return std::nullopt;
   }
 
-  auto wrapConst =
-      getConstantIntValue(wrapVal, substitute, allowSubstitution);
+  auto wrapConst = getConstantIntValue(wrapVal, substitute, allowSubstitution);
   if (!wrapConst || *wrapConst != 0)
     return std::nullopt;
 
@@ -252,10 +283,9 @@ analyzeBufferIndex(Value indexValue, ValueSubstitutionFn substitute,
   if (!resolved)
     return std::nullopt;
   indexValue = resolved->value;
-  auto withSubstitutionOffset = [&](BufferIndexExpr expr)
-      -> std::optional<BufferIndexExpr> {
-    if (__builtin_add_overflow(expr.constantOffset,
-                               resolved->constantOffset,
+  auto withSubstitutionOffset =
+      [&](BufferIndexExpr expr) -> std::optional<BufferIndexExpr> {
+    if (__builtin_add_overflow(expr.constantOffset, resolved->constantOffset,
                                &expr.constantOffset))
       return std::nullopt;
     return expr;
@@ -265,11 +295,11 @@ analyzeBufferIndex(Value indexValue, ValueSubstitutionFn substitute,
     return withSubstitutionOffset(BufferIndexExpr{nullptr, *c});
 
   if (auto addOp = indexValue.getDefiningOp<arith::AddIOp>()) {
-    auto composeWithConstant = [&](Value nonConst,
-                                   int64_t constant)
-        -> std::optional<BufferIndexExpr> {
-      auto baseExpr = analyzeBufferIndex(nonConst, substitute, isStable,
-                                         allowSubstitution);
+    auto composeWithConstant =
+        [&](Value nonConst,
+            int64_t constant) -> std::optional<BufferIndexExpr> {
+      auto baseExpr =
+          analyzeBufferIndex(nonConst, substitute, isStable, allowSubstitution);
       if (!baseExpr)
         return std::nullopt;
       // (x mod N) + C is not represented as (base, offset, mod); keep the
@@ -301,8 +331,8 @@ analyzeBufferIndex(Value indexValue, ValueSubstitutionFn substitute,
   // arith.remsi(x, N): strip the remainder and record N as the modulus.
   // N must be a positive compile-time constant.
   if (auto remOp = indexValue.getDefiningOp<arith::RemSIOp>()) {
-    if (auto mod = getConstantIntValue(remOp.getRhs(), substitute,
-                                       allowSubstitution);
+    if (auto mod =
+            getConstantIntValue(remOp.getRhs(), substitute, allowSubstitution);
         mod && *mod > 0) {
       auto result = analyzeBufferIndex(remOp.getLhs(), substitute, isStable,
                                        allowSubstitution);
@@ -360,7 +390,8 @@ std::pair<Value, bool> extractBufferIndex(Value value,
 } // namespace
 
 BufferIndexAnalysis::BufferIndexAnalysis(FunctionOpInterface funcOp)
-    : dominanceInfo(funcOp) {}
+    : dominanceInfo(funcOp),
+      hasReducibleCFG(isReducibleCFG(funcOp, dominanceInfo)) {}
 
 BufferIndexAnalysis::~BufferIndexAnalysis() = default;
 
@@ -416,6 +447,9 @@ void BufferIndexAnalysis::attachBufferIndex(AllocationSlice &slice,
 void BufferIndexAnalysis::attachBufferIndex(AllocationSlice &slice, Value value,
                                             ValueSubstitutionFn substitute,
                                             ValueStabilityFn isStable) {
+  if (!hasReducibleCFG)
+    return;
+
   auto [index, allowSubstitution] =
       extractBufferIndex(value, substitute, /*allowSubstitution=*/true);
   if (!index)
