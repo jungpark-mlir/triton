@@ -101,3 +101,11 @@ docs/sg_execution_times.rst
 .DS_Store
 
 AGENTS.override.md
+
+# Local GEMM experiments and profiler artifacts
+/.rocprofv3/
+/MatchTable.yaml
+/a.out
+/experiments/
+/run/
+/trace/
