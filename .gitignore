@@ -106,6 +106,5 @@ AGENTS.override.md
 /.rocprofv3/
 /MatchTable.yaml
 /a.out
-/experiments/
 /run/
 /trace/
