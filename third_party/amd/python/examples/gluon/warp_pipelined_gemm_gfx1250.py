@@ -403,6 +403,410 @@ def f16_cluster_kernelC_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_
 
 
 @gluon.jit
+def _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_dst, b_dst, BLOCK_K: gl.constexpr):
+    tdm.async_load(a_desc, [0, 0], a_dst, warp_used_hint=0b00001111)
+    tdm.async_load(b_desc, [0, 0], b_dst, warp_used_hint=0b00001111)
+    a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K])
+    b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K])
+    return a_desc, b_desc
+
+
+@gluon.jit
+def _bf16_kernelc_3pf_load_slot(a_buf, b_buf, slot, DOT_A: gl.constexpr, DOT_B: gl.constexpr):
+    a = a_buf.index(slot).load(layout=DOT_A)
+    b = b_buf.index(slot).permute([1, 0]).load(layout=DOT_B)
+    return a, b
+
+
+@gluon.jit
+def _bf16_kernelc_3pf_load_dynamic(phase, a_buf, b_buf, DOT_A: gl.constexpr, DOT_B: gl.constexpr):
+    a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, phase % 3, DOT_A, DOT_B)
+    return phase + 1, a, b
+
+
+@gluon.jit
+def bf16_kernelc_3pf_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn,
+                             stride_cm, stride_cn, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+                             BLOCK_K: gl.constexpr, GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr,
+                             GROUP_SIZE_M: gl.constexpr, NUM_WARPS: gl.constexpr):
+    """Materialized form of the partitioned KernelC that measured 3 PFLOPS."""
+    gl.static_assert(a_ptr.type.element_ty.is_bf16() and b_ptr.type.element_ty.is_bf16(),
+                     "bf16_kernelc_3pf_gfx1250 requires BF16 inputs")
+    gl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 64)
+    gl.static_assert(NUM_WARPS == 8)
+    pid_m, pid_n = get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    padded_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0])
+    padded_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0])
+    layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        BLOCK_M, BLOCK_N, padded_a, padded_b, NUM_WARPS, [16, 16, 32], a_transposed=False, b_transposed=True,
+        transposed=True)
+    shared_a: gl.constexpr = layouts[0]
+    shared_b: gl.constexpr = layouts[1]
+    wmma: gl.constexpr = layouts[2]
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma, 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma, 8)
+
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K), strides=(stride_am, stride_ak),
+                                        block_shape=(BLOCK_M, BLOCK_K), layout=shared_a)
+    b_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K), strides=(stride_bn, stride_bk),
+                                        block_shape=(BLOCK_N, BLOCK_K), layout=shared_b)
+    a_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [3, BLOCK_M, BLOCK_K], shared_a)
+    b_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [3, BLOCK_N, BLOCK_K], shared_b)
+
+    a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_buf.index(0), b_buf.index(0), BLOCK_K)
+    a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_buf.index(1), b_buf.index(1), BLOCK_K)
+    tdm.async_wait(2)
+
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma)
+
+    # Preserve the exact three-slot refill-first schedule used by the measured
+    # partitioned experiment. Complete ring rotations use static LDS slots.
+    for _ in range(0, (gl.cdiv(K, BLOCK_K) - 2) // 3):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(2), b_buf.index(2), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 0, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        tdm.async_wait(2)
+
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(0), b_buf.index(0), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 1, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        tdm.async_wait(2)
+
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(1), b_buf.index(1), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 2, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        tdm.async_wait(2)
+
+    phase = ((gl.cdiv(K, BLOCK_K) - 2) // 3) * 3
+    for _ in range(0, (gl.cdiv(K, BLOCK_K) - 2) % 3):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            write_phase = phase + 2
+            phase, a, b = _bf16_kernelc_3pf_load_dynamic(phase, a_buf, b_buf, dot_a, dot_b)
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(write_phase % 3), b_buf.index(write_phase % 3), BLOCK_K)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        tdm.async_wait(2)
+
+    for _ in gl.static_range(2):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            phase, a, b = _bf16_kernelc_3pf_load_dynamic(phase, a_buf, b_buf, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        tdm.async_wait(0)
+
+    # The historical 3-PFLOPS result used this one-CTA TDM-store epilogue.
+    c_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_N, 4]], [BLOCK_M, BLOCK_N],
+                                                                           [1, 0])
+    c_shared = gl.allocate_shared_memory(c_ptr.type.element_ty, [BLOCK_M, BLOCK_N], c_shared_layout)
+    c_shared.store(acc.to(c_ptr.type.element_ty))
+    c_desc = tdm.make_tensor_descriptor(base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
+                                        block_shape=(BLOCK_M, BLOCK_N), layout=c_shared_layout)
+    tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_shared)
+    tdm.async_wait(0)
+
+
+@gluon.jit
+def _bf16_kernelc_2pf_consume_slot(a_buf, b_buf, slot, acc, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+                                   HALF_K: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        a = a_buf.index(slot).slice(0, HALF_K, 1).load(layout=DOT_A)
+        b = b_buf.index(slot).slice(0, HALF_K, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        acc = gl.amd.gfx1250.wmma(a, b, acc)
+
+    with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        a = a_buf.index(slot).slice(HALF_K, HALF_K, 1).load(layout=DOT_A)
+        b = b_buf.index(slot).slice(HALF_K, HALF_K, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        acc = gl.amd.gfx1250.wmma(a, b, acc)
+    return acc
+
+
+@gluon.jit
+def _bf16_kernelc_2pf_consume_and_refill(a_buf, b_buf, slot, a_desc, b_desc, acc, DOT_A: gl.constexpr,
+                                        DOT_B: gl.constexpr, HALF_K: gl.constexpr, BLOCK_K: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        a = a_buf.index(slot).slice(0, HALF_K, 1).load(layout=DOT_A)
+        b = b_buf.index(slot).slice(0, HALF_K, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        acc = gl.amd.gfx1250.wmma(a, b, acc)
+
+    with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        a = a_buf.index(slot).slice(HALF_K, HALF_K, 1).load(layout=DOT_A)
+        b = b_buf.index(slot).slice(HALF_K, HALF_K, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        # The stage0 boundary waits for the LDS reads before the refill starts
+        # overwriting this slot. WMMA only consumes the register operands.
+        a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+            a_desc, b_desc, a_buf.index(slot), b_buf.index(slot), BLOCK_K)
+        acc = gl.amd.gfx1250.wmma(a, b, acc)
+    return a_desc, b_desc, acc
+
+
+@gluon.jit
+def bf16_kernelc_2pf_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn,
+                             stride_cm, stride_cn, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+                             BLOCK_K: gl.constexpr, GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr,
+                             GROUP_SIZE_M: gl.constexpr, NUM_WARPS: gl.constexpr):
+    """KernelC full-tile schedule with double-buffered BK128 TDM copies."""
+    gl.static_assert(a_ptr.type.element_ty.is_bf16() and b_ptr.type.element_ty.is_bf16(),
+                     "bf16_kernelc_2pf_gfx1250 requires BF16 inputs")
+    gl.static_assert(BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 128)
+    gl.static_assert(NUM_WARPS == 8)
+    pid_m, pid_n = get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    padded_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0])
+    padded_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0])
+    layouts: gl.constexpr = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        BLOCK_M, BLOCK_N, padded_a, padded_b, NUM_WARPS, [16, 16, 32], a_transposed=False, b_transposed=True,
+        transposed=True)
+    shared_a: gl.constexpr = layouts[0]
+    shared_b: gl.constexpr = layouts[1]
+    wmma: gl.constexpr = layouts[2]
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma, 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma, 8)
+
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K), strides=(stride_am, stride_ak),
+                                        block_shape=(BLOCK_M, BLOCK_K), layout=shared_a)
+    b_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K), strides=(stride_bn, stride_bk),
+                                        block_shape=(BLOCK_N, BLOCK_K), layout=shared_b)
+    a_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [2, BLOCK_M, BLOCK_K], shared_a)
+    b_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [2, BLOCK_N, BLOCK_K], shared_b)
+
+    a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_buf.index(0), b_buf.index(0), BLOCK_K)
+    a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_buf.index(1), b_buf.index(1), BLOCK_K)
+    tdm.async_wait(2)
+
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma)
+    iter_max = gl.cdiv(K, BLOCK_K)
+    gl.assume(iter_max >= 2)
+    half_k: gl.constexpr = BLOCK_K // 2
+
+    # Consume and refill complete two-slot rotations with compile-time LDS
+    # addresses. Split each BK128 tile into two full-MN BK64 WMMAs to keep
+    # operand register pressure equal to the BK64 KernelC.
+    for _ in range(0, (iter_max - 2) // 2):
+        a_desc, b_desc, acc = _bf16_kernelc_2pf_consume_and_refill(
+            a_buf, b_buf, 0, a_desc, b_desc, acc, dot_a, dot_b, half_k, BLOCK_K)
+        tdm.async_wait(2)
+
+        a_desc, b_desc, acc = _bf16_kernelc_2pf_consume_and_refill(
+            a_buf, b_buf, 1, a_desc, b_desc, acc, dot_a, dot_b, half_k, BLOCK_K)
+        tdm.async_wait(2)
+
+    phase = ((iter_max - 2) // 2) * 2
+    for _ in range(0, (iter_max - 2) % 2):
+        slot = phase % 2
+        a_desc, b_desc, acc = _bf16_kernelc_2pf_consume_and_refill(
+            a_buf, b_buf, slot, a_desc, b_desc, acc, dot_a, dot_b, half_k, BLOCK_K)
+        tdm.async_wait(2)
+        phase += 1
+
+    tdm.async_wait(0)
+    for _ in gl.static_range(2):
+        acc = _bf16_kernelc_2pf_consume_slot(
+            a_buf, b_buf, phase % 2, acc, dot_a, dot_b, half_k)
+        phase += 1
+
+    c_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_N, 4]], [BLOCK_M, BLOCK_N],
+                                                                           [1, 0])
+    c_shared = gl.allocate_shared_memory(c_ptr.type.element_ty, [BLOCK_M, BLOCK_N], c_shared_layout)
+    c_shared.store(acc.to(c_ptr.type.element_ty))
+    c_desc = tdm.make_tensor_descriptor(base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
+                                        block_shape=(BLOCK_M, BLOCK_N), layout=c_shared_layout)
+    tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_shared)
+    tdm.async_wait(0)
+
+
+@gluon.jit
+def _bf16_cluster_4x4_wait(wait_count: gl.constexpr):
+    gl.amd.gfx1250.cluster.arrive()
+    tdm.async_wait(wait_count)
+    gl.amd.gfx1250.cluster.wait()
+
+
+@gluon.jit
+def bf16_cluster_4x4_tdm_kernel_gfx1250(
+        a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, GRID_MN: gl.constexpr,
+        NUM_XCDS: gl.constexpr, GROUP_SIZE_M: gl.constexpr, NUM_WARPS: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr):
+    """Standalone 4x4 cluster KernelC with a CGA-aware TDM-store epilogue."""
+    gl.static_assert(a_ptr.type.element_ty.is_bf16() and b_ptr.type.element_ty.is_bf16(),
+                     "bf16_cluster_4x4_tdm_kernel_gfx1250 requires BF16 inputs")
+    gl.static_assert(BLOCK_M == 1024 and BLOCK_N == 1024 and BLOCK_K == 64)
+    gl.static_assert(NUM_WARPS == 8)
+    gl.static_assert(gl.num_ctas() == 16, "BF16 4x4 cluster KernelC requires 16 CTAs")
+    pid_m, pid_n = get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 8)
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K), strides=(stride_am, stride_ak),
+                                        block_shape=(BLOCK_M, BLOCK_K), layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K), strides=(stride_bn, stride_bk),
+                                        block_shape=(BLOCK_N, BLOCK_K), layout=SHARED_LAYOUT_B)
+    a_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [3, BLOCK_M, BLOCK_K], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [3, BLOCK_N, BLOCK_K], SHARED_LAYOUT_B)
+
+    a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_buf.index(0), b_buf.index(0), BLOCK_K)
+    a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_buf.index(1), b_buf.index(1), BLOCK_K)
+    _bf16_cluster_4x4_wait(2)
+
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+
+    for _ in range(0, (gl.cdiv(K, BLOCK_K) - 2) // 3):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(2), b_buf.index(2), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 0, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(2)
+
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(0), b_buf.index(0), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 1, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(2)
+
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(1), b_buf.index(1), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 2, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(2)
+
+    phase = ((gl.cdiv(K, BLOCK_K) - 2) // 3) * 3
+    for _ in range(0, (gl.cdiv(K, BLOCK_K) - 2) % 3):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            write_phase = phase + 2
+            phase, a, b = _bf16_kernelc_3pf_load_dynamic(phase, a_buf, b_buf, dot_a, dot_b)
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(write_phase % 3), b_buf.index(write_phase % 3), BLOCK_K)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(2)
+
+    for _ in gl.static_range(2):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            phase, a, b = _bf16_kernelc_3pf_load_dynamic(phase, a_buf, b_buf, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(0)
+
+    c_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0], WMMA_LAYOUT.cga_layout)
+    c_shared = gl.allocate_shared_memory(c_ptr.type.element_ty, [BLOCK_M, BLOCK_N], c_shared_layout)
+    c_shared.store(acc.to(c_ptr.type.element_ty))
+    c_desc = tdm.make_tensor_descriptor(base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
+                                        block_shape=(BLOCK_M, BLOCK_N), layout=c_shared_layout)
+    tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_shared)
+    tdm.async_wait(0)
+
+
+@gluon.jit
+def bf16_cluster_4x4_identity_tdm_kernel_gfx1250(
+        a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, NUM_WARPS: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr):
+    """4x4 cluster KernelC with direct two-dimensional cluster coordinates."""
+    gl.static_assert(a_ptr.type.element_ty.is_bf16() and b_ptr.type.element_ty.is_bf16(),
+                     "bf16_cluster_4x4_identity_tdm_kernel_gfx1250 requires BF16 inputs")
+    gl.static_assert(BLOCK_M == 1024 and BLOCK_N == 1024 and BLOCK_K == 64)
+    gl.static_assert(NUM_WARPS == 8)
+    gl.static_assert(gl.num_ctas() == 16, "BF16 4x4 identity cluster KernelC requires 16 CTAs")
+    pid_m = gl.program_id(axis=0)
+    pid_n = gl.program_id(axis=1)
+
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 8)
+    a_base = pid_m * BLOCK_M * stride_am
+    b_base = pid_n * BLOCK_N * stride_bn
+    a_desc = tdm.make_tensor_descriptor(base=a_ptr + a_base, shape=(M, K), strides=(stride_am, stride_ak),
+                                        block_shape=(BLOCK_M, BLOCK_K), layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(base=b_ptr + b_base, shape=(N, K), strides=(stride_bn, stride_bk),
+                                        block_shape=(BLOCK_N, BLOCK_K), layout=SHARED_LAYOUT_B)
+    a_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [3, BLOCK_M, BLOCK_K], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [3, BLOCK_N, BLOCK_K], SHARED_LAYOUT_B)
+
+    a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_buf.index(0), b_buf.index(0), BLOCK_K)
+    a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(a_desc, b_desc, a_buf.index(1), b_buf.index(1), BLOCK_K)
+    _bf16_cluster_4x4_wait(2)
+
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+
+    for _ in range(0, (gl.cdiv(K, BLOCK_K) - 2) // 3):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(2), b_buf.index(2), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 0, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(2)
+
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(0), b_buf.index(0), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 1, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(2)
+
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(1), b_buf.index(1), BLOCK_K)
+            a, b = _bf16_kernelc_3pf_load_slot(a_buf, b_buf, 2, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(2)
+
+    phase = ((gl.cdiv(K, BLOCK_K) - 2) // 3) * 3
+    for _ in range(0, (gl.cdiv(K, BLOCK_K) - 2) % 3):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            write_phase = phase + 2
+            phase, a, b = _bf16_kernelc_3pf_load_dynamic(phase, a_buf, b_buf, dot_a, dot_b)
+            a_desc, b_desc = _bf16_kernelc_3pf_issue_loads(
+                a_desc, b_desc, a_buf.index(write_phase % 3), b_buf.index(write_phase % 3), BLOCK_K)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(2)
+
+    for _ in gl.static_range(2):
+        with gl.amd.warp_pipeline_stage("stage0", priority=0):
+            phase, a, b = _bf16_kernelc_3pf_load_dynamic(phase, a_buf, b_buf, dot_a, dot_b)
+        with gl.amd.warp_pipeline_stage("stage1", priority=1):
+            acc = gl.amd.gfx1250.wmma(a, b, acc)
+        _bf16_cluster_4x4_wait(0)
+
+    c_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0], WMMA_LAYOUT.cga_layout)
+    c_shared = gl.allocate_shared_memory(c_ptr.type.element_ty, [BLOCK_M, BLOCK_N], c_shared_layout)
+    c_shared.store(acc.to(c_ptr.type.element_ty))
+    c_desc = tdm.make_tensor_descriptor(base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
+                                        block_shape=(BLOCK_M, BLOCK_N), layout=c_shared_layout)
+    tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_shared)
+    tdm.async_wait(0)
+
+
+@gluon.jit
 def _consume_bf16_slice_mnk_tile(a_buf, b_buf, slot, acc_tl, acc_bl, acc_tr, acc_br, DOT_A: gl.constexpr,
                                  DOT_B: gl.constexpr, SUBTILE_M: gl.constexpr, SUBTILE_N: gl.constexpr,
                                  SUBTILE_K: gl.constexpr):
@@ -1460,7 +1864,22 @@ def _build_fp8_scaled_cluster_layouts(BLOCK_M, BLOCK_N, BLOCK_K, SCALE_BLOCK, NU
 def _build_f16_cluster_layouts(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS, cga_layout_c):
     """Build layouts for an F16 tile distributed across a CTA cluster."""
     assert NUM_WARPS == 8
-    wmma = gl.amd.AMDWMMALayout(3, True, ((0, 1), (1, 0), (2, 0)), [], [16, 16, 32], cga_layout_c)
+    cta_m = 4
+    cta_n = 4
+    slice_m = BLOCK_M // cta_m
+    slice_n = BLOCK_N // cta_n
+
+    # Derive the same partition-aware warp/register mapping used by the
+    # historical 256x256 KernelC, then distribute that local tile across the
+    # 4x4 CGA.
+    padded_a_local = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0])
+    padded_b_local = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0])
+    local_layouts = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        BLOCK_M, BLOCK_N, padded_a_local, padded_b_local, NUM_WARPS, [16, 16, 32], a_transposed=False,
+        b_transposed=True, slice_m=slice_m, slice_n=slice_n, transposed=True)
+    local_wmma = local_layouts[2]
+    wmma = gl.amd.AMDWMMALayout(3, local_wmma.transposed, local_wmma.warp_bases, local_wmma.reg_bases,
+                                local_wmma.instr_shape, cga_layout_c)
     dot_a = gl.DotOperandLayout(0, wmma, 8)
     dot_b = gl.DotOperandLayout(1, wmma, 8)
     cga_layout_a = dot_a.cga_layout
@@ -3039,6 +3458,32 @@ def _event_probe(fn, iters):
     return start.elapsed_time(end) / iters
 
 
+def _run_direct_benchmark(launch, M, N, K, warmup, iters):
+    if iters <= 0:
+        raise ValueError("--direct-iters must be positive")
+
+    for _ in range(warmup):
+        launch()
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        launch()
+    torch.cuda.synchronize()
+    elapsed_s = time.perf_counter() - t0
+
+    per_iter_s = elapsed_s / iters
+    tflops = (2 * M * N * K) / per_iter_s / 1e12
+
+    print("benchmark mode   : direct synchronized CPU wall")
+    print(f"warmup iters     : {warmup}")
+    print(f"total iters      : {iters}")
+    print()
+    print(f"total elapsed    : {elapsed_s:.6f} s")
+    print(f"per-iter         : {per_iter_s * 1e6:.2f} us")
+    print(f"TFLOPS           : {tflops:.3f}")
+
+
 def _capture_graph(fn, n_per_graph):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -3155,6 +3600,33 @@ def _make_f16_case(args):
     return launch, check
 
 
+def _make_bf16_kernelc_3pf_inputs(args):
+    output_dtype = torch.bfloat16 if args.bf16_output else torch.float32
+    if args.input_mode == "random":
+        torch.manual_seed(42)
+        a = torch.randn((args.M, args.K), dtype=torch.bfloat16)
+        b = torch.randn((args.K, args.N), dtype=torch.bfloat16)
+        if args.transpose_b:
+            b = b.T.contiguous()
+        c = torch.zeros((args.M, args.N), dtype=output_dtype)
+        return a.cuda(), b.cuda(), c.cuda()
+
+    device = torch.device("cuda")
+    a = torch.empty((args.M, args.K), dtype=torch.bfloat16, device=device)
+    b_shape = (args.N, args.K) if args.transpose_b else (args.K, args.N)
+    b = torch.empty(b_shape, dtype=torch.bfloat16, device=device)
+    chunk = 8 * 1024 * 1024
+    for output, cosine in ((a, False), (b, True)):
+        flat = output.view(-1)
+        for begin in range(0, flat.numel(), chunk):
+            end = min(begin + chunk, flat.numel())
+            angle = torch.arange(begin, end, dtype=torch.float64, device=device)
+            value = torch.cos(angle) if cosine else torch.sin(angle)
+            flat[begin:end].copy_(value.float())
+    c = torch.zeros((args.M, args.N), dtype=output_dtype, device=device)
+    return a, b, c
+
+
 def _make_bf16_case(args):
     if args.dtype_b != "bfloat16":
         raise ValueError("The BF16 path requires --dtype-a bfloat16 --dtype-b bfloat16")
@@ -3162,27 +3634,73 @@ def _make_bf16_case(args):
         raise ValueError("--scale-preshuffled and --async-copy-scale do not apply to BF16")
     if not args.transpose_b:
         raise ValueError("The BF16 SliceMNK kernel expects --transpose-b so K is contiguous in B")
-    if (args.BM, args.BN) != (256, 256):
-        raise ValueError("The BF16 SliceMNK kernel requires -BM 256 -BN 256")
+    is_cluster_4x4 = args.bf16_cluster_4x4_tdm or args.bf16_cluster_4x4_identity_tdm
+    expected_mn = (1024, 1024) if is_cluster_4x4 else (256, 256)
+    if (args.BM, args.BN) != expected_mn:
+        raise ValueError(
+            f"The selected BF16 kernel requires -BM {expected_mn[0]} -BN {expected_mn[1]}")
     if args.num_warps != 8:
         raise ValueError("The BF16 SliceMNK kernel requires --num-warps 8")
-    if (args.BK, args.num_buffers) not in ((128, 2), (64, 3)):
+    is_kernelc = args.bf16_kernelc_3pf or args.bf16_kernelc_2pf or is_cluster_4x4
+    if (args.bf16_kernelc_3pf or is_cluster_4x4) and (args.BK, args.num_buffers) != (64, 3):
+        raise ValueError("The restored BF16 KernelC requires -BK 64 and --num-buffers 3")
+    if args.bf16_kernelc_2pf and (args.BK, args.num_buffers) != (128, 2):
+        raise ValueError("The double-buffered BF16 KernelC requires -BK 128 and --num-buffers 2")
+    if args.bf16_cluster_4x4_tdm and (args.group_size_m != 4 or args.num_xcds != 8):
+        raise ValueError("The isolated 4x4 result requires --group-size-m 4 and --num-xcds 8")
+    if not is_kernelc and (args.BK, args.num_buffers) not in ((128, 2), (64, 3)):
         raise ValueError("The BF16 SliceMNK kernel supports BK128 with 2 buffers or BK64 with 3 buffers")
     if args.M % args.BM or args.N % args.BN or args.K % args.BK:
         raise ValueError("The BF16 SliceMNK kernel requires M, N, and K divisible by their block sizes")
     if triton.cdiv(args.K, args.BK) < args.num_buffers:
         raise ValueError("The BF16 SliceMNK kernel requires at least NUM_BUFFERS K tiles")
 
-    torch.manual_seed(args.seed)
-    a = torch.randn((args.M, args.K), dtype=torch.bfloat16, device="cuda")
-    b = torch.randn((args.K, args.N), dtype=torch.bfloat16)
-    if args.transpose_b:
-        b = b.T.contiguous()
-    b = b.cuda()
-    c = torch.zeros((args.M, args.N), dtype=torch.float32, device="cuda")
+    if is_kernelc:
+        a, b, c = _make_bf16_kernelc_3pf_inputs(args)
+    else:
+        torch.manual_seed(args.seed)
+        a = torch.randn((args.M, args.K), dtype=torch.bfloat16, device="cuda")
+        b = torch.randn((args.K, args.N), dtype=torch.bfloat16)
+        if args.transpose_b:
+            b = b.T.contiguous()
+        b = b.cuda()
+        output_dtype = torch.bfloat16 if args.bf16_output else torch.float32
+        c = torch.zeros((args.M, args.N), dtype=output_dtype, device="cuda")
     grid = (triton.cdiv(args.M, args.BM) * triton.cdiv(args.N, args.BN), 1)
+    identity_cluster_grid = (triton.cdiv(args.M, args.BM), triton.cdiv(args.N, args.BN))
+    cluster_layouts = None
+    if is_cluster_4x4:
+        cga_layout_c = make_cga_layout([4, 4], [4, 4], [0, 1])
+        cluster_layouts = _build_f16_cluster_layouts(args.BM, args.BN, args.BK, args.num_warps, cga_layout_c)
 
     def launch():
+        if args.bf16_cluster_4x4_identity_tdm:
+            shared_a, shared_b, wmma = cluster_layouts
+            return bf16_cluster_4x4_identity_tdm_kernel_gfx1250[identity_cluster_grid](
+                a, b, c, args.M, args.N, args.K, a.stride(0), a.stride(1), b.stride(1), b.stride(0), c.stride(0),
+                c.stride(1), BLOCK_M=args.BM, BLOCK_N=args.BN, BLOCK_K=args.BK, NUM_WARPS=args.num_warps,
+                SHARED_LAYOUT_A=shared_a, SHARED_LAYOUT_B=shared_b, WMMA_LAYOUT=wmma, num_warps=args.num_warps,
+                waves_per_eu=args.num_warps // 4, num_ctas=16)
+        if args.bf16_cluster_4x4_tdm:
+            shared_a, shared_b, wmma = cluster_layouts
+            return bf16_cluster_4x4_tdm_kernel_gfx1250[grid](
+                a, b, c, args.M, args.N, args.K, a.stride(0), a.stride(1), b.stride(1), b.stride(0), c.stride(0),
+                c.stride(1), BLOCK_M=args.BM, BLOCK_N=args.BN, BLOCK_K=args.BK, GRID_MN=grid[0],
+                NUM_XCDS=args.num_xcds, GROUP_SIZE_M=args.group_size_m, NUM_WARPS=args.num_warps,
+                SHARED_LAYOUT_A=shared_a, SHARED_LAYOUT_B=shared_b, WMMA_LAYOUT=wmma, num_warps=args.num_warps,
+                waves_per_eu=args.num_warps // 4, num_ctas=16)
+        if args.bf16_kernelc_3pf:
+            return bf16_kernelc_3pf_gfx1250[grid](
+                a, b, c, args.M, args.N, args.K, a.stride(0), a.stride(1), b.stride(1), b.stride(0), c.stride(0),
+                c.stride(1), BLOCK_M=args.BM, BLOCK_N=args.BN, BLOCK_K=args.BK, GRID_MN=grid[0],
+                NUM_XCDS=args.num_xcds, GROUP_SIZE_M=args.group_size_m, NUM_WARPS=args.num_warps,
+                num_warps=args.num_warps, waves_per_eu=args.num_warps // 4)
+        if args.bf16_kernelc_2pf:
+            return bf16_kernelc_2pf_gfx1250[grid](
+                a, b, c, args.M, args.N, args.K, a.stride(0), a.stride(1), b.stride(1), b.stride(0), c.stride(0),
+                c.stride(1), BLOCK_M=args.BM, BLOCK_N=args.BN, BLOCK_K=args.BK, GRID_MN=grid[0],
+                NUM_XCDS=args.num_xcds, GROUP_SIZE_M=args.group_size_m, NUM_WARPS=args.num_warps,
+                num_warps=args.num_warps, waves_per_eu=args.num_warps // 4)
         return bf16_slice_mnk_warp_pipeline_kernel_gfx1250[grid](
             a, b, c, args.M, args.N, args.K, a.stride(0), a.stride(1), b.stride(1), b.stride(0), c.stride(0),
             c.stride(1), BLOCK_M=args.BM, BLOCK_N=args.BN, BLOCK_K=args.BK, GROUP_SIZE_M=args.group_size_m,
@@ -3195,7 +3713,12 @@ def _make_bf16_case(args):
         torch.cuda.synchronize()
         ref_b = b.cpu().T.to(torch.float32) if args.transpose_b else b.cpu().to(torch.float32)
         ref = a.cpu().to(torch.float32) @ ref_b
-        torch.testing.assert_close(c.cpu(), ref, rtol=1e-3, atol=1e-2)
+        output = c.cpu()
+        if args.bf16_output:
+            ref = ref.to(torch.bfloat16)
+            torch.testing.assert_close(output, ref, rtol=1e-2, atol=2.5e-1)
+        else:
+            torch.testing.assert_close(output, ref, rtol=1e-3, atol=1e-2)
         print("result verified", flush=True)
 
     return launch, check
@@ -3635,6 +4158,19 @@ def _build_arg_parser():
                         help="Scaled FP8 tutorial A/B-prefetch distance in BK tiles (0 disables)")
     parser.add_argument("--f16-cluster-kernelC", dest="f16_cluster_kernel_c", action="store_true",
                         help="Use the four-CTA, 512x512 F16 KernelC kernel")
+    parser.add_argument("--bf16-kernelc-3pf", dest="bf16_kernelc_3pf", action="store_true",
+                        help="Use the restored 256x256x64 BF16 KernelC with its TDM-store epilogue")
+    parser.add_argument("--bf16-kernelc-2pf", dest="bf16_kernelc_2pf", action="store_true",
+                        help="Use the double-buffered 256x256x128 BF16 KernelC")
+    parser.add_argument("--bf16-cluster-4x4-tdm", dest="bf16_cluster_4x4_tdm", action="store_true",
+                        help="Use the standalone 16-CTA BF16 KernelC with its CGA-aware TDM-store epilogue")
+    parser.add_argument("--bf16-cluster-4x4-identity-tdm", dest="bf16_cluster_4x4_identity_tdm",
+                        action="store_true",
+                        help="Use a separate 16-CTA BF16 KernelC with direct 2D cluster coordinates")
+    parser.add_argument("--bf16-output", action="store_true",
+                        help="Store BF16 instead of FP32 from BF16 kernels")
+    parser.add_argument("--input-mode", choices=["random", "trig"], default="random",
+                        help="Input initialization for the restored BF16 KernelC")
     parser.add_argument("--fp8-cluster", action="store_true",
                         help="Use the 2-CTA, 512x256 scaled-FP8 cluster tutorial kernel")
     parser.add_argument("--fp8-scaled-cluster-bk128", action="store_true",
@@ -3650,8 +4186,12 @@ def _build_arg_parser():
                         help="Use partition-aware gfx1250 WMMA/shared layouts for FP16/MXFP; plain FP8 always uses them")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check", action="store_true", help="Check output against torch")
-    parser.add_argument("--benchmark", action="store_true", help="Benchmark with CUDA graph replay")
+    parser.add_argument("--benchmark", action="store_true", help="Benchmark the selected kernel")
+    parser.add_argument("--benchmark-mode", choices=["graph", "direct"], default="graph",
+                        help="Use CUDA graph replay or direct synchronized CPU-wall timing")
     parser.add_argument("--warmup", type=int, default=10, help="Benchmark warmup iterations")
+    parser.add_argument("--direct-iters", type=int, default=1000,
+                        help="Timed iterations for --benchmark-mode direct")
     parser.add_argument("--probe-iters", type=int, default=20, help="Iterations for CUDA event timing probe")
     parser.add_argument("--graph-ms", type=float, default=100.0, help="Target CUDA graph body duration in ms")
     parser.add_argument("--n-replays", type=int, default=20, help="Number of CUDA graph replays to time")
@@ -3664,16 +4204,33 @@ if __name__ == "__main__":
     dedicated_mxfp4 = args.mxfp4_tutorial or args.mxfp4_kernel_c
     if dedicated_mxfp4:
         if (args.mxfp or args.with_scale or args.with_a_scale or args.f16_cluster_kernel_c or args.fp8_cluster
-                or args.fp8_scaled_cluster_bk128 or args.kernel_c or args.async_copy_scale):
+                or args.bf16_kernelc_3pf or args.bf16_kernelc_2pf or args.bf16_cluster_4x4_tdm
+                or args.bf16_cluster_4x4_identity_tdm or args.fp8_scaled_cluster_bk128 or args.kernel_c
+                or args.async_copy_scale):
             raise ValueError(
                 "Dedicated MXFP4 selectors cannot be combined with --mxfp, --with-scale, --with-a-scale, "
-                "--f16-cluster-kernelC, --fp8-cluster, --fp8-scaled-cluster-bk128, --kernelC, "
+                "--f16-cluster-kernelC, --bf16-kernelc-3pf, --bf16-kernelc-2pf, --bf16-cluster-4x4-tdm, "
+                "--bf16-cluster-4x4-identity-tdm, --fp8-cluster, --fp8-scaled-cluster-bk128, --kernelC, "
                 "or --async-copy-scale")
         args.dtype_a = "float4"
         args.dtype_b = "float4"
         args.scale_preshuffled = True
+    bf16_kernelc_selectors = (
+        args.bf16_kernelc_3pf,
+        args.bf16_kernelc_2pf,
+        args.bf16_cluster_4x4_tdm,
+        args.bf16_cluster_4x4_identity_tdm,
+    )
+    if any(bf16_kernelc_selectors):
+        if args.f16_cluster_kernel_c or args.fp8_cluster or args.fp8_scaled_cluster_bk128 or args.kernel_c:
+            raise ValueError("BF16 KernelC selectors cannot be combined with another kernel selector")
+        if sum(bf16_kernelc_selectors) > 1:
+            raise ValueError("BF16 KernelC selectors are mutually exclusive")
+        args.dtype_a = "bfloat16"
+        args.dtype_b = "bfloat16"
     if args.num_buffers is None:
-        args.num_buffers = 3 if (args.mxfp4_kernel_c or args.f16_cluster_kernel_c
+        args.num_buffers = 3 if (args.mxfp4_kernel_c or args.f16_cluster_kernel_c or args.bf16_kernelc_3pf
+                                 or args.bf16_cluster_4x4_tdm or args.bf16_cluster_4x4_identity_tdm
                                  or args.fp8_scaled_cluster_bk128) else 2
     if args.dtype_b is None:
         args.dtype_b = args.dtype_a
@@ -3692,9 +4249,10 @@ if __name__ == "__main__":
         raise ValueError("--fp8-scaled-cluster-bk128 requires the plain-FP8 --with-scale path")
     partition_conflict_avoidance = plain_fp8 or dedicated_mxfp4 or args.resolve_partition_conflicts
     if args.BK is None:
-        args.BK = 128 if args.fp8_scaled_cluster_bk128 else (
+        args.BK = 128 if args.bf16_kernelc_2pf else (64 if any(bf16_kernelc_selectors) else (
+            128 if args.fp8_scaled_cluster_bk128 else (
             256 if args.mxfp4_tutorial or (plain_fp8 and args.with_scale and not args.kernel_c) else
-            (128 if plain_fp8 or args.mxfp4_kernel_c or args.dtype_a == "bfloat16" else 64))
+            (128 if plain_fp8 or args.mxfp4_kernel_c or args.dtype_a == "bfloat16" else 64))))
     if not args.check and not args.benchmark:
         args.check = True
 
@@ -3703,7 +4261,11 @@ if __name__ == "__main__":
         f"{args.dtype_a=}, {args.dtype_b=}, {args.num_warps=}, {args.num_buffers=}, "
         f"{args.transpose_b=}, {args.mxfp=}, {args.with_scale=}, {args.scale_preshuffled=}, "
         f"{args.async_copy_scale=}, {args.l2_prefetch_distance=}, "
-        f"{args.f16_cluster_kernel_c=}, {args.fp8_cluster=}, {args.fp8_scaled_cluster_bk128=}, "
+        f"{args.f16_cluster_kernel_c=}, {args.bf16_kernelc_3pf=}, {args.bf16_kernelc_2pf=}, "
+        f"{args.bf16_cluster_4x4_tdm=}, "
+        f"{args.bf16_cluster_4x4_identity_tdm=}, {args.bf16_output=}, "
+        f"{args.input_mode=}, "
+        f"{args.fp8_cluster=}, {args.fp8_scaled_cluster_bk128=}, "
         f"{args.kernel_c=}, {args.mxfp4_tutorial=}, {args.mxfp4_kernel_c=}, "
         f"{partition_conflict_avoidance=}, sliceMN=True"
     )
@@ -3726,5 +4288,8 @@ if __name__ == "__main__":
     if args.check:
         check()
     if args.benchmark:
-        _run_benchmark(launch, args.M, args.N, args.K, args.warmup, args.probe_iters, args.graph_ms, args.n_replays,
-                       args.iters_per_graph)
+        if args.benchmark_mode == "direct":
+            _run_direct_benchmark(launch, args.M, args.N, args.K, args.warmup, args.direct_iters)
+        else:
+            _run_benchmark(launch, args.M, args.N, args.K, args.warmup, args.probe_iters, args.graph_ms,
+                           args.n_replays, args.iters_per_graph)
