@@ -280,3 +280,38 @@ tt.func @no_split_example(%n: index) {
 // CHECK-NOT: scf.execute_region
 // CHECK-NOT: pipelined_for
 // CHECK: tt.return
+
+// -----
+
+module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+tt.func @cluster_barriers_are_stage_ops(%n: index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+
+  scf.for %i = %c0 to %n step %c1 {
+    %a = arith.addi %i, %c1 : index
+    amdg.cluster_barrier_arrive
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "stage0"}
+
+    amdg.cluster_barrier_wait
+    %b = arith.muli %a, %c1 : index
+    rocdl.sched.barrier none {triton.warp_pipeline.border = "stage1"}
+
+    scf.yield
+  }
+  tt.return
+}
+}
+
+// CHECK-LABEL: tt.func @cluster_barriers_are_stage_ops(
+// CHECK: scf.for
+// CHECK: scf.execute_region
+// CHECK: arith.addi
+// CHECK-NEXT: amdg.cluster_barrier_arrive
+// CHECK: triton.warp_pipeline.stage = "stage0"
+// CHECK: scf.execute_region
+// CHECK: amdg.cluster_barrier_wait
+// CHECK: arith.muli
+// CHECK: triton.warp_pipeline.stage = "stage1"
+// CHECK: triton.warp_pipeline.pipelined_for
+// CHECK: tt.return

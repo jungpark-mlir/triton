@@ -27,9 +27,11 @@ namespace mlir {
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
 // Ops that may appear between pipeline stages but never inside one.  Pre-
-// existing memory-fence/wait ops at cluster boundaries are tolerated so that
-// prefetch patterns continue to work; encountering one mid-cluster is treated
-// as malformed input by the callers.
+// existing CTA-local memory-fence/wait ops at stage boundaries are tolerated
+// so that prefetch patterns continue to work; encountering one mid-stage is
+// treated as malformed input by the callers.  CTA-cluster arrive/wait ops are
+// deliberately excluded: they do not synchronize waves within a CTA and are
+// ordinary operations in the stage that contains them.
 static bool canSitBetweenStages(Operation *op) {
   return isa<ttg::AsyncWaitOp, gpu::BarrierOp, triton::gpu::BarrierOp,
              tt::amdgpu::AsyncTDMWait>(op);

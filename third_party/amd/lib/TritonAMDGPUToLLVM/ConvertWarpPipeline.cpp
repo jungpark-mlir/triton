@@ -342,10 +342,12 @@ static bool hasWarpPipelineHazard(const BlockInfo &src, const BlockInfo &dst,
                            ignoreWarpPipelineRaw);
 }
 
-// Pre-existing barrier/wait ops that may legally appear at cluster
+// Pre-existing CTA-local barrier/wait ops that may legally appear at stage
 // boundaries (between stages or before/after a pipeline).  Mirrors
-// isPipelineIgnorable in WarpPipeliner.cpp plus the ROCDL-lowered forms that
-// can appear after intermediate passes.
+// canSitBetweenStages in WarpPipeliner.cpp plus the ROCDL-lowered forms that
+// can appear after intermediate passes.  CTA-cluster arrive/wait ops are stage
+// operations: they do not synchronize waves within a CTA and therefore cannot
+// replace a warp-pipeline stage-boundary barrier.
 static bool isWarpPipelineIgnorableBarrier(Operation *op) {
   return isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::BarrierOp,
              triton::gpu::AsyncWaitOp, triton::amdgpu::AsyncWaitOp,
@@ -379,7 +381,7 @@ static scf::ExecuteRegionOp getPipelineStage(Operation *op) {
 // failure on any deviation.  Side-effect free: leaves the IR untouched so
 // callers can fail fast before mutating anything.
 static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
-  std::map<int, Operation *> existingBarrierMap;
+  std::map<int, SmallVector<Operation *>> existingBarrierMap;
   int numClusters = 0;
   for (auto &op : *forOp.getBody()) {
     if (auto exeOp = dyn_cast<scf::ExecuteRegionOp>(op)) {
@@ -388,10 +390,7 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
             "non-warp-pipeline scf.execute_region inside pipelined_for body");
       ++numClusters;
     } else if (isWarpPipelineIgnorableBarrier(&op)) {
-      if (existingBarrierMap.count(numClusters))
-        return op.emitError("multiple pre-existing barriers between pipeline "
-                            "stages; insert a dummy stage instead");
-      existingBarrierMap[numClusters] = &op;
+      existingBarrierMap[numClusters].push_back(&op);
     } else if (isa<scf::YieldOp>(op)) {
       continue;
     } else {
@@ -403,6 +402,12 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
   if (numClusters < 2)
     return forOp.emitError(
         "pipelined_for body must contain at least two pipeline stages");
+  for (auto &entry : existingBarrierMap) {
+    auto &group = entry.second;
+    if (group.size() != 1)
+      return group.back()->emitError(
+          "multiple pre-existing barriers between pipeline stages");
+  }
   if (existingBarrierMap.count(0) && existingBarrierMap.count(numClusters))
     return forOp.emitError("pipelined_for body has both top-of-loop and "
                            "bottom-of-loop pre-existing barriers");
@@ -536,13 +541,14 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
 // cluster barrier when one already exists at the cluster boundary.
 static void wrapExistingBarrier(OpBuilder &b, Location loc,
                                 Operation *clusterOp,
-                                Operation *existingBarrier, bool anyHasPriority,
+                                Operation *firstBarrier,
+                                Operation *lastBarrier, bool anyHasPriority,
                                 bool emitPriority = true) {
-  b.setInsertionPoint(existingBarrier);
+  b.setInsertionPoint(firstBarrier);
   if (emitPriority)
     emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
-  b.setInsertionPointAfter(existingBarrier);
+  b.setInsertionPointAfter(lastBarrier);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
 }
 
@@ -662,7 +668,7 @@ private:
     SmallVector<Block *> clusterBlocks;
     SmallVector<Operation *> clusterOps;
     SmallVector<bool> bars;
-    std::map<int, Operation *> existingBarrierMap;
+    std::map<int, SmallVector<Operation *>> existingBarrierMap;
     Operation *terminatorOp = nullptr;
 
     for (auto &op : *forOp.getBody()) {
@@ -672,7 +678,7 @@ private:
         clusterBlocks.push_back(&exeOp->getRegion(0).front());
         bars.push_back(false);
       } else if (isWarpPipelineIgnorableBarrier(&op)) {
-        existingBarrierMap[clusterBlocks.size()] = &op;
+        existingBarrierMap[clusterBlocks.size()].push_back(&op);
       } else if (isa<scf::YieldOp>(op)) {
         terminatorOp = &op;
       }
@@ -720,7 +726,7 @@ private:
       // bottom barriers, so rotating bottom -> 0 is unambiguous.
       assert(!hasTopBarrier &&
              "validatePipelinedForBody should have rejected this");
-      existingBarrierMap[0] = bottomBar->second;
+      existingBarrierMap[0] = std::move(bottomBar->second);
       existingBarrierMap.erase(bottomBar);
     }
 
@@ -774,7 +780,8 @@ private:
         // barrier is not enough to satisfy LDS ordering.  For now we rely on
         // the producer to place such barriers only where no local fence is
         // needed.
-        wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
+        wrapExistingBarrier(b, loc, clusterOps[i], exBar->second.front(),
+                            exBar->second.back(),
                             anyHasPriority, emitPriorityAtBoundary);
       } else {
         if (emitPriorityAtBoundary)
@@ -911,20 +918,22 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
   emitClusterPriority(b, loc, clusterOps[0], anyHasPriority);
 
   for (int i = 1; i < numClusters; i++) {
-    Operation *existingBarrier = nullptr;
+    Operation *firstBarrier = nullptr;
+    Operation *lastBarrier = nullptr;
     for (Operation *op = clusterOps[i - 1]->getNextNode();
          op && op != clusterOps[i].getOperation(); op = op->getNextNode()) {
       if (isWarpPipelineIgnorableBarrier(op)) {
-        existingBarrier = op;
-        break;
+        if (!firstBarrier)
+          firstBarrier = op;
+        lastBarrier = op;
       }
     }
 
-    if (existingBarrier) {
+    if (firstBarrier) {
       // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing barrier
       // is not enough to satisfy LDS ordering.  For now we rely on the
       // producer to place such barriers only where no local fence is needed.
-      wrapExistingBarrier(b, loc, clusterOps[i], existingBarrier,
+      wrapExistingBarrier(b, loc, clusterOps[i], firstBarrier, lastBarrier,
                           anyHasPriority);
     } else {
       b.setInsertionPoint(clusterOps[i]);
