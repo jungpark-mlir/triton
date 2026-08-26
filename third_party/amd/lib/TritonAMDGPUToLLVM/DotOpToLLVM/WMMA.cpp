@@ -36,16 +36,26 @@ namespace {
 
 static std::optional<mlir::triton::LinearLayout>
 wmmaRepLayoutForTensor(const mlir::triton::LinearLayout &wholeTileLL,
-                       const mlir::triton::LinearLayout &tileLL) {
+                       const mlir::triton::LinearLayout &tileLL,
+                       ArrayRef<int64_t> shapePerCTA) {
+  auto ctx = wholeTileLL.getOutDimNames().begin()->getContext();
+  auto block = StringAttr::get(ctx, "block");
+  auto perCTALL = wholeTileLL.resizeInDim(block, 1);
+  assert(shapePerCTA.size() == perCTALL.getNumOutDims());
+  for (auto [outDim, size] :
+       llvm::zip(perCTALL.getOutDimNames(), shapePerCTA)) {
+    perCTALL = perCTALL.resizeOutDim(outDim, size);
+  }
+
   llvm::SmallDenseMap<StringAttr, int64_t> shape;
-  for (auto outDim : wholeTileLL.getOutDimNames())
-    shape[outDim] = wholeTileLL.getOutDimSize(outDim);
+  for (auto outDim : perCTALL.getOutDimNames())
+    shape[outDim] = perCTALL.getOutDimSize(outDim);
 
   // Clamp the tileLL to the tensor's output dims so that divideLeft succeeds
   // when the tensor is smaller than the WMMA instruction shape.
   auto clampedTileLL = ensureLayoutNotLargerThan(tileLL, shape);
 
-  auto quot = divideLeft(wholeTileLL, clampedTileLL);
+  auto quot = divideLeft(perCTALL, clampedTileLL);
   if (quot.has_value())
     return zerosLike(clampedTileLL) * *quot;
   return {};
@@ -444,7 +454,8 @@ LogicalResult convertDot(DotOp op, DotOpAdaptor adaptor,
 
   auto tile = wmmaLayout.getTileLayout(rank);
   auto wmmaLL = triton::gpu::toLinearLayout(resShape, wmmaLayout);
-  auto repLayout = wmmaRepLayoutForTensor(wmmaLL, tile);
+  auto shapePerCTA = triton::gpu::getShapePerCTA(wmmaLayout, resShape);
+  auto repLayout = wmmaRepLayoutForTensor(wmmaLL, tile, shapePerCTA);
   if (!repLayout.has_value()) {
     return op.emitError("failed to divide wmma layout by tile layout");
   }
@@ -669,7 +680,8 @@ LogicalResult convertScaledDot(triton::DotScaledOp op,
 
   auto tile = wmmaLayout.getTileLayout(rank);
   auto wmmaLL = triton::gpu::toLinearLayout(resShape, wmmaLayout);
-  auto repLayout = wmmaRepLayoutForTensor(wmmaLL, tile);
+  auto shapePerCTA = triton::gpu::getShapePerCTA(wmmaLayout, resShape);
+  auto repLayout = wmmaRepLayoutForTensor(wmmaLL, tile, shapePerCTA);
   if (!repLayout.has_value()) {
     return op.emitError("failed to divide wmma layout by tile layout");
   }
