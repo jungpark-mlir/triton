@@ -143,6 +143,9 @@ struct ClusterBarrierArriveOpConversion
     LLVM::BrOp::create(rewriter, loc, afterBlock);
     rewriter.setInsertionPointToStart(afterBlock);
 
+    // Prevent the backend scheduler from moving non-memory work issued after
+    // arrive (for example WMMA) past a later cluster wait.
+    ROCDL::SchedBarrier::create(rewriter, loc, ROCDL::SchedGroupMask::none);
     rewriter.eraseOp(op);
     return success();
   }
@@ -156,6 +159,9 @@ struct ClusterBarrierWaitOpConversion
   matchAndRewrite(triton::amdgpu::ClusterBarrierWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
+    // Keep preceding work between the paired arrive and wait. In particular,
+    // do not let the backend sink WMMA behind the cluster rendezvous.
+    ROCDL::SchedBarrier::create(rewriter, loc, ROCDL::SchedGroupMask::none);
     // Use ROCDL barrier wait op with barrier ID -3 for cluster barriers
     ROCDL::BarrierWaitOp::create(rewriter, loc, -3);
     rewriter.eraseOp(op);
