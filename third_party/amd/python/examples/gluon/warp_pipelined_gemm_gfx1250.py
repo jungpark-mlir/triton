@@ -8,6 +8,7 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from triton.experimental.gluon.language.amd.gfx1250 import async_copy as cp
 from triton.experimental.gluon.language.amd.gfx1250 import tdm
+from triton.tools.mxfp import MXFP4Tensor
 
 try:
     from .mxfp_gemm_cdna5 import (
@@ -3280,6 +3281,315 @@ def mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250(
                      BLOCK_M, BLOCK_N)
 
 
+def _build_mxfp4_bk512_cluster_layouts(
+        block_m, block_n, block_k, num_warps, cga_layout, cta_m, cta_n):
+    """Build partitioned MXFP4 operand layouts for the requested cluster."""
+    bk_packed = block_k // 2
+    slice_m = block_m // cta_m
+    slice_n = block_n // cta_n
+
+    local_a = gl.PaddedSharedLayout.with_identity_for(
+        [[bk_packed, 16]], [block_m, bk_packed], [1, 0])
+    local_b = gl.PaddedSharedLayout.with_identity_for(
+        [[bk_packed, 16]], [block_n, bk_packed], [1, 0])
+    _, _, local_wmma = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        block_m, block_n, local_a, local_b, num_warps, [32, 16, 128],
+        a_transposed=False, b_transposed=True, slice_m=slice_m, slice_n=slice_n)
+
+    wmma = gl.amd.AMDWMMALayout(
+        3, local_wmma.transposed, local_wmma.warp_bases, local_wmma.reg_bases,
+        local_wmma.instr_shape, cga_layout)
+    dot_a = gl.DotOperandLayout(0, wmma, 16)
+    dot_b = gl.DotOperandLayout(1, wmma, 16)
+    cga_a = dot_a.cga_layout
+    cga_b = tuple(tuple([basis[1], basis[0]]) for basis in dot_b.cga_layout)
+    padded_a = gl.PaddedSharedLayout.with_identity_for(
+        [[bk_packed, 16]], [block_m, bk_packed], [1, 0], cga_a)
+    padded_b = gl.PaddedSharedLayout.with_identity_for(
+        [[bk_packed, 16]], [block_n, bk_packed], [1, 0], cga_b)
+    shared_a, shared_b, _ = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        slice_m, slice_n, padded_a, padded_b, num_warps, [32, 16, 128],
+        a_transposed=False, b_transposed=True, slice_m=slice_m, slice_n=slice_n)
+
+    bk_scale = block_k // 32
+    preshuffle_factor = 128
+    shared_scale_a = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 8]], [block_m // preshuffle_factor, bk_scale * preshuffle_factor],
+        [1, 0], cga_a)
+    shared_scale_b = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 8]], [block_n // preshuffle_factor, bk_scale * preshuffle_factor],
+        [1, 0], cga_b)
+    return shared_a, shared_b, shared_scale_a, shared_scale_b, wmma
+
+
+# This BK512 variant ports the leading-four pipeline used by the parameterized
+# MXFP8 kernel to packed E2M1 operands. Each CTA computes 256x256x512 within a
+# parameterized cluster, using two physical LDS partitions per operand, two fused TDM
+# requests per slot, four logical K=128 scaled-WMMA steps, and a padded BF16
+# cluster-aware TDM-store epilogue.
+@gluon.jit
+def _issue_mxfp4_bk512_leading4_refill(
+        a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf, tile_idx, slot,
+        BK_PACKED: gl.constexpr, BK_SCALE_PRESHUFFLED: gl.constexpr):
+    """Issue one BK512 data/scale refill from the leading four warps."""
+    packed_k = tile_idx * BK_PACKED
+    a_load = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, packed_k])
+    b_load = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, packed_k])
+    tdm.async_load_fused([
+        (a_load, a_buf.index(slot), 0b00000011),
+        (b_load, b_buf.index(slot), 0b00001100),
+    ])
+
+    scale_k = tile_idx * BK_SCALE_PRESHUFFLED
+    as_load = tdm.update_tensor_descriptor(as_desc, add_offsets=[0, scale_k])
+    bs_load = tdm.update_tensor_descriptor(bs_desc, add_offsets=[0, scale_k])
+    tdm.async_load_fused([
+        (as_load, as_buf.index(slot), 0b00000011),
+        (bs_load, bs_buf.index(slot), 0b00001100),
+    ])
+
+
+@gluon.jit
+def _consume_mxfp4_bk512_k_step(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc, START_K_PACKED: gl.constexpr,
+        START_SCALE_K: gl.constexpr, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BK_SCALE: gl.constexpr,
+        SUBTILE_K_PACKED: gl.constexpr, SUBTILE_SCALE_K: gl.constexpr,
+        PRESHUFFLE_FACTOR: gl.constexpr, SCALE_KWIDTH: gl.constexpr,
+        OVERLAP_CLUSTER: gl.constexpr):
+    """Consume one logical K=128 slice of a staged BK512 tile."""
+    with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        a = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            START_K_PACKED, SUBTILE_K_PACKED, 1).load(layout=DOT_A)
+        as_ = _load_mxfp4_slice_mnk_scale(
+            as_buf, slot, 0, START_SCALE_K, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE,
+            BLOCK_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        b = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            START_K_PACKED, SUBTILE_K_PACKED, 1).permute([1, 0]).load(layout=DOT_B)
+        bs = _load_mxfp4_slice_mnk_scale(
+            bs_buf, slot, 0, START_SCALE_K, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE,
+            BLOCK_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        if OVERLAP_CLUSTER:
+            gl.amd.gfx1250.cluster.arrive()
+    with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(a, as_, "e2m1", b, bs, "e2m1", acc)
+        if OVERLAP_CLUSTER:
+            gl.amd.gfx1250.cluster.wait()
+    return acc
+
+
+@gluon.jit
+def _consume_mxfp4_bk512_k256_step(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc, START_K_PACKED: gl.constexpr,
+        START_SCALE_K: gl.constexpr, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BK_SCALE: gl.constexpr,
+        SUBTILE_K_PACKED: gl.constexpr, SUBTILE_SCALE_K: gl.constexpr,
+        PRESHUFFLE_FACTOR: gl.constexpr, SCALE_KWIDTH: gl.constexpr,
+        OVERLAP_CLUSTER: gl.constexpr):
+    """Load K256 in one warp-pipeline region and consume it in the next."""
+    with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            START_K_PACKED, SUBTILE_K_PACKED, 1).load(layout=DOT_A)
+        as0 = _load_mxfp4_slice_mnk_scale(
+            as_buf, slot, 0, START_SCALE_K, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE,
+            BLOCK_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            START_K_PACKED, SUBTILE_K_PACKED, 1).permute([1, 0]).load(layout=DOT_B)
+        bs0 = _load_mxfp4_slice_mnk_scale(
+            bs_buf, slot, 0, START_SCALE_K, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE,
+            BLOCK_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+
+        a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            START_K_PACKED + SUBTILE_K_PACKED, SUBTILE_K_PACKED, 1).load(layout=DOT_A)
+        as1 = _load_mxfp4_slice_mnk_scale(
+            as_buf, slot, 0, START_SCALE_K + SUBTILE_SCALE_K,
+            SCALE_A_LAYOUT, BLOCK_M, BK_SCALE, BLOCK_M, SUBTILE_SCALE_K,
+            PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            START_K_PACKED + SUBTILE_K_PACKED, SUBTILE_K_PACKED, 1
+        ).permute([1, 0]).load(layout=DOT_B)
+        bs1 = _load_mxfp4_slice_mnk_scale(
+            bs_buf, slot, 0, START_SCALE_K + SUBTILE_SCALE_K,
+            SCALE_B_LAYOUT, BLOCK_N, BK_SCALE, BLOCK_N, SUBTILE_SCALE_K,
+            PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(a0, as0, "e2m1", b0, bs0, "e2m1", acc)
+        if OVERLAP_CLUSTER:
+            gl.amd.gfx1250.cluster.arrive()
+        acc = gl.amd.gfx1250.wmma_scaled(a1, as1, "e2m1", b1, bs1, "e2m1", acc)
+        if OVERLAP_CLUSTER:
+            gl.amd.gfx1250.cluster.wait()
+    return acc
+
+
+@gluon.jit
+def _consume_mxfp4_bk512_tile(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BK_SCALE: gl.constexpr,
+        SUBTILE_K_PACKED: gl.constexpr, SUBTILE_SCALE_K: gl.constexpr,
+        PRESHUFFLE_FACTOR: gl.constexpr, SCALE_KWIDTH: gl.constexpr,
+        K256_STAGES: gl.constexpr, OVERLAP_CLUSTER: gl.constexpr):
+    """Consume BK512 as four whole-CTA scaled-WMMA K=128 steps."""
+    if K256_STAGES:
+        acc = _consume_mxfp4_bk512_k256_step(
+            a_buf, b_buf, as_buf, bs_buf, slot, acc, 0, 0, DOT_A, DOT_B,
+            SCALE_A_LAYOUT, SCALE_B_LAYOUT, BLOCK_M, BLOCK_N, BK_SCALE,
+            SUBTILE_K_PACKED, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH,
+            False)
+        return _consume_mxfp4_bk512_k256_step(
+            a_buf, b_buf, as_buf, bs_buf, slot, acc, 2 * SUBTILE_K_PACKED,
+            2 * SUBTILE_SCALE_K, DOT_A, DOT_B, SCALE_A_LAYOUT, SCALE_B_LAYOUT,
+            BLOCK_M, BLOCK_N, BK_SCALE, SUBTILE_K_PACKED, SUBTILE_SCALE_K,
+            PRESHUFFLE_FACTOR, SCALE_KWIDTH, OVERLAP_CLUSTER)
+
+    acc = _consume_mxfp4_bk512_k_step(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc, 0, 0, DOT_A, DOT_B,
+        SCALE_A_LAYOUT, SCALE_B_LAYOUT, BLOCK_M, BLOCK_N, BK_SCALE,
+        SUBTILE_K_PACKED, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH,
+        False)
+    acc = _consume_mxfp4_bk512_k_step(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc, SUBTILE_K_PACKED,
+        SUBTILE_SCALE_K, DOT_A, DOT_B, SCALE_A_LAYOUT, SCALE_B_LAYOUT,
+        BLOCK_M, BLOCK_N, BK_SCALE, SUBTILE_K_PACKED, SUBTILE_SCALE_K,
+        PRESHUFFLE_FACTOR, SCALE_KWIDTH, False)
+    acc = _consume_mxfp4_bk512_k_step(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc, 2 * SUBTILE_K_PACKED,
+        2 * SUBTILE_SCALE_K, DOT_A, DOT_B, SCALE_A_LAYOUT, SCALE_B_LAYOUT,
+        BLOCK_M, BLOCK_N, BK_SCALE, SUBTILE_K_PACKED, SUBTILE_SCALE_K,
+        PRESHUFFLE_FACTOR, SCALE_KWIDTH, False)
+    return _consume_mxfp4_bk512_k_step(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc, 3 * SUBTILE_K_PACKED,
+        3 * SUBTILE_SCALE_K, DOT_A, DOT_B, SCALE_A_LAYOUT, SCALE_B_LAYOUT,
+        BLOCK_M, BLOCK_N, BK_SCALE, SUBTILE_K_PACKED, SUBTILE_SCALE_K,
+        PRESHUFFLE_FACTOR, SCALE_KWIDTH, OVERLAP_CLUSTER)
+
+
+@gluon.jit
+def mxfp4_bk512_warp_pipeline_gfx1250(
+        a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
+        stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        stride_scale, SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr,
+        BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, GROUP_SIZE_M: gl.constexpr,
+        GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr, NUM_WARPS: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
+        SHARED_SCALE_A: gl.constexpr, SHARED_SCALE_B: gl.constexpr,
+        WMMA_LAYOUT: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr,
+        K256_STAGES: gl.constexpr, OVERLAP_CLUSTER: gl.constexpr):
+    """Clustered MXFP4 GEMM with a 256x256x512 tile per CTA."""
+    gl.static_assert(
+        (CTA_M == 2 and CTA_N == 2) or (CTA_M == 2 and CTA_N == 4)
+        or (CTA_M == 4 and CTA_N == 2) or (CTA_M == 4 and CTA_N == 4))
+    gl.static_assert(BLOCK_M == CTA_M * 256 and BLOCK_N == CTA_N * 256 and BLOCK_K == 512)
+    gl.static_assert(SCALE_BLOCK == 32)
+    gl.static_assert(NUM_WARPS == 8)
+    gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
+    pid_m, pid_n = get_xcd_swizzled_pids(
+        M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    num_k_steps: gl.constexpr = 4
+    bk_packed: gl.constexpr = BLOCK_K // 2
+    subtile_k_packed: gl.constexpr = bk_packed // num_k_steps
+    bk_scale: gl.constexpr = BLOCK_K // SCALE_BLOCK
+    subtile_scale_k: gl.constexpr = bk_scale // num_k_steps
+    preshuffle_factor: gl.constexpr = 128
+    bk_scale_preshuffled: gl.constexpr = bk_scale * preshuffle_factor
+    block_m_preshuffled: gl.constexpr = BLOCK_M // preshuffle_factor
+    block_n_preshuffled: gl.constexpr = BLOCK_N // preshuffle_factor
+    scale_kwidth: gl.constexpr = 4
+    nbuf: gl.constexpr = 2
+
+    wmma_packed: gl.constexpr = gl.amd.AMDWMMALayout(
+        3, WMMA_LAYOUT.transposed, WMMA_LAYOUT.warp_bases, WMMA_LAYOUT.reg_bases,
+        [32, 16, 64], WMMA_LAYOUT.cga_layout)
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma_packed, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma_packed, 16)
+    scale_a_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_a, [BLOCK_M, subtile_scale_k])
+    scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_b, [BLOCK_N, subtile_scale_k])
+
+    a_buf = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [nbuf, BLOCK_M, bk_packed], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [nbuf, BLOCK_N, bk_packed], SHARED_LAYOUT_B)
+    as_buf = gl.allocate_shared_memory(
+        a_scale_ptr.type.element_ty,
+        [nbuf, block_m_preshuffled, bk_scale_preshuffled], SHARED_SCALE_A)
+    bs_buf = gl.allocate_shared_memory(
+        b_scale_ptr.type.element_ty,
+        [nbuf, block_n_preshuffled, bk_scale_preshuffled], SHARED_SCALE_B)
+
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * BLOCK_M * stride_am, shape=(M, K // 2),
+        strides=(stride_am, stride_ak), block_shape=(BLOCK_M, bk_packed),
+        layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(
+        base=b_ptr + pid_n * BLOCK_N * stride_bn, shape=(N, K // 2),
+        strides=(stride_bn, stride_bk), block_shape=(BLOCK_N, bk_packed),
+        layout=SHARED_LAYOUT_B)
+    as_desc = tdm.make_tensor_descriptor(
+        base=a_scale_ptr + (pid_m * BLOCK_M) // preshuffle_factor * stride_scale,
+        shape=(M // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1),
+        block_shape=(block_m_preshuffled, bk_scale_preshuffled),
+        layout=SHARED_SCALE_A)
+    bs_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + (pid_n * BLOCK_N) // preshuffle_factor * stride_scale,
+        shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor),
+        strides=(stride_scale, 1),
+        block_shape=(block_n_preshuffled, bk_scale_preshuffled),
+        layout=SHARED_SCALE_B)
+
+    for prefetch_idx in gl.static_range(nbuf):
+        _issue_mxfp4_bk512_leading4_refill(
+            a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
+            prefetch_idx, prefetch_idx, bk_packed, bk_scale_preshuffled)
+
+    wait_count: gl.constexpr = 2
+    tdm.async_wait(wait_count)
+    _cluster_wait(wait_count)
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, BLOCK_K)
+    gl.assume(iter_max >= nbuf)
+
+    for tile_idx in range(0, iter_max - nbuf):
+        slot = tile_idx % nbuf
+        acc = _consume_mxfp4_bk512_tile(
+            a_buf, b_buf, as_buf, bs_buf, slot, acc, dot_a, dot_b,
+            scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, bk_scale,
+            subtile_k_packed, subtile_scale_k, preshuffle_factor, scale_kwidth,
+            K256_STAGES, OVERLAP_CLUSTER)
+        if not OVERLAP_CLUSTER:
+            _cluster_wait(wait_count)
+        with gl.amd.warp_pipeline_stage("tdm", priority=1):
+            _issue_mxfp4_bk512_leading4_refill(
+                a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
+                tile_idx + nbuf, slot, bk_packed, bk_scale_preshuffled)
+        tdm.async_wait(wait_count)
+
+    penultimate_slot = (iter_max - 2) % nbuf
+    acc = _consume_mxfp4_bk512_tile(
+        a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc, dot_a, dot_b,
+        scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, bk_scale,
+        subtile_k_packed, subtile_scale_k, preshuffle_factor, scale_kwidth,
+        K256_STAGES, False)
+
+    tdm.async_wait(0)
+    _cluster_wait(0)
+    last_slot = (iter_max - 1) % nbuf
+    acc = _consume_mxfp4_bk512_tile(
+        a_buf, b_buf, as_buf, bs_buf, last_slot, acc, dot_a, dot_b,
+        scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, bk_scale,
+        subtile_k_packed, subtile_scale_k, preshuffle_factor, scale_kwidth,
+        K256_STAGES, False)
+    _tdm_store_full_tile(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc, WMMA_LAYOUT,
+        BLOCK_M, BLOCK_N, CTA_N)
+
+
 @gluon.jit
 def fp8_slice_mn_warp_pipeline_kernelC_gfx1250(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk,
                                               stride_bn, stride_cm, stride_cn, DTYPE_A: gl.constexpr,
@@ -4393,25 +4703,34 @@ def _make_fp8_scaled_case(args):
 
 def _make_mxfp4_pipeline_case(args):
     is_kernel_c = args.mxfp4_kernel_c
+    is_bk512 = args.mxfp4_bk512
+    cluster_m, cluster_n = args.mxfp4_cluster_shape
     if not args.transpose_b:
         raise ValueError("The dedicated MXFP4 kernels require --transpose-b so packed K is contiguous in B")
     if is_kernel_c and (args.BM, args.BN, args.BK) != (256, 256, 128):
         raise ValueError("The dedicated MXFP4 KernelC kernel requires -BM 256 -BN 256 -BK 128")
-    if not is_kernel_c and (args.BM, args.BN, args.BK) != (256, 256, 256):
+    expected_bk512_tile = (cluster_m * 256, cluster_n * 256, 512)
+    if is_bk512 and (args.BM, args.BN, args.BK) != expected_bk512_tile:
+        raise ValueError(
+            f"The {cluster_m}x{cluster_n} MXFP4 BK512 kernel requires "
+            f"-BM {expected_bk512_tile[0]} -BN {expected_bk512_tile[1]} -BK 512")
+    if not is_kernel_c and not is_bk512 and (args.BM, args.BN, args.BK) != (256, 256, 256):
         raise ValueError("The MXFP4 tutorial experiment requires -BM 256 -BN 256 -BK 256")
     if args.num_warps != 8:
         raise ValueError("The dedicated MXFP4 kernels require --num-warps 8")
     if is_kernel_c and args.num_buffers not in (3, 4):
         raise ValueError("MXFP4 kernelC requires --num-buffers 3 or 4")
     if not is_kernel_c and args.num_buffers != 2:
-        raise ValueError("The MXFP4 tutorial kernel requires --num-buffers 2")
+        raise ValueError("The two-buffer MXFP4 kernels require --num-buffers 2")
+    if is_bk512 and args.scale_block != 32:
+        raise ValueError("The dedicated MXFP4 BK512 kernel requires --scale-block 32")
     if args.M % args.BM or args.N % args.BN or args.K % args.BK:
         raise ValueError("The dedicated MXFP4 kernels require M, N, and K to be divisible by their block sizes")
     num_k_tiles = triton.cdiv(args.K, args.BK)
     if is_kernel_c and num_k_tiles <= 3:
         raise ValueError("MXFP4 KernelC requires K/BLOCK_K to be greater than 3")
     if not is_kernel_c and num_k_tiles < 2:
-        raise ValueError("The BK256 MXFP4 tutorial kernel requires K/BLOCK_K to be at least 2")
+        raise ValueError("The two-buffer MXFP4 kernels require K/BLOCK_K to be at least 2")
     if args.scale_block not in (16, 32):
         raise ValueError("The MXFP4 kernels support --scale-block 16 or 32")
 
@@ -4422,15 +4741,33 @@ def _make_mxfp4_pipeline_case(args):
         raise ValueError("MXFP4 preshuffled scales require M/N divisible by 128 and a compatible scale K-width")
 
     torch.manual_seed(args.seed)
-    a = init_data("float4", args.M, args.K)
-    b = init_data("float4", args.K, args.N)
+    if args.input_mode == "trig":
+        def make_trig_input(shape, cosine):
+            result = MXFP4Tensor(size=shape)
+            encoded = torch.empty(shape[0] * shape[1], dtype=torch.uint8)
+            chunk = 8 * 1024 * 1024
+            for begin in range(0, encoded.numel(), chunk):
+                end = min(begin + chunk, encoded.numel())
+                angle = torch.arange(begin, end, dtype=torch.float64)
+                values = torch.cos(angle) if cosine else torch.sin(angle)
+                encoded[begin:end].copy_(MXFP4Tensor(data=values.float()).data)
+            result.data = encoded.view(shape)
+            return result
+
+        a = make_trig_input((args.M, args.K), False)
+        b = make_trig_input((args.K, args.N), True)
+    else:
+        a = init_data("float4", args.M, args.K)
+        b = init_data("float4", args.K, args.N)
     a_scale_obj = MXScaleTensor(size=(args.M, scale_k)).random(low=1.0, high=32.0)
     b_scale_obj = MXScaleTensor(size=(args.N, scale_k)).random(low=1.0, high=32.0)
 
     c_ref = None
     if args.check:
-        c_ref = torch_gemm_mxfp(a, b, a_scale_obj, b_scale_obj, args.scale_block, args.M, args.N,
-                                args.K).to(torch.float16)
+        output_dtype = torch.bfloat16 if is_bk512 else torch.float16
+        c_ref = torch_gemm_mxfp(
+            a, b, a_scale_obj, b_scale_obj, args.scale_block,
+            args.M, args.N, args.K).to(output_dtype)
 
     a_scale = _pack_fp8_scale(a_scale_obj.data, scale_kwidth)
     b_scale = _pack_fp8_scale(b_scale_obj.data, scale_kwidth)
@@ -4440,8 +4777,16 @@ def _make_mxfp4_pipeline_case(args):
     b_d = b.data.T.contiguous().cuda()
     a_scale_d = a_scale.cuda()
     b_scale_d = b_scale.cuda()
-    c_d = torch.empty((args.M, args.N), dtype=torch.float16, device="cuda")
+    output_dtype = torch.bfloat16 if is_bk512 else torch.float16
+    c_d = torch.empty((args.M, args.N), dtype=output_dtype, device="cuda")
     grid = (triton.cdiv(args.M, args.BM) * triton.cdiv(args.N, args.BN), 1)
+    bk512_layouts = None
+    if is_bk512:
+        cga_layout = make_cga_layout(
+            [cluster_m, cluster_n], [cluster_m, cluster_n], [0, 1])
+        bk512_layouts = _build_mxfp4_bk512_cluster_layouts(
+            args.BM, args.BN, args.BK, args.num_warps, cga_layout,
+            cluster_m, cluster_n)
 
     def launch():
         kernel_args = (
@@ -4459,13 +4804,25 @@ def _make_mxfp4_pipeline_case(args):
         if is_kernel_c:
             return mxfp4_slice_mn_warp_pipeline_kernelC_gfx1250[grid](
                 *kernel_args, NUM_BUFFERS=args.num_buffers, TDM_WARP_USED_HINT=0b00001111, **launch_options)
+        if is_bk512:
+            shared_a, shared_b, shared_scale_a, shared_scale_b, wmma = bk512_layouts
+            return mxfp4_bk512_warp_pipeline_gfx1250[grid](
+                *kernel_args, SHARED_LAYOUT_A=shared_a, SHARED_LAYOUT_B=shared_b,
+                SHARED_SCALE_A=shared_scale_a, SHARED_SCALE_B=shared_scale_b,
+                WMMA_LAYOUT=wmma, CTA_M=cluster_m, CTA_N=cluster_n,
+                K256_STAGES=args.mxfp4_k256_stages,
+                OVERLAP_CLUSTER=args.mxfp4_overlap_cluster,
+                num_ctas=cluster_m * cluster_n, **launch_options)
         return mxfp4_slice_mn_warp_pipeline_tutorial_gfx1250[grid](*kernel_args, **launch_options)
 
     def check():
         c_d.zero_()
         launch()
         torch.cuda.synchronize()
-        torch.testing.assert_close(c_d.cpu(), c_ref.cpu(), rtol=1e-3, atol=1e-3)
+        if is_bk512:
+            torch.testing.assert_close(c_d.cpu(), c_ref.cpu(), rtol=1e-2, atol=5e-1)
+        else:
+            torch.testing.assert_close(c_d.cpu(), c_ref.cpu(), rtol=1e-3, atol=1e-3)
         print("result verified", flush=True)
 
     return launch, check
@@ -4612,7 +4969,7 @@ def _build_arg_parser():
     parser.add_argument("--bf16-output", action="store_true",
                         help="Store BF16 instead of FP32 from BF16 kernels")
     parser.add_argument("--input-mode", choices=["random", "trig"], default="random",
-                        help="Input initialization for BF16 and scaled-FP8 kernels")
+                        help="Input initialization for BF16, scaled-FP8, and dedicated MXFP4 kernels")
     parser.add_argument("--fp8-cluster", action="store_true",
                         help="Use the 16-CTA, 1024x1024 scaled-FP8 cluster tutorial kernel")
     parser.add_argument("--fp8-cluster-bf16-style", action="store_true",
@@ -4633,6 +4990,15 @@ def _build_arg_parser():
                              help="Use the fixed two-buffer fused-scale MXFP4 tutorial kernel")
     mxfp4_group.add_argument("--mxfp4-kernelC", dest="mxfp4_kernel_c", action="store_true",
                              help="Use the three/four-buffer fused-scale MXFP4 KernelC kernel")
+    mxfp4_group.add_argument("--mxfp4-bk512", action="store_true",
+                             help="Use the clustered, eight-warp-per-CTA 256x256x512 MXFP4 kernel with BF16 output")
+    parser.add_argument("--mxfp4-cluster-shape", type=int, nargs=2, metavar=("CTA_M", "CTA_N"),
+                        default=(4, 4),
+                        help="Cluster shape for --mxfp4-bk512: 2 2, 2 4, 4 2, or 4 4")
+    parser.add_argument("--mxfp4-k256-stages", action="store_true",
+                        help="Load and consume two K128 fragments in each BK512 warp-pipeline pair")
+    parser.add_argument("--mxfp4-overlap-cluster", action="store_true",
+                        help="Overlap cluster synchronization with the final BK512 scaled WMMA")
     parser.add_argument("--resolve-partition-conflicts", action="store_true",
                         help="Use partition-aware gfx1250 WMMA/shared layouts for FP16/MXFP; plain FP8 always uses them")
     parser.add_argument("--seed", type=int, default=0)
@@ -4652,7 +5018,7 @@ def _build_arg_parser():
 
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
-    dedicated_mxfp4 = args.mxfp4_tutorial or args.mxfp4_kernel_c
+    dedicated_mxfp4 = args.mxfp4_tutorial or args.mxfp4_kernel_c or args.mxfp4_bk512
     if dedicated_mxfp4:
         if (args.mxfp or args.with_scale or args.with_a_scale or args.f16_cluster_kernel_c or args.fp8_cluster
                 or args.fp8_cluster_bf16_style or args.bf16_kernelc_3pf or args.bf16_kernelc_2pf
@@ -4704,6 +5070,15 @@ if __name__ == "__main__":
         raise ValueError("--fp8-cluster-shape must be 1 1, 2 2, or 4 4")
     if tuple(args.fp8_cluster_shape) != (4, 4) and not args.fp8_cluster_bf16_style:
         raise ValueError("--fp8-cluster-shape applies only to --fp8-cluster-bf16-style")
+    valid_mxfp4_cluster_shapes = ((2, 2), (2, 4), (4, 2), (4, 4))
+    if tuple(args.mxfp4_cluster_shape) not in valid_mxfp4_cluster_shapes:
+        raise ValueError("--mxfp4-cluster-shape must be 2 2, 2 4, 4 2, or 4 4")
+    if tuple(args.mxfp4_cluster_shape) != (4, 4) and not args.mxfp4_bk512:
+        raise ValueError("--mxfp4-cluster-shape applies only to --mxfp4-bk512")
+    if args.mxfp4_k256_stages and not args.mxfp4_bk512:
+        raise ValueError("--mxfp4-k256-stages applies only to --mxfp4-bk512")
+    if args.mxfp4_overlap_cluster and not args.mxfp4_bk512:
+        raise ValueError("--mxfp4-overlap-cluster applies only to --mxfp4-bk512")
     if args.fp8_tdm_schedule is None:
         args.fp8_tdm_schedule = "leading4" if args.fp8_cluster_bf16_style else "fused-pairs"
     elif not args.fp8_cluster_bf16_style:
@@ -4716,10 +5091,18 @@ if __name__ == "__main__":
         raise ValueError("--fp8-scale-layout hipblaslt requires --fp8-cluster-bf16-style")
     partition_conflict_avoidance = plain_fp8 or dedicated_mxfp4 or args.resolve_partition_conflicts
     if args.BK is None:
-        args.BK = 128 if args.bf16_kernelc_2pf else (64 if any(bf16_kernelc_selectors) else (
-            128 if args.fp8_scaled_cluster_bk128 else (
-            256 if args.mxfp4_tutorial or (plain_fp8 and args.with_scale and not args.kernel_c) else
-            (128 if plain_fp8 or args.mxfp4_kernel_c or args.dtype_a == "bfloat16" else 64))))
+        if args.bf16_kernelc_2pf or args.fp8_scaled_cluster_bk128:
+            args.BK = 128
+        elif any(bf16_kernelc_selectors):
+            args.BK = 64
+        elif args.mxfp4_bk512:
+            args.BK = 512
+        elif args.mxfp4_tutorial or (plain_fp8 and args.with_scale and not args.kernel_c):
+            args.BK = 256
+        elif plain_fp8 or args.mxfp4_kernel_c or args.dtype_a == "bfloat16":
+            args.BK = 128
+        else:
+            args.BK = 64
     if not args.check and not args.benchmark:
         args.check = True
 
@@ -4736,7 +5119,9 @@ if __name__ == "__main__":
         f"{args.fp8_tdm_schedule=}, "
         f"{args.fp8_scaled_cluster_bk128=}, "
         f"{args.fp8_bf16_output=}, {args.fp8_scale_layout=}, "
-        f"{args.kernel_c=}, {args.mxfp4_tutorial=}, {args.mxfp4_kernel_c=}, "
+        f"{args.kernel_c=}, {args.mxfp4_tutorial=}, {args.mxfp4_kernel_c=}, {args.mxfp4_bk512=}, "
+        f"{args.mxfp4_cluster_shape=}, {args.mxfp4_k256_stages=}, "
+        f"{args.mxfp4_overlap_cluster=}, "
         f"{partition_conflict_avoidance=}, sliceMN=True"
     )
 
