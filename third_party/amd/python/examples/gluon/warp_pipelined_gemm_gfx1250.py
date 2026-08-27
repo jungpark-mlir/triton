@@ -1927,8 +1927,13 @@ def _issue_fp8_scaled_slice_mnk_l2_prefetch(a_desc, b_desc, tile_idx, BLOCK_K: g
 
 
 def _build_fp8_scaled_cluster_layouts(BLOCK_M, BLOCK_N, BLOCK_K, SCALE_BLOCK, NUM_WARPS, cga_layout_c,
-                                      CTA_M=2, CTA_N=1, HIPBLASLT_SCALE_LAYOUT=False):
-    """Build layouts for an FP8 tile distributed across M and optionally N."""
+                                      CTA_M=2, CTA_N=1, HIPBLASLT_SCALE_LAYOUT=False, USE_PARTITIONED=False):
+    """Build layouts for an FP8 tile distributed across M and optionally N.
+
+    USE_PARTITIONED gives each CTA-local A and B slice two physical LDS
+    partitions matching the partition-aware WMMA mapping. Scale tiles retain
+    their padded CGA layouts.
+    """
     assert NUM_WARPS == 8
     padded_a_local = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0])
     padded_b_local = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [BLOCK_N, BLOCK_K], [1, 0])
@@ -1950,6 +1955,14 @@ def _build_fp8_scaled_cluster_layouts(BLOCK_M, BLOCK_N, BLOCK_K, SCALE_BLOCK, NU
                                                        cga_layout_a)
     padded_b = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [BLOCK_N, BLOCK_K], [1, 0],
                                                        cga_layout_b_transposed)
+    shared_a = padded_a
+    shared_b = padded_b
+    if USE_PARTITIONED:
+        # Physically partition each CTA-local operand slice to match the
+        # partition-aware WMMA mapping derived above.
+        shared_a, shared_b, _ = gl.amd.gfx1250.make_partitioned_dot_layouts(
+            BLOCK_M // CTA_M, BLOCK_N // CTA_N, padded_a, padded_b, NUM_WARPS, [16, 16, 128],
+            a_transposed=False, b_transposed=True, slice_m=BLOCK_M // CTA_M, slice_n=BLOCK_N // CTA_N)
 
     bk_scale = BLOCK_K // SCALE_BLOCK
     preshuffle_factor = 128
@@ -1970,7 +1983,7 @@ def _build_fp8_scaled_cluster_layouts(BLOCK_M, BLOCK_N, BLOCK_K, SCALE_BLOCK, NU
         shared_scale_b = gl.PaddedSharedLayout.with_identity_for(
             [[256, 8]], [BLOCK_N // preshuffle_factor, bk_scale * preshuffle_factor], [1, 0],
             cga_layout_b_transposed)
-    return padded_a, padded_b, shared_scale_a, shared_scale_b, wmma
+    return shared_a, shared_b, shared_scale_a, shared_scale_b, wmma
 
 
 def _build_f16_cluster_layouts(BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS, cga_layout_c):
@@ -4289,7 +4302,8 @@ def _make_fp8_scaled_case(args):
                                                             args.num_warps, cga_layout_c,
                                                             CTA_M=cta_m, CTA_N=cta_n,
                                                             HIPBLASLT_SCALE_LAYOUT=(
-                                                                args.fp8_scale_layout == "hipblaslt"))
+                                                                args.fp8_scale_layout == "hipblaslt"),
+                                                            USE_PARTITIONED=args.fp8_cluster_bf16_style)
 
     a_d = a.contiguous().cuda()
     b_d = b.T.contiguous().cuda()
@@ -4602,7 +4616,7 @@ def _build_arg_parser():
     parser.add_argument("--fp8-cluster", action="store_true",
                         help="Use the 16-CTA, 1024x1024 scaled-FP8 cluster tutorial kernel")
     parser.add_argument("--fp8-cluster-bf16-style", action="store_true",
-                        help="Use the parameterized square-cluster BK256 scaled-FP8 kernel")
+                        help="Use the parameterized square-cluster BK256 scaled-FP8 kernel with partitioned A/B LDS")
     parser.add_argument("--fp8-cluster-shape", type=int, nargs=2, metavar=("CTA_M", "CTA_N"),
                         default=(4, 4),
                         help="Square cluster shape for --fp8-cluster-bf16-style: 1 1, 2 2, or 4 4")
