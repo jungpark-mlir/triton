@@ -138,6 +138,22 @@ def _store_full_tile(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc, STORE
 
 
 @gluon.jit
+def _tdm_store_full_tile(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+                         STORE_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+                         CTA_N: gl.constexpr):
+    # Pad each CTA-local row by eight BF16 elements. This avoids the LDS bank
+    # conflicts of the identity layout and outperforms the swizzled TDM store.
+    c_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_N // CTA_N, 8]], [BLOCK_M, BLOCK_N], [1, 0], STORE_LAYOUT.cga_layout)
+    c_shared = gl.allocate_shared_memory(c_ptr.type.element_ty, [BLOCK_M, BLOCK_N], c_shared_layout)
+    c_shared.store(acc.to(c_ptr.type.element_ty))
+    c_desc = tdm.make_tensor_descriptor(base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
+                                        block_shape=(BLOCK_M, BLOCK_N), layout=c_shared_layout)
+    tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_shared)
+    tdm.async_wait(0)
+
+
+@gluon.jit
 def _load_mxfp_scale(scale_buffer, idx, layout: gl.constexpr, BLOCK_NONK: gl.constexpr, BK_SCALE: gl.constexpr,
                      SCALE_PRESHUFFLE: gl.constexpr, PRESHUFFLE_FACTOR: gl.constexpr,
                      SCALE_KWIDTH: gl.constexpr):
@@ -1733,6 +1749,19 @@ def _load_fp8_scaled_slice_mnk_scale(scale_buffer, slot, start_nonk: gl.constexp
 
 
 @gluon.jit
+def _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+        scale_buffer, slot, start_nonk: gl.constexpr, start_k: gl.constexpr, LAYOUT: gl.constexpr,
+        BLOCK_NONK: gl.constexpr, BK_SCALE: gl.constexpr, SUBTILE_NONK: gl.constexpr,
+        SUBTILE_SCALE_K: gl.constexpr, SCALE_KWIDTH: gl.constexpr):
+    # hipBLASLt gfx1250 layout: [BK_SCALE / 4, BLOCK_NONK, 4].
+    scale_slice = scale_buffer.index(slot).reshape(
+        (BK_SCALE // SCALE_KWIDTH, BLOCK_NONK, SCALE_KWIDTH)).permute(
+            (1, 0, 2)).reshape((BLOCK_NONK, BK_SCALE))
+    return scale_slice.slice(start_nonk, SUBTILE_NONK, 0).slice(
+        start_k, SUBTILE_SCALE_K, 1).load(layout=LAYOUT)
+
+
+@gluon.jit
 def _consume_fp8_scaled_slice_mnk_tile(
         a_buf, b_buf, as_buf, bs_buf, slot, acc_tl, acc_bl, acc_tr, acc_br, DTYPE_A: gl.constexpr,
         DTYPE_B: gl.constexpr, DOT_A: gl.constexpr, DOT_B: gl.constexpr, SCALE_A_LAYOUT: gl.constexpr,
@@ -1819,6 +1848,78 @@ def _issue_fp8_scaled_slice_mnk_fused_scale_load(as_desc, bs_desc, as_buf, bs_bu
 
 
 @gluon.jit
+def _issue_fp8_scaled_slice_mnk_fused_scale_load_hipblaslt(
+        as_desc, bs_desc, as_buf, bs_buf, tile_idx, slot, BK_SCALE: gl.constexpr,
+        SCALE_KWIDTH: gl.constexpr):
+    scale_tile = tile_idx * (BK_SCALE // SCALE_KWIDTH)
+    as_load_desc = tdm.update_tensor_descriptor(as_desc, add_offsets=[scale_tile, 0])
+    bs_load_desc = tdm.update_tensor_descriptor(bs_desc, add_offsets=[scale_tile, 0])
+    tdm.async_load_fused([
+        (as_load_desc, as_buf.index(slot), 0b00001111),
+        (bs_load_desc, bs_buf.index(slot), 0b11110000),
+    ])
+
+
+@gluon.jit
+def _issue_fp8_scaled_slice_mnk_leading4_fused_scale_load(
+        as_desc, bs_desc, as_buf, bs_buf, tile_idx, slot, BK_SCALE_PRESHUFFLED: gl.constexpr):
+    scale_k = tile_idx * BK_SCALE_PRESHUFFLED
+    as_load_desc = tdm.update_tensor_descriptor(as_desc, add_offsets=[0, scale_k])
+    bs_load_desc = tdm.update_tensor_descriptor(bs_desc, add_offsets=[0, scale_k])
+    tdm.async_load_fused([
+        (as_load_desc, as_buf.index(slot), 0b00000011),
+        (bs_load_desc, bs_buf.index(slot), 0b00001100),
+    ])
+
+
+@gluon.jit
+def _issue_fp8_scaled_slice_mnk_leading4_fused_scale_load_hipblaslt(
+        as_desc, bs_desc, as_buf, bs_buf, tile_idx, slot, BK_SCALE: gl.constexpr,
+        SCALE_KWIDTH: gl.constexpr):
+    scale_tile = tile_idx * (BK_SCALE // SCALE_KWIDTH)
+    as_load_desc = tdm.update_tensor_descriptor(as_desc, add_offsets=[scale_tile, 0])
+    bs_load_desc = tdm.update_tensor_descriptor(bs_desc, add_offsets=[scale_tile, 0])
+    tdm.async_load_fused([
+        (as_load_desc, as_buf.index(slot), 0b00000011),
+        (bs_load_desc, bs_buf.index(slot), 0b00001100),
+    ])
+
+
+@gluon.jit
+def _issue_fp8_scaled_slice_mnk_fused_data_load(a_desc, b_desc, a_buf, b_buf, tile_idx, slot,
+                                                BLOCK_K: gl.constexpr):
+    tile_k = tile_idx * BLOCK_K
+    a_load_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, tile_k])
+    b_load_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, tile_k])
+    tdm.async_load_fused([
+        (a_load_desc, a_buf.index(slot), 0b00001111),
+        (b_load_desc, b_buf.index(slot), 0b11110000),
+    ])
+
+
+@gluon.jit
+def _issue_fp8_scaled_slice_mnk_leading4_fused_data_load(a_desc, b_desc, a_buf, b_buf, tile_idx, slot,
+                                                         BLOCK_K: gl.constexpr):
+    tile_k = tile_idx * BLOCK_K
+    a_load_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, tile_k])
+    b_load_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, tile_k])
+    tdm.async_load_fused([
+        (a_load_desc, a_buf.index(slot), 0b00000011),
+        (b_load_desc, b_buf.index(slot), 0b00001100),
+    ])
+
+
+@gluon.jit
+def _issue_fp8_scaled_slice_mnk_separate_data_load(a_desc, b_desc, a_buf, b_buf, tile_idx, slot,
+                                                   BLOCK_K: gl.constexpr):
+    tile_k = tile_idx * BLOCK_K
+    a_load_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, tile_k])
+    b_load_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, tile_k])
+    tdm.async_load(a_load_desc, dest=a_buf.index(slot), warp_used_hint=0b00001111)
+    tdm.async_load(b_load_desc, dest=b_buf.index(slot), warp_used_hint=0b11110000)
+
+
+@gluon.jit
 def _issue_fp8_scaled_slice_mnk_l2_prefetch(a_desc, b_desc, tile_idx, BLOCK_K: gl.constexpr):
     tile_k = tile_idx * BLOCK_K
     tdm.prefetch(a_desc, [0, tile_k])
@@ -1826,7 +1927,7 @@ def _issue_fp8_scaled_slice_mnk_l2_prefetch(a_desc, b_desc, tile_idx, BLOCK_K: g
 
 
 def _build_fp8_scaled_cluster_layouts(BLOCK_M, BLOCK_N, BLOCK_K, SCALE_BLOCK, NUM_WARPS, cga_layout_c,
-                                      CTA_M=2, CTA_N=1):
+                                      CTA_M=2, CTA_N=1, HIPBLASLT_SCALE_LAYOUT=False):
     """Build layouts for an FP8 tile distributed across M and optionally N."""
     assert NUM_WARPS == 8
     padded_a_local = gl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0])
@@ -1852,12 +1953,23 @@ def _build_fp8_scaled_cluster_layouts(BLOCK_M, BLOCK_N, BLOCK_K, SCALE_BLOCK, NU
 
     bk_scale = BLOCK_K // SCALE_BLOCK
     preshuffle_factor = 128
-    shared_scale_a = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_M // preshuffle_factor, bk_scale * preshuffle_factor], [1, 0],
-        cga_layout_a)
-    shared_scale_b = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_N // preshuffle_factor, bk_scale * preshuffle_factor], [1, 0],
-        cga_layout_b_transposed)
+    if HIPBLASLT_SCALE_LAYOUT:
+        scale_kwidth = 4 if bk_scale >= 4 else bk_scale
+        cga_layout_scale_a = tuple(tuple([basis[1], basis[0]]) for basis in cga_layout_a)
+        cga_layout_scale_b = tuple(tuple([basis[1], basis[0]]) for basis in cga_layout_b_transposed)
+        shared_scale_a = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 8]], [bk_scale // scale_kwidth, BLOCK_M * scale_kwidth], [1, 0],
+            cga_layout_scale_a)
+        shared_scale_b = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 8]], [bk_scale // scale_kwidth, BLOCK_N * scale_kwidth], [1, 0],
+            cga_layout_scale_b)
+    else:
+        shared_scale_a = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 8]], [BLOCK_M // preshuffle_factor, bk_scale * preshuffle_factor], [1, 0],
+            cga_layout_a)
+        shared_scale_b = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 8]], [BLOCK_N // preshuffle_factor, bk_scale * preshuffle_factor], [1, 0],
+            cga_layout_b_transposed)
     return padded_a, padded_b, shared_scale_a, shared_scale_b, wmma
 
 
@@ -2154,6 +2266,33 @@ def _consume_fp8_scaled_cluster_2x2_tile(
 
 
 @gluon.jit
+def _consume_fp8_scaled_cluster_2x2_tile_hipblaslt(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc, DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr, SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, BK_SCALE: gl.constexpr,
+        SUBTILE_K: gl.constexpr, SUBTILE_SCALE_K: gl.constexpr, SCALE_KWIDTH: gl.constexpr):
+    a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(0, SUBTILE_K, 1).load(layout=DOT_A)
+    as0 = _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+        as_buf, slot, 0, 0, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE, BLOCK_M, SUBTILE_SCALE_K, SCALE_KWIDTH)
+    b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+        0, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+    bs0 = _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+        bs_buf, slot, 0, 0, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE, BLOCK_N, SUBTILE_SCALE_K, SCALE_KWIDTH)
+    acc = gl.amd.gfx1250.wmma_scaled(a0, as0, DTYPE_A, b0, bs0, DTYPE_B, acc)
+
+    a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(SUBTILE_K, SUBTILE_K, 1).load(layout=DOT_A)
+    as1 = _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+        as_buf, slot, 0, SUBTILE_SCALE_K, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE, BLOCK_M, SUBTILE_SCALE_K,
+        SCALE_KWIDTH)
+    b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+        SUBTILE_K, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+    bs1 = _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+        bs_buf, slot, 0, SUBTILE_SCALE_K, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE, BLOCK_N, SUBTILE_SCALE_K,
+        SCALE_KWIDTH)
+    return gl.amd.gfx1250.wmma_scaled(a1, as1, DTYPE_A, b1, bs1, DTYPE_B, acc)
+
+
+@gluon.jit
 def fp8_scaled_slice_mn_cluster_warp_pipeline_kernel_gfx1250(
         a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
         stride_cn, stride_scale, DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr, SCALE_BLOCK: gl.constexpr,
@@ -2298,6 +2437,241 @@ def fp8_scaled_slice_mn_cluster_warp_pipeline_kernel_gfx1250(
         scale_kwidth)
 
     _store_full_tile(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc, wmma, BLOCK_M, BLOCK_N)
+
+
+@gluon.jit
+def _fp8_scaled_cluster_bf16_style_consume_and_refill(
+        a_buf, b_buf, as_buf, bs_buf, slot, a_desc, b_desc, as_desc, bs_desc, refill_idx, acc,
+        DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
+        BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr, BK_SCALE: gl.constexpr,
+        SUBTILE_K: gl.constexpr, SUBTILE_SCALE_K: gl.constexpr, PRESHUFFLE_FACTOR: gl.constexpr,
+        BK_SCALE_PRESHUFFLED: gl.constexpr, SCALE_KWIDTH: gl.constexpr,
+        HIPBLASLT_SCALE_LAYOUT: gl.constexpr, AB_SEPARATE_DATA: gl.constexpr,
+        LEADING_FOUR_TDM: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(0, SUBTILE_K, 1).load(layout=DOT_A)
+        if HIPBLASLT_SCALE_LAYOUT:
+            as0 = _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+                as_buf, slot, 0, 0, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE, BLOCK_M, SUBTILE_SCALE_K,
+                SCALE_KWIDTH)
+        else:
+            as0 = _load_fp8_scaled_slice_mnk_scale(as_buf, slot, 0, 0, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE,
+                                                  BLOCK_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            0, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+        if HIPBLASLT_SCALE_LAYOUT:
+            bs0 = _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+                bs_buf, slot, 0, 0, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE, BLOCK_N, SUBTILE_SCALE_K,
+                SCALE_KWIDTH)
+        else:
+            bs0 = _load_fp8_scaled_slice_mnk_scale(bs_buf, slot, 0, 0, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE,
+                                                  BLOCK_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(a0, as0, DTYPE_A, b0, bs0, DTYPE_B, acc)
+
+    with gl.amd.warp_pipeline_stage("stage0", priority=0):
+        a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            SUBTILE_K, SUBTILE_K, 1).load(layout=DOT_A)
+        if HIPBLASLT_SCALE_LAYOUT:
+            as1 = _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+                as_buf, slot, 0, SUBTILE_SCALE_K, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE, BLOCK_M,
+                SUBTILE_SCALE_K, SCALE_KWIDTH)
+        else:
+            as1 = _load_fp8_scaled_slice_mnk_scale(as_buf, slot, 0, SUBTILE_SCALE_K, SCALE_A_LAYOUT,
+                                                  BLOCK_M, BK_SCALE, BLOCK_M, SUBTILE_SCALE_K,
+                                                  PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            SUBTILE_K, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+        if HIPBLASLT_SCALE_LAYOUT:
+            bs1 = _load_fp8_scaled_slice_mnk_scale_hipblaslt(
+                bs_buf, slot, 0, SUBTILE_SCALE_K, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE, BLOCK_N,
+                SUBTILE_SCALE_K, SCALE_KWIDTH)
+        else:
+            bs1 = _load_fp8_scaled_slice_mnk_scale(bs_buf, slot, 0, SUBTILE_SCALE_K, SCALE_B_LAYOUT,
+                                                  BLOCK_N, BK_SCALE, BLOCK_N, SUBTILE_SCALE_K,
+                                                  PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        if CTA_M * CTA_N > 1:
+            gl.amd.gfx1250.cluster.arrive()
+    with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(a1, as1, DTYPE_A, b1, bs1, DTYPE_B, acc)
+        if CTA_M * CTA_N > 1:
+            gl.amd.gfx1250.cluster.wait()
+        if LEADING_FOUR_TDM:
+            _issue_fp8_scaled_slice_mnk_leading4_fused_data_load(
+                a_desc, b_desc, a_buf, b_buf, refill_idx, slot, BLOCK_K)
+        elif AB_SEPARATE_DATA:
+            _issue_fp8_scaled_slice_mnk_separate_data_load(
+                a_desc, b_desc, a_buf, b_buf, refill_idx, slot, BLOCK_K)
+        if LEADING_FOUR_TDM and HIPBLASLT_SCALE_LAYOUT:
+            _issue_fp8_scaled_slice_mnk_leading4_fused_scale_load_hipblaslt(
+                as_desc, bs_desc, as_buf, bs_buf, refill_idx, slot, BK_SCALE, SCALE_KWIDTH)
+        elif LEADING_FOUR_TDM:
+            _issue_fp8_scaled_slice_mnk_leading4_fused_scale_load(
+                as_desc, bs_desc, as_buf, bs_buf, refill_idx, slot, BK_SCALE_PRESHUFFLED)
+        elif HIPBLASLT_SCALE_LAYOUT:
+            _issue_fp8_scaled_slice_mnk_fused_scale_load_hipblaslt(
+                as_desc, bs_desc, as_buf, bs_buf, refill_idx, slot, BK_SCALE, SCALE_KWIDTH)
+        else:
+            _issue_fp8_scaled_slice_mnk_fused_scale_load(
+                as_desc, bs_desc, as_buf, bs_buf, refill_idx, slot, BK_SCALE_PRESHUFFLED)
+        if not LEADING_FOUR_TDM and not AB_SEPARATE_DATA:
+            _issue_fp8_scaled_slice_mnk_fused_data_load(
+                a_desc, b_desc, a_buf, b_buf, refill_idx, slot, BLOCK_K)
+    return acc
+
+
+@gluon.jit
+def fp8_scaled_cluster_bf16_style_kernel_gfx1250(
+        a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn,
+        stride_cm, stride_cn, stride_scale, DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr,
+        SCALE_BLOCK: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
+        GROUP_SIZE_M: gl.constexpr, GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr, NUM_WARPS: gl.constexpr,
+        SCALE_PRESHUFFLE: gl.constexpr, ASYNC_COPY_SCALE: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
+        SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, HIPBLASLT_SCALE_LAYOUT: gl.constexpr,
+        AB_SEPARATE_DATA: gl.constexpr, LEADING_FOUR_TDM: gl.constexpr,
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+    gl.static_assert(DTYPE_A != "e2m1" and DTYPE_B != "e2m1",
+                     "fp8_scaled_cluster_bf16_style_kernel_gfx1250 requires FP8 inputs")
+    gl.static_assert(CTA_M == CTA_N and (CTA_M == 1 or CTA_M == 2 or CTA_M == 4),
+                     "the BF16-style MXFP8 kernel supports 1x1, 2x2, and 4x4 clusters")
+    gl.static_assert(BLOCK_M == CTA_M * 256 and BLOCK_N == CTA_N * 256 and BLOCK_K == 256)
+    gl.static_assert(SCALE_BLOCK == 16 or SCALE_BLOCK == 32)
+    gl.static_assert(NUM_WARPS == 8)
+    gl.static_assert(gl.num_ctas() == CTA_M * CTA_N,
+                     "the BF16-style MXFP8 kernel CTA count must match its cluster shape")
+    gl.static_assert(SCALE_PRESHUFFLE, "the BF16-style MXFP8 kernel requires preshuffled scales")
+    gl.static_assert(not ASYNC_COPY_SCALE, "the BF16-style MXFP8 kernel stages scales with TDM")
+    pid_m, pid_n = get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
+
+    subtile_k: gl.constexpr = BLOCK_K // 2
+    bk_scale: gl.constexpr = BLOCK_K // SCALE_BLOCK
+    subtile_scale_k: gl.constexpr = bk_scale // 2
+    preshuffle_factor: gl.constexpr = 128
+    bk_scale_preshuffled: gl.constexpr = bk_scale * preshuffle_factor
+    block_m_preshuffled: gl.constexpr = BLOCK_M // preshuffle_factor
+    block_n_preshuffled: gl.constexpr = BLOCK_N // preshuffle_factor
+    scale_kwidth: gl.constexpr = 4 if bk_scale >= 4 else bk_scale
+
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 16)
+    scale_a_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_a, [BLOCK_M, subtile_scale_k])
+    scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_b, [BLOCK_N, subtile_scale_k])
+
+    nbuf: gl.constexpr = 2
+    a_buf = gl.allocate_shared_memory(a_ptr.type.element_ty, [nbuf, BLOCK_M, BLOCK_K], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(b_ptr.type.element_ty, [nbuf, BLOCK_N, BLOCK_K], SHARED_LAYOUT_B)
+    if HIPBLASLT_SCALE_LAYOUT:
+        as_buf = gl.allocate_shared_memory(
+            a_scale_ptr.type.element_ty, [nbuf, bk_scale // scale_kwidth, BLOCK_M * scale_kwidth],
+            SHARED_SCALE_A)
+        bs_buf = gl.allocate_shared_memory(
+            b_scale_ptr.type.element_ty, [nbuf, bk_scale // scale_kwidth, BLOCK_N * scale_kwidth],
+            SHARED_SCALE_B)
+    else:
+        as_buf = gl.allocate_shared_memory(
+            a_scale_ptr.type.element_ty, [nbuf, block_m_preshuffled, bk_scale_preshuffled], SHARED_SCALE_A)
+        bs_buf = gl.allocate_shared_memory(
+            b_scale_ptr.type.element_ty, [nbuf, block_n_preshuffled, bk_scale_preshuffled], SHARED_SCALE_B)
+
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * BLOCK_M * stride_am, shape=(M, K), strides=(stride_am, stride_ak),
+        block_shape=(BLOCK_M, BLOCK_K), layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(
+        base=b_ptr + pid_n * BLOCK_N * stride_bn, shape=(N, K), strides=(stride_bn, stride_bk),
+        block_shape=(BLOCK_N, BLOCK_K), layout=SHARED_LAYOUT_B)
+    if HIPBLASLT_SCALE_LAYOUT:
+        as_desc = tdm.make_tensor_descriptor(
+            base=a_scale_ptr + pid_m * BLOCK_M * scale_kwidth,
+            shape=(K // SCALE_BLOCK // scale_kwidth, M * scale_kwidth), strides=(stride_scale, 1),
+            block_shape=(bk_scale // scale_kwidth, BLOCK_M * scale_kwidth), layout=SHARED_SCALE_A)
+        bs_desc = tdm.make_tensor_descriptor(
+            base=b_scale_ptr + pid_n * BLOCK_N * scale_kwidth,
+            shape=(K // SCALE_BLOCK // scale_kwidth, N * scale_kwidth), strides=(stride_scale, 1),
+            block_shape=(bk_scale // scale_kwidth, BLOCK_N * scale_kwidth), layout=SHARED_SCALE_B)
+    else:
+        as_desc = tdm.make_tensor_descriptor(
+            base=a_scale_ptr + (pid_m * BLOCK_M) // preshuffle_factor * stride_scale,
+            shape=(M // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor), strides=(stride_scale, 1),
+            block_shape=(block_m_preshuffled, bk_scale_preshuffled), layout=SHARED_SCALE_A)
+        bs_desc = tdm.make_tensor_descriptor(
+            base=b_scale_ptr + (pid_n * BLOCK_N) // preshuffle_factor * stride_scale,
+            shape=(N // preshuffle_factor, K // SCALE_BLOCK * preshuffle_factor), strides=(stride_scale, 1),
+            block_shape=(block_n_preshuffled, bk_scale_preshuffled), layout=SHARED_SCALE_B)
+
+    for prefetch_idx in gl.static_range(2):
+        if LEADING_FOUR_TDM:
+            _issue_fp8_scaled_slice_mnk_leading4_fused_data_load(
+                a_desc, b_desc, a_buf, b_buf, prefetch_idx, prefetch_idx, BLOCK_K)
+        elif AB_SEPARATE_DATA:
+            _issue_fp8_scaled_slice_mnk_separate_data_load(
+                a_desc, b_desc, a_buf, b_buf, prefetch_idx, prefetch_idx, BLOCK_K)
+        if LEADING_FOUR_TDM and HIPBLASLT_SCALE_LAYOUT:
+            _issue_fp8_scaled_slice_mnk_leading4_fused_scale_load_hipblaslt(
+                as_desc, bs_desc, as_buf, bs_buf, prefetch_idx, prefetch_idx, bk_scale, scale_kwidth)
+        elif LEADING_FOUR_TDM:
+            _issue_fp8_scaled_slice_mnk_leading4_fused_scale_load(
+                as_desc, bs_desc, as_buf, bs_buf, prefetch_idx, prefetch_idx, bk_scale_preshuffled)
+        elif HIPBLASLT_SCALE_LAYOUT:
+            _issue_fp8_scaled_slice_mnk_fused_scale_load_hipblaslt(
+                as_desc, bs_desc, as_buf, bs_buf, prefetch_idx, prefetch_idx, bk_scale, scale_kwidth)
+        else:
+            _issue_fp8_scaled_slice_mnk_fused_scale_load(
+                as_desc, bs_desc, as_buf, bs_buf, prefetch_idx, prefetch_idx, bk_scale_preshuffled)
+        if not LEADING_FOUR_TDM and not AB_SEPARATE_DATA:
+            _issue_fp8_scaled_slice_mnk_fused_data_load(
+                a_desc, b_desc, a_buf, b_buf, prefetch_idx, prefetch_idx, BLOCK_K)
+
+    wait_count: gl.constexpr = 2 if LEADING_FOUR_TDM or AB_SEPARATE_DATA else 1
+    tdm.async_wait(wait_count)
+    if CTA_M * CTA_N > 1:
+        _cluster_wait(wait_count)
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, BLOCK_K)
+    gl.assume(iter_max >= 2)
+
+    for tile_idx in range(0, iter_max - 2):
+        slot = tile_idx % nbuf
+        acc = _fp8_scaled_cluster_bf16_style_consume_and_refill(
+            a_buf, b_buf, as_buf, bs_buf, slot, a_desc, b_desc, as_desc, bs_desc, tile_idx + 2, acc,
+            DTYPE_A, DTYPE_B,
+            dot_a, dot_b, scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, preshuffle_factor, bk_scale_preshuffled, scale_kwidth, HIPBLASLT_SCALE_LAYOUT,
+            AB_SEPARATE_DATA, LEADING_FOUR_TDM, CTA_M, CTA_N)
+        tdm.async_wait(wait_count)
+
+    penultimate_slot = (iter_max - 2) % nbuf
+    if HIPBLASLT_SCALE_LAYOUT:
+        acc = _consume_fp8_scaled_cluster_2x2_tile_hipblaslt(
+            a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc, DTYPE_A, DTYPE_B, dot_a, dot_b,
+            scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, scale_kwidth)
+    else:
+        acc = _consume_fp8_scaled_cluster_2x2_tile(
+            a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc, DTYPE_A, DTYPE_B, dot_a, dot_b,
+            scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, preshuffle_factor, scale_kwidth)
+
+    tdm.async_wait(0)
+    if CTA_M * CTA_N > 1:
+        _cluster_wait(0)
+    last_slot = (iter_max - 1) % nbuf
+    if HIPBLASLT_SCALE_LAYOUT:
+        acc = _consume_fp8_scaled_cluster_2x2_tile_hipblaslt(
+            a_buf, b_buf, as_buf, bs_buf, last_slot, acc, DTYPE_A, DTYPE_B, dot_a, dot_b,
+            scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, scale_kwidth)
+    else:
+        acc = _consume_fp8_scaled_cluster_2x2_tile(
+            a_buf, b_buf, as_buf, bs_buf, last_slot, acc, DTYPE_A, DTYPE_B, dot_a, dot_b,
+            scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, preshuffle_factor, scale_kwidth)
+
+    _tdm_store_full_tile(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc, WMMA_LAYOUT, BLOCK_M, BLOCK_N,
+                         CTA_N)
 
 
 @gluon.jit
@@ -3794,6 +4168,13 @@ def _pack_fp8_scale(scale, scale_kwidth):
     return scale.view(non_k // preshuffle_factor, k_scale * preshuffle_factor)
 
 
+def _pack_fp8_scale_hipblaslt(scale, scale_kwidth):
+    non_k, k_scale = scale.shape
+    # gfx1250 hipBLASLt layout: [K-scale tile, non-K coordinate, four scales].
+    scale = scale.view(non_k, k_scale // scale_kwidth, scale_kwidth)
+    return scale.permute(1, 0, 2).contiguous().view(k_scale // scale_kwidth, non_k * scale_kwidth)
+
+
 def _make_fp8_scaled_case(args):
     if not args.dtype_a.startswith("float8") or not args.dtype_b.startswith("float8"):
         raise ValueError("--with-scale requires FP8 inputs for both operands")
@@ -3801,13 +4182,17 @@ def _make_fp8_scaled_case(args):
         raise ValueError("--with-scale always scales both operands; do not pass --with-a-scale")
     if not args.transpose_b:
         raise ValueError("The scaled FP8 kernels expect --transpose-b so K is contiguous in B")
-    if args.fp8_cluster and args.fp8_scaled_cluster_bk128:
-        raise ValueError("--fp8-cluster and --fp8-scaled-cluster-bk128 are mutually exclusive")
-    if (args.fp8_cluster or args.fp8_scaled_cluster_bk128) and args.kernel_c:
+    cluster_selectors = (args.fp8_cluster, args.fp8_cluster_bf16_style, args.fp8_scaled_cluster_bk128)
+    if sum(cluster_selectors) > 1:
+        raise ValueError("Scaled FP8 cluster selectors are mutually exclusive")
+    if any(cluster_selectors) and args.kernel_c:
         raise ValueError("The scaled FP8 cluster selectors and --kernelC are mutually exclusive")
     expected_bk = 128 if args.kernel_c else 256
     if args.fp8_scaled_cluster_bk128:
         expected_tile = (512, 256, 128)
+    elif args.fp8_cluster_bf16_style:
+        cluster_m, cluster_n = args.fp8_cluster_shape
+        expected_tile = (cluster_m * 256, cluster_n * 256, 256)
     elif args.fp8_cluster:
         expected_tile = (1024, 1024, 256)
     else:
@@ -3816,7 +4201,8 @@ def _make_fp8_scaled_case(args):
         if args.fp8_scaled_cluster_bk128:
             kernel_name = "BK128 cluster"
         else:
-            kernel_name = "cluster tutorial" if args.fp8_cluster else ("kernelC" if args.kernel_c else "tutorial")
+            kernel_name = ("BF16-style cluster" if args.fp8_cluster_bf16_style else
+                           ("cluster tutorial" if args.fp8_cluster else ("kernelC" if args.kernel_c else "tutorial")))
         raise ValueError(
             f"The scaled FP8 {kernel_name} kernel requires -BM {expected_tile[0]} -BN {expected_tile[1]} "
             f"-BK {expected_tile[2]}")
@@ -3849,14 +4235,28 @@ def _make_fp8_scaled_case(args):
     block_scale_k = args.BK // args.scale_block
     scale_kwidth = 4 if block_scale_k >= 4 else block_scale_k
     if args.scale_preshuffled:
-        if args.M % 128 or args.N % 128:
+        if args.fp8_scale_layout == "triton" and (args.M % 128 or args.N % 128):
             raise ValueError("--scale-preshuffled requires M and N to be divisible by 128")
         if scale_k % scale_kwidth:
             raise ValueError("--scale-preshuffled requires K/scale_block to be divisible by its scale K-width")
 
     torch.manual_seed(args.seed)
-    a = init_data(args.dtype_a, args.M, args.K)
-    b = init_data(args.dtype_b, args.K, args.N)
+    if args.input_mode == "trig":
+        dtype_a = torch.float8_e4m3fn if args.dtype_a == "float8_e4m3" else torch.float8_e5m2
+        dtype_b = torch.float8_e4m3fn if args.dtype_b == "float8_e4m3" else torch.float8_e5m2
+        a = torch.empty((args.M, args.K), dtype=dtype_a)
+        b = torch.empty((args.K, args.N), dtype=dtype_b)
+        chunk = 8 * 1024 * 1024
+        for output, cosine in ((a, False), (b, True)):
+            flat = output.view(-1)
+            for begin in range(0, flat.numel(), chunk):
+                end = min(begin + chunk, flat.numel())
+                angle = torch.arange(begin, end, dtype=torch.float64)
+                value = torch.cos(angle) if cosine else torch.sin(angle)
+                flat[begin:end].copy_(value.float())
+    else:
+        a = init_data(args.dtype_a, args.M, args.K)
+        b = init_data(args.dtype_b, args.K, args.N)
     a_scale_obj = MXScaleTensor(size=(args.M, scale_k)).random(low=1.0, high=32.0)
     b_scale_obj = MXScaleTensor(size=(args.N, scale_k)).random(low=1.0, high=32.0)
     a_scale = a_scale_obj.data
@@ -3864,27 +4264,39 @@ def _make_fp8_scaled_case(args):
 
     c_ref = None
     if args.check:
+        output_dtype = torch.bfloat16 if args.fp8_bf16_output else torch.float16
         c_ref = torch_gemm_mxfp(a, b, a_scale_obj, b_scale_obj, args.scale_block, args.M, args.N,
-                                args.K).to(torch.float16)
+                                args.K).to(output_dtype)
 
     if args.scale_preshuffled:
-        a_scale = _pack_fp8_scale(a_scale, scale_kwidth)
-        b_scale = _pack_fp8_scale(b_scale, scale_kwidth)
+        if args.fp8_scale_layout == "hipblaslt":
+            a_scale = _pack_fp8_scale_hipblaslt(a_scale, scale_kwidth)
+            b_scale = _pack_fp8_scale_hipblaslt(b_scale, scale_kwidth)
+        else:
+            a_scale = _pack_fp8_scale(a_scale, scale_kwidth)
+            b_scale = _pack_fp8_scale(b_scale, scale_kwidth)
 
     cluster_layouts = None
-    if args.fp8_cluster or args.fp8_scaled_cluster_bk128:
-        cga_layout_c = make_cga_layout([4, 4], [4, 4], [0, 1]) if args.fp8_cluster else make_cga_layout(
-            [2, 1], [2, 1], [0, 1])
+    if any(cluster_selectors):
+        if args.fp8_scaled_cluster_bk128:
+            cta_m, cta_n = 2, 1
+        elif args.fp8_cluster_bf16_style:
+            cta_m, cta_n = args.fp8_cluster_shape
+        else:
+            cta_m, cta_n = 4, 4
+        cga_layout_c = make_cga_layout([cta_m, cta_n], [cta_m, cta_n], [0, 1])
         cluster_layouts = _build_fp8_scaled_cluster_layouts(args.BM, args.BN, args.BK, args.scale_block,
                                                             args.num_warps, cga_layout_c,
-                                                            CTA_M=4 if args.fp8_cluster else 2,
-                                                            CTA_N=4 if args.fp8_cluster else 1)
+                                                            CTA_M=cta_m, CTA_N=cta_n,
+                                                            HIPBLASLT_SCALE_LAYOUT=(
+                                                                args.fp8_scale_layout == "hipblaslt"))
 
     a_d = a.contiguous().cuda()
     b_d = b.T.contiguous().cuda()
     a_scale_d = a_scale.cuda()
     b_scale_d = b_scale.cuda()
-    c_d = torch.empty((args.M, args.N), dtype=torch.float16, device="cuda")
+    output_dtype = torch.bfloat16 if args.fp8_bf16_output else torch.float16
+    c_d = torch.empty((args.M, args.N), dtype=output_dtype, device="cuda")
     grid = (triton.cdiv(args.M, args.BM) * triton.cdiv(args.N, args.BN), 1)
     swizzle_block_m, swizzle_block_n = args.swizzle_block or (0, 0)
     if args.z_order and args.swizzle_block:
@@ -3930,6 +4342,17 @@ def _make_fp8_scaled_case(args):
                       SHARED_LAYOUT_B=shared_b, SHARED_SCALE_A=shared_scale_a, SHARED_SCALE_B=shared_scale_b,
                       WMMA_LAYOUT=wmma, Z_ORDER=args.z_order, SWIZZLE_BLOCK_M=swizzle_block_m,
                       SWIZZLE_BLOCK_N=swizzle_block_n, num_ctas=2, **launch_options)
+        if args.fp8_cluster_bf16_style:
+            cta_m, cta_n = args.fp8_cluster_shape
+            shared_a, shared_b, shared_scale_a, shared_scale_b, wmma = cluster_layouts
+            return fp8_scaled_cluster_bf16_style_kernel_gfx1250[
+                grid](*kernel_args, SHARED_LAYOUT_A=shared_a, SHARED_LAYOUT_B=shared_b,
+                      SHARED_SCALE_A=shared_scale_a, SHARED_SCALE_B=shared_scale_b, WMMA_LAYOUT=wmma,
+                      HIPBLASLT_SCALE_LAYOUT=args.fp8_scale_layout == "hipblaslt",
+                      AB_SEPARATE_DATA=args.fp8_tdm_schedule == "ab-scales",
+                      LEADING_FOUR_TDM=args.fp8_tdm_schedule == "leading4",
+                      CTA_M=cta_m, CTA_N=cta_n, num_ctas=cta_m * cta_n,
+                      **launch_options)
         if args.fp8_cluster:
             shared_a, shared_b, shared_scale_a, shared_scale_b, wmma = cluster_layouts
             return fp8_scaled_slice_mn_cluster_warp_pipeline_kernel_gfx1250[
@@ -3945,7 +4368,10 @@ def _make_fp8_scaled_case(args):
         c_d.zero_()
         launch()
         torch.cuda.synchronize()
-        torch.testing.assert_close(c_d.cpu(), c_ref, rtol=1e-3, atol=1e-3)
+        if args.fp8_bf16_output:
+            torch.testing.assert_close(c_d.cpu(), c_ref, rtol=1e-2, atol=5e-1)
+        else:
+            torch.testing.assert_close(c_d.cpu(), c_ref, rtol=1e-3, atol=1e-3)
         print("result verified", flush=True)
 
     return launch, check
@@ -4152,6 +4578,8 @@ def _build_arg_parser():
     parser.add_argument("--with-a-scale", action="store_true", help="Use A scales on the MXFP path")
     parser.add_argument("--scale-preshuffled", "--scale_preshuffled", dest="scale_preshuffled", action="store_true",
                         help="Use preshuffled E8M0 scale tensors")
+    parser.add_argument("--fp8-scale-layout", choices=["triton", "hipblaslt"], default="triton",
+                        help="Global scale permutation for --fp8-cluster-bf16-style")
     parser.add_argument("--async-copy-scale", "--async_copy_scale", dest="async_copy_scale", action="store_true",
                         help="Stage E8M0 scale tensors with async copy instead of TDM")
     parser.add_argument("--l2-prefetch-distance", type=int, default=0, choices=[0, 1, 2, 3, 4],
@@ -4170,11 +4598,20 @@ def _build_arg_parser():
     parser.add_argument("--bf16-output", action="store_true",
                         help="Store BF16 instead of FP32 from BF16 kernels")
     parser.add_argument("--input-mode", choices=["random", "trig"], default="random",
-                        help="Input initialization for the restored BF16 KernelC")
+                        help="Input initialization for BF16 and scaled-FP8 kernels")
     parser.add_argument("--fp8-cluster", action="store_true",
-                        help="Use the 2-CTA, 512x256 scaled-FP8 cluster tutorial kernel")
+                        help="Use the 16-CTA, 1024x1024 scaled-FP8 cluster tutorial kernel")
+    parser.add_argument("--fp8-cluster-bf16-style", action="store_true",
+                        help="Use the parameterized square-cluster BK256 scaled-FP8 kernel")
+    parser.add_argument("--fp8-cluster-shape", type=int, nargs=2, metavar=("CTA_M", "CTA_N"),
+                        default=(4, 4),
+                        help="Square cluster shape for --fp8-cluster-bf16-style: 1 1, 2 2, or 4 4")
+    parser.add_argument("--fp8-tdm-schedule", choices=["leading4", "fused-pairs", "ab-scales"], default=None,
+                        help="TDM schedule for --fp8-cluster-bf16-style (default: two fused loads on warps 0..3)")
     parser.add_argument("--fp8-scaled-cluster-bk128", action="store_true",
                         help="Use the 2-CTA, 512x256 scaled-FP8 BK128 kernel")
+    parser.add_argument("--fp8-bf16-output", action="store_true",
+                        help="Store BF16 instead of FP16 from scaled-FP8 kernels")
     parser.add_argument("--kernelC", dest="kernel_c", action="store_true",
                         help="Use the plain-FP8 KernelC variant with four-warp TDM load issue")
     mxfp4_group = parser.add_mutually_exclusive_group()
@@ -4204,14 +4641,15 @@ if __name__ == "__main__":
     dedicated_mxfp4 = args.mxfp4_tutorial or args.mxfp4_kernel_c
     if dedicated_mxfp4:
         if (args.mxfp or args.with_scale or args.with_a_scale or args.f16_cluster_kernel_c or args.fp8_cluster
-                or args.bf16_kernelc_3pf or args.bf16_kernelc_2pf or args.bf16_cluster_4x4_tdm
+                or args.fp8_cluster_bf16_style or args.bf16_kernelc_3pf or args.bf16_kernelc_2pf
+                or args.bf16_cluster_4x4_tdm
                 or args.bf16_cluster_4x4_identity_tdm or args.fp8_scaled_cluster_bk128 or args.kernel_c
                 or args.async_copy_scale):
             raise ValueError(
                 "Dedicated MXFP4 selectors cannot be combined with --mxfp, --with-scale, --with-a-scale, "
                 "--f16-cluster-kernelC, --bf16-kernelc-3pf, --bf16-kernelc-2pf, --bf16-cluster-4x4-tdm, "
-                "--bf16-cluster-4x4-identity-tdm, --fp8-cluster, --fp8-scaled-cluster-bk128, --kernelC, "
-                "or --async-copy-scale")
+                "--bf16-cluster-4x4-identity-tdm, --fp8-cluster, --fp8-cluster-bf16-style, "
+                "--fp8-scaled-cluster-bk128, --kernelC, or --async-copy-scale")
         args.dtype_a = "float4"
         args.dtype_b = "float4"
         args.scale_preshuffled = True
@@ -4222,7 +4660,8 @@ if __name__ == "__main__":
         args.bf16_cluster_4x4_identity_tdm,
     )
     if any(bf16_kernelc_selectors):
-        if args.f16_cluster_kernel_c or args.fp8_cluster or args.fp8_scaled_cluster_bk128 or args.kernel_c:
+        if (args.f16_cluster_kernel_c or args.fp8_cluster or args.fp8_cluster_bf16_style
+                or args.fp8_scaled_cluster_bk128 or args.kernel_c):
             raise ValueError("BF16 KernelC selectors cannot be combined with another kernel selector")
         if sum(bf16_kernelc_selectors) > 1:
             raise ValueError("BF16 KernelC selectors are mutually exclusive")
@@ -4245,8 +4684,22 @@ if __name__ == "__main__":
         raise ValueError("--f16-cluster-kernelC requires --dtype-a float16")
     if args.fp8_cluster and not (plain_fp8 and args.with_scale):
         raise ValueError("--fp8-cluster requires the plain-FP8 --with-scale path")
+    if args.fp8_cluster_bf16_style and not (plain_fp8 and args.with_scale):
+        raise ValueError("--fp8-cluster-bf16-style requires the plain-FP8 --with-scale path")
+    if tuple(args.fp8_cluster_shape) not in ((1, 1), (2, 2), (4, 4)):
+        raise ValueError("--fp8-cluster-shape must be 1 1, 2 2, or 4 4")
+    if tuple(args.fp8_cluster_shape) != (4, 4) and not args.fp8_cluster_bf16_style:
+        raise ValueError("--fp8-cluster-shape applies only to --fp8-cluster-bf16-style")
+    if args.fp8_tdm_schedule is None:
+        args.fp8_tdm_schedule = "leading4" if args.fp8_cluster_bf16_style else "fused-pairs"
+    elif not args.fp8_cluster_bf16_style:
+        raise ValueError("--fp8-tdm-schedule applies only to --fp8-cluster-bf16-style")
     if args.fp8_scaled_cluster_bk128 and not (plain_fp8 and args.with_scale):
         raise ValueError("--fp8-scaled-cluster-bk128 requires the plain-FP8 --with-scale path")
+    if args.fp8_bf16_output and not (plain_fp8 and args.with_scale):
+        raise ValueError("--fp8-bf16-output requires the plain-FP8 --with-scale path")
+    if args.fp8_scale_layout == "hipblaslt" and not args.fp8_cluster_bf16_style:
+        raise ValueError("--fp8-scale-layout hipblaslt requires --fp8-cluster-bf16-style")
     partition_conflict_avoidance = plain_fp8 or dedicated_mxfp4 or args.resolve_partition_conflicts
     if args.BK is None:
         args.BK = 128 if args.bf16_kernelc_2pf else (64 if any(bf16_kernelc_selectors) else (
@@ -4265,7 +4718,10 @@ if __name__ == "__main__":
         f"{args.bf16_cluster_4x4_tdm=}, "
         f"{args.bf16_cluster_4x4_identity_tdm=}, {args.bf16_output=}, "
         f"{args.input_mode=}, "
-        f"{args.fp8_cluster=}, {args.fp8_scaled_cluster_bk128=}, "
+        f"{args.fp8_cluster=}, {args.fp8_cluster_bf16_style=}, {args.fp8_cluster_shape=}, "
+        f"{args.fp8_tdm_schedule=}, "
+        f"{args.fp8_scaled_cluster_bk128=}, "
+        f"{args.fp8_bf16_output=}, {args.fp8_scale_layout=}, "
         f"{args.kernel_c=}, {args.mxfp4_tutorial=}, {args.mxfp4_kernel_c=}, "
         f"{partition_conflict_avoidance=}, sliceMN=True"
     )
