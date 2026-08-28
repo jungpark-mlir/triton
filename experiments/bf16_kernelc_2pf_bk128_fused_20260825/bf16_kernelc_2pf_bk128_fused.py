@@ -105,8 +105,10 @@ def consume_and_refill(a_buf, b_buf, slot, a_desc, b_desc, acc,
 @gluon.jit
 def cluster_consume_and_refill(a_buf, b_buf, slot, a_desc, b_desc, acc,
                                DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+                               BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
                                BLOCK_K: gl.constexpr):
     half_k: gl.constexpr = BLOCK_K // 2
+    wmma_k: gl.constexpr = half_k // 2
     with gl.amd.warp_pipeline_stage("stage0", priority=0):
         a = a_buf.index(slot).slice(0, half_k, 1).load(layout=DOT_A)
         b = b_buf.index(slot).slice(0, half_k, 1).permute([1, 0]).load(layout=DOT_B)
@@ -118,10 +120,15 @@ def cluster_consume_and_refill(a_buf, b_buf, slot, a_desc, b_desc, acc,
         b = b_buf.index(slot).slice(half_k, half_k, 1).permute([1, 0]).load(layout=DOT_B)
         gl.amd.gfx1250.cluster.arrive()
     with gl.amd.warp_pipeline_stage("stage1", priority=1):
-        acc = gl.amd.gfx1250.wmma(a, b, acc)
+        a0 = gl.amd.slice(a, [BLOCK_M, wmma_k], [0, 0])
+        b0 = gl.amd.slice(b, [wmma_k, BLOCK_N], [0, 0])
+        a1 = gl.amd.slice(a, [BLOCK_M, wmma_k], [0, wmma_k])
+        b1 = gl.amd.slice(b, [wmma_k, BLOCK_N], [wmma_k, 0])
+        acc = gl.amd.gfx1250.wmma(a0, b0, acc)
         gl.amd.gfx1250.cluster.wait()
         a_desc, b_desc = issue_loads(
             a_desc, b_desc, a_buf.index(slot), b_buf.index(slot), BLOCK_K)
+        acc = gl.amd.gfx1250.wmma(a1, b1, acc)
     return a_desc, b_desc, acc
 
 
@@ -321,7 +328,7 @@ def bf16_kernelc_2pf_bk128_fused_cluster_4x4_gfx1250(
             else:
                 a_desc, b_desc, acc = cluster_consume_and_refill(
                     a_buf, b_buf, 0, a_desc, b_desc, acc,
-                    dot_a, dot_b, BLOCK_K)
+                    dot_a, dot_b, BLOCK_M, BLOCK_N, BLOCK_K)
             tdm.async_wait(2)
             if SLICE_BK32:
                 a_desc, b_desc, acc = cluster_consume_and_refill_bk32(
@@ -330,14 +337,21 @@ def bf16_kernelc_2pf_bk128_fused_cluster_4x4_gfx1250(
             else:
                 a_desc, b_desc, acc = cluster_consume_and_refill(
                     a_buf, b_buf, 1, a_desc, b_desc, acc,
-                    dot_a, dot_b, BLOCK_K)
+                    dot_a, dot_b, BLOCK_M, BLOCK_N, BLOCK_K)
             tdm.async_wait(2)
 
-        tdm.async_wait(0)
-        acc = consume_slot(
-            a_buf, b_buf, 0, acc, dot_a, dot_b, BLOCK_K, False, False)
-        acc = consume_slot(
-            a_buf, b_buf, 1, acc, dot_a, dot_b, BLOCK_K, False, False)
+        # Keep the tail in a loop so the warp-pipeline pass also transforms
+        # the epilogue. The preceding wait(2) makes the penultimate slot ready
+        # while the final slot is still in flight.
+        for tail_idx in range(iter_max - NUM_BUFFERS, iter_max - 1):
+            slot = tail_idx % NUM_BUFFERS
+            acc = consume_slot(
+                a_buf, b_buf, slot, acc, dot_a, dot_b, BLOCK_K, False, False)
+
+            tdm.async_wait(0)
+            slot = (tail_idx + 1) % NUM_BUFFERS
+            acc = consume_slot(
+                a_buf, b_buf, slot, acc, dot_a, dot_b, BLOCK_K, False, False)
     else:
         for _ in range(0, (iter_max - NUM_BUFFERS) // NUM_BUFFERS):
             acc = consume_slot(

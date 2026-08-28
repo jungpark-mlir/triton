@@ -40,22 +40,24 @@ gaps, LDS stalls, tensor waits, local CTA barriers, and cluster barriers.
 
 ## Final result
 
-The current best kernel uses:
+The current retained kernel uses:
 
 - A 4x4 CTA cluster, forming a logical `1024x1024x128` cluster tile.
 - A `256x256` output tile per CTA.
 - Two BK128 LDS buffers.
-- Two BK64 load/WMMA stages per BK128 tile.
+- Two BK64 LDS-load stages per BK128 tile.
+- One full-K64 WMMA followed by a refill-side K64 WMMA split into two K32
+  pieces.
 - Two-piece CTA-local partitioned layouts for both A and B.
 - Four leading TDM producer waves.
 - Fused A/B TDM refill.
 - Cluster arrival in the final LDS stage.
-- The final WMMA between cluster arrive and cluster wait.
-- Same-slot refill after cluster wait.
+- The first refill-side K32 WMMA between cluster arrive and cluster wait.
+- Same-slot refill between the two refill-side K32 WMMAs.
 - Full mask-zero scheduler barriers around cluster synchronization in the
   AMDGPU lowering.
 
-Three final benchmark runs measured:
+Before the August 28 follow-up, the highest-throughput benchmark runs measured:
 
 - 680.80 us, 3230.065 TFLOPS
 - 682.70 us, 3221.090 TFLOPS
@@ -66,7 +68,7 @@ The median is:
 - Latency: **680.80 us**
 - Throughput: **3.230 PFLOPS**
 
-The matching ATT capture measured:
+The matching pre-split ATT capture measured:
 
 - Mean active-CU cycles: **1,129,431**
 - Mean GFX frequency: **1696.52 MHz**
@@ -521,6 +523,110 @@ The final placement improved:
 This removed one class of long transition bubble. Most remaining gaps moved
 into the 33-64-cycle range.
 
+## Phase 10: splitting the refill-side K64 WMMA
+
+An August 28 recapture isolated the remaining issue loss in the retained
+schedule. The pre-split baseline measured:
+
+- Median latency: **695.26 us**
+- Median throughput: **3.163 PFLOPS**
+- Active-CU cycles: **1,129,640**
+- Mean GFX frequency: **1655.38 MHz**
+- WMMA issue span: **1,109,233 cycles**
+- Net WMMA bubble: **60,665 cycles**
+- WMMA efficiency: **94.53%**
+
+The main deterministic loss was 1,015 refill-handoff gaps in the 33-64-cycle
+range. To overlap this handoff without adding another warp-pipeline boundary,
+only the refill-side logical K64 WMMA was divided into two K32 pieces:
+
+```text
+K32 WMMA #1 -> cluster wait -> A/B refill -> K32 WMMA #2
+```
+
+This is different from the four-stage BK32 experiment in Phase 6. Both K32
+pieces remain in the same compute stage, so the split does not add a local
+stage barrier. The dynamic native WMMA count also remains 131,072 because a
+logical K64 operation already lowers to two native K32 instructions.
+
+The retained split schedule measured:
+
+- Median latency: **688.72 us**
+- Median throughput: **3.193 PFLOPS**, a **0.95%** paired improvement
+- Active-CU cycles: **1,116,780**, down **1.14%**
+- Mean GFX frequency: **1633.34 MHz**
+- WMMA issue span: **1,101,201 cycles**
+- Net WMMA bubble: **52,633 cycles**, down **13.2%**
+- WMMA efficiency: **95.22%**
+- 33-64-cycle gaps: **1,015 to 2**
+
+The resource footprint was unchanged at 464 VGPRs, 128 SGPRs, and 278,528
+bytes of LDS. Static code increased from 1,862 to 1,883 instructions.
+Correctness passed before full-size benchmarking.
+
+### Epilogue warp pipelining
+
+The final two slots were also placed in a loop with `tdm.async_wait(0)` between
+them so that the warp-pipeline pass transforms the tail. This reduced the final
+transition from 1,663 to 308 cycles in the isolated epilogue experiment and to
+288 cycles in the retained split trace. The end-to-end effect is small because
+the tail accounts for only about 0.03% of the WMMA issue span.
+
+### Remaining 4.78% WMMA issue loss
+
+The 3.193-PFLOPS ATT trace contains 131,072 WMMA instructions across the two
+traced SIMDs. Relative to an ideal eight-cycle merged issue interval, its
+52,633-cycle bubble separates into:
+
+- **36,273 cycles (68.9%)** of steady-state short-gap structure.
+- **16,080 cycles (30.6%)** from four runtime synchronization outliers.
+- **280 cycles (0.5%)** from the final pipeline drain.
+
+The steady-state component is dominated by:
+
+- 17,346 cycles at the regular
+  `WMMA #1 -> cluster wait -> refill -> WMMA #2` boundary, principally 1,014
+  25-cycle gaps.
+- 6,096 cycles from 508 regular 20-cycle transitions from WMMA #2 to the next
+  WMMA #1.
+- 12,227 cycles from 19- and 21-cycle cross-slot transitions.
+- 6,125 cycles of dual-SIMD phase skew in the full-K64 first-half WMMA block.
+- A 5,610-cycle offset from closely bunched one-to-six-cycle issues.
+
+The four runtime outliers were:
+
+- Two cluster-wait gaps of 3,008 and 5,050 cycles, contributing 8,042 net
+  bubble cycles.
+- One 5,980-cycle tensor-readiness gap, contributing 5,972 net cycles.
+- One 2,074-cycle local-barrier gap, contributing 2,066 net cycles.
+
+Compared with the pre-split trace, the deterministic bubble excluding outliers
+fell from 47,861 to 36,273 cycles, a **24.2%** reduction. Outliers were 3,556
+cycles worse in this individual capture, but they are sparse runtime events
+and do not demonstrate a scheduling regression.
+
+### Refill-after-WMMA experiment
+
+The alternate requested source order was:
+
+```text
+WMMA #1 -> cluster wait -> WMMA #2 -> refill
+```
+
+The AMDGPU machine scheduler still emitted the refill before WMMA #2. A
+side-effecting inline-assembly operation did not constrain the independent
+TDM memory operations. The variant measured 689.14 us / 3.191 PFLOPS, within
+noise of but slightly behind the retained schedule, and was reverted.
+Enforcing that exact order requires exposing an
+`llvm.amdgcn.sched.barrier(0)` operation or introducing another stage
+boundary.
+
+The retained ATT directory is:
+
+```text
+/home/jungpark/mnt/att-traces/bf16-kernelc-bk128-split-k32-wmma-around-refill-20260828
+```
+
 ## How the bottleneck evolved
 
 The optimization did not address one fixed bottleneck. Each successful change
@@ -556,25 +662,33 @@ exposed the next one:
    - Symptom: 1,530 gaps over 32 cycles after scheduler ordering was fixed.
    - Fix: advance cluster arrival into the final LDS stage.
 
+8. **Refill-side WMMA handoff**
+   - Symptom: 1,015 regular 33-64-cycle gaps and 94.53% WMMA efficiency in the
+     August 28 recapture.
+   - Fix: split the refill-side logical K64 WMMA around cluster wait and refill,
+     reducing the gaps to two and raising efficiency to 95.22%.
+
 ## Remaining bottleneck
 
-The final kernel reaches 94.21% merged WMMA efficiency. Its remaining issue
-loss is dominated by approximately 1,020 stage-transition gaps, almost all in
-the 33-64-cycle range.
+The retained split kernel reaches 95.22% merged WMMA efficiency. Its remaining
+issue loss is split between regular 19-25-cycle stage-transition skew and four
+large runtime cluster, tensor, or local-barrier outliers. The previous
+33-64-cycle refill bubble has been nearly eliminated.
 
 The important constraints are:
 
-- Cluster wait is no longer the dominant stall.
+- Regular cluster wait is short; rare cluster stragglers remain significant.
 - BK32 reduces LDS latency but adds too many local boundaries.
 - Full-BK128 or asymmetric operand lookahead spills.
 - TDM producer splitting and priority changes do not materially help.
 - The useful WMMA, LDS-load, and TDM-load counts are already stable.
 
-The remaining bottleneck is therefore short stage-transition skew among LDS
-completion, CTA-local boundary synchronization, and tensor readiness. Further
-improvement likely requires a compiler or hardware scheduling change that
-reduces the cost of an existing boundary without adding another boundary or
-increasing operand liveness.
+The largest deterministic target is now the regular 25-cycle interval between
+the first refill-side K32 WMMA and the second. The secondary target is runtime
+straggler variance at cluster, tensor, and local waits. Further improvement
+likely requires shortening the existing scalar refill sequence or controlling
+backend scheduling without adding another local boundary or increasing
+operand liveness.
 
 Potential future directions:
 
@@ -654,7 +768,10 @@ than from isolated instruction tuning:
 - Keep BK64 to balance LDS latency and barrier count.
 - Prevent the backend from destroying source-level overlap.
 - Advance cluster arrival to reduce transition bubbles.
+- Split the refill-side K64 WMMA to overlap the remaining refill handoff.
 
 The result progressed from a 728.33-us pre-fusion BK128 kernel and a
-925.47-us first clustered implementation to the current **680.80-us,
-3.230-PFLOPS** kernel with **94.21% WMMA efficiency**.
+925.47-us first clustered implementation to a highest absolute measurement of
+**680.80 us / 3.230 PFLOPS**. In the lower-clock August 28 comparison, the
+retained split schedule measured **688.72 us / 3.193 PFLOPS** and improved
+merged WMMA efficiency from 94.53% to **95.22%**.
