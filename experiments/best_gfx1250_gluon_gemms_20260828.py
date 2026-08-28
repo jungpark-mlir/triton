@@ -718,7 +718,8 @@ def make_bf16_case(args):
                     begin, end, dtype=torch.float64, device=device)
                 value = torch.cos(angle) if cosine else torch.sin(angle)
                 flat[begin:end].copy_(value.float())
-    c = torch.zeros((args.M, args.N), dtype=torch.float32, device="cuda")
+    output_dtype = torch.bfloat16 if args.bf16_output else torch.float32
+    c = torch.zeros((args.M, args.N), dtype=output_dtype, device="cuda")
     layouts = build_bf16_layouts()
     grid = (triton.cdiv(args.M, 1024) * triton.cdiv(args.N, 1024), 1)
 
@@ -735,8 +736,9 @@ def make_bf16_case(args):
         c.zero_()
         launch()
         torch.cuda.synchronize()
-        reference = a.cpu().float() @ b.cpu().T.float()
-        torch.testing.assert_close(c.cpu(), reference, rtol=1e-3, atol=1e-2)
+        reference = (a.cpu().float() @ b.cpu().T.float()).to(output_dtype)
+        rtol = 1e-2 if output_dtype == torch.bfloat16 else 1e-3
+        torch.testing.assert_close(c.cpu(), reference, rtol=rtol, atol=1e-2)
         print("result verified", flush=True)
 
     return launch, check
@@ -954,6 +956,10 @@ def parse_args():
     parser.add_argument("-N", type=int, default=4096)
     parser.add_argument("-K", type=int, default=65536)
     parser.add_argument("--input-mode", choices=("random", "trig"))
+    parser.add_argument(
+        "--bf16-fp32-output", dest="bf16_output", action="store_false",
+        help="Store BF16 kernel results as FP32 instead of the BF16 default")
+    parser.set_defaults(bf16_output=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
