@@ -32,9 +32,11 @@ The source-contained selectors JIT-compiled and passed:
 
 ## August 28 rebenchmark
 
-The target was M=N=4096 and K=65536 with trigonometric inputs. Each result is
-the median of three interleaved Gluon/hipBLASLt runs under `gpu-lock`. Gluon
-timing used 10 warmups followed by 1,000 graph-contained launches
+The target was M=N=4096 and K=65536 with trigonometric inputs. Each Gluon
+result is the median of three runs under `gpu-lock`. The MXFP measurements
+were interleaved with hipBLASLt; the BF16-output Gluon result was rerun in
+three consecutive trials and compared with the retained hipBLASLt result.
+Gluon timing used 10 warmups followed by 1,000 graph-contained launches
 (50 launches per graph and 20 replays). hipBLASLt used 1,000 iterations.
 
 - BF16 Gluon with BF16 output: 688.74 us, 3.193 PFLOPS.
