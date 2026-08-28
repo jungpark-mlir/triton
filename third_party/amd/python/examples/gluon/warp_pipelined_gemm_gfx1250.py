@@ -2462,7 +2462,8 @@ def _fp8_scaled_cluster_bf16_style_consume_and_refill(
         SUBTILE_K: gl.constexpr, SUBTILE_SCALE_K: gl.constexpr, PRESHUFFLE_FACTOR: gl.constexpr,
         BK_SCALE_PRESHUFFLED: gl.constexpr, SCALE_KWIDTH: gl.constexpr,
         HIPBLASLT_SCALE_LAYOUT: gl.constexpr, AB_SEPARATE_DATA: gl.constexpr,
-        LEADING_FOUR_TDM: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+        LEADING_FOUR_TDM: gl.constexpr, REFILL_BEFORE_WMMA: gl.constexpr,
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr):
     with gl.amd.warp_pipeline_stage("stage0", priority=0):
         a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(0, SUBTILE_K, 1).load(layout=DOT_A)
         if HIPBLASLT_SCALE_LAYOUT:
@@ -2508,7 +2509,8 @@ def _fp8_scaled_cluster_bf16_style_consume_and_refill(
         if CTA_M * CTA_N > 1:
             gl.amd.gfx1250.cluster.arrive()
     with gl.amd.warp_pipeline_stage("stage1", priority=1):
-        acc = gl.amd.gfx1250.wmma_scaled(a1, as1, DTYPE_A, b1, bs1, DTYPE_B, acc)
+        if not REFILL_BEFORE_WMMA:
+            acc = gl.amd.gfx1250.wmma_scaled(a1, as1, DTYPE_A, b1, bs1, DTYPE_B, acc)
         if CTA_M * CTA_N > 1:
             gl.amd.gfx1250.cluster.wait()
         if LEADING_FOUR_TDM:
@@ -2532,6 +2534,8 @@ def _fp8_scaled_cluster_bf16_style_consume_and_refill(
         if not LEADING_FOUR_TDM and not AB_SEPARATE_DATA:
             _issue_fp8_scaled_slice_mnk_fused_data_load(
                 a_desc, b_desc, a_buf, b_buf, refill_idx, slot, BLOCK_K)
+        if REFILL_BEFORE_WMMA:
+            acc = gl.amd.gfx1250.wmma_scaled(a1, as1, DTYPE_A, b1, bs1, DTYPE_B, acc)
     return acc
 
 
@@ -2545,7 +2549,7 @@ def fp8_scaled_cluster_bf16_style_kernel_gfx1250(
         SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
         SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, HIPBLASLT_SCALE_LAYOUT: gl.constexpr,
         AB_SEPARATE_DATA: gl.constexpr, LEADING_FOUR_TDM: gl.constexpr,
-        CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+        REFILL_BEFORE_WMMA: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr):
     gl.static_assert(DTYPE_A != "e2m1" and DTYPE_B != "e2m1",
                      "fp8_scaled_cluster_bf16_style_kernel_gfx1250 requires FP8 inputs")
     gl.static_assert(CTA_M == CTA_N and (CTA_M == 1 or CTA_M == 2 or CTA_M == 4),
@@ -2654,7 +2658,7 @@ def fp8_scaled_cluster_bf16_style_kernel_gfx1250(
             DTYPE_A, DTYPE_B,
             dot_a, dot_b, scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
             subtile_scale_k, preshuffle_factor, bk_scale_preshuffled, scale_kwidth, HIPBLASLT_SCALE_LAYOUT,
-            AB_SEPARATE_DATA, LEADING_FOUR_TDM, CTA_M, CTA_N)
+            AB_SEPARATE_DATA, LEADING_FOUR_TDM, REFILL_BEFORE_WMMA, CTA_M, CTA_N)
         tdm.async_wait(wait_count)
 
     penultimate_slot = (iter_max - 2) % nbuf
@@ -4675,6 +4679,7 @@ def _make_fp8_scaled_case(args):
                       HIPBLASLT_SCALE_LAYOUT=args.fp8_scale_layout == "hipblaslt",
                       AB_SEPARATE_DATA=args.fp8_tdm_schedule == "ab-scales",
                       LEADING_FOUR_TDM=args.fp8_tdm_schedule == "leading4",
+                      REFILL_BEFORE_WMMA=args.fp8_refill_before_wmma,
                       CTA_M=cta_m, CTA_N=cta_n, num_ctas=cta_m * cta_n,
                       **launch_options)
         if args.fp8_cluster:
@@ -4979,6 +4984,8 @@ def _build_arg_parser():
                         help="Square cluster shape for --fp8-cluster-bf16-style: 1 1, 2 2, or 4 4")
     parser.add_argument("--fp8-tdm-schedule", choices=["leading4", "fused-pairs", "ab-scales"], default=None,
                         help="TDM schedule for --fp8-cluster-bf16-style (default: two fused loads on warps 0..3)")
+    parser.add_argument("--fp8-refill-before-wmma", action="store_true",
+                        help="Issue refill before the final K128 scaled WMMA")
     parser.add_argument("--fp8-scaled-cluster-bk128", action="store_true",
                         help="Use the 2-CTA, 512x256 scaled-FP8 BK128 kernel")
     parser.add_argument("--fp8-bf16-output", action="store_true",
@@ -5083,6 +5090,8 @@ if __name__ == "__main__":
         args.fp8_tdm_schedule = "leading4" if args.fp8_cluster_bf16_style else "fused-pairs"
     elif not args.fp8_cluster_bf16_style:
         raise ValueError("--fp8-tdm-schedule applies only to --fp8-cluster-bf16-style")
+    if args.fp8_refill_before_wmma and not args.fp8_cluster_bf16_style:
+        raise ValueError("--fp8-refill-before-wmma applies only to --fp8-cluster-bf16-style")
     if args.fp8_scaled_cluster_bk128 and not (plain_fp8 and args.with_scale):
         raise ValueError("--fp8-scaled-cluster-bk128 requires the plain-FP8 --with-scale path")
     if args.fp8_bf16_output and not (plain_fp8 and args.with_scale):
