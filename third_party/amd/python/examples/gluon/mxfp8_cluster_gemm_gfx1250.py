@@ -222,6 +222,52 @@ def _consume_drain_tile(a_buf, b_buf, as_buf, bs_buf, slot, acc,
 
 
 @gluon.jit
+def _consume_pipelined_drain_tile(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc,
+        DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        BLOCK_K: gl.constexpr, BK_SCALE: gl.constexpr,
+        SUBTILE_K: gl.constexpr, SUBTILE_SCALE_K: gl.constexpr,
+        PRESHUFFLE_FACTOR: gl.constexpr, SCALE_KWIDTH: gl.constexpr):
+    """Consume a drain slot while preserving the load/WMMA warp pipeline."""
+    with gl.amd.warp_pipeline_stage("stage0_tail", priority=0):
+        a0 = a_buf.index(slot).slice(
+            0, BLOCK_M, 0).slice(0, SUBTILE_K, 1).load(layout=DOT_A)
+        as0 = _load_scale(
+            as_buf, slot, 0, 0, SCALE_A_LAYOUT, BLOCK_M, BK_SCALE,
+            BLOCK_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+        b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            0, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+        bs0 = _load_scale(
+            bs_buf, slot, 0, 0, SCALE_B_LAYOUT, BLOCK_N, BK_SCALE,
+            BLOCK_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("stage1_tail", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, DTYPE_A, b0, bs0, DTYPE_B, acc)
+
+    with gl.amd.warp_pipeline_stage("stage0_tail", priority=0):
+        a1 = a_buf.index(slot).slice(
+            0, BLOCK_M, 0).slice(
+                SUBTILE_K, SUBTILE_K, 1).load(layout=DOT_A)
+        as1 = _load_scale(
+            as_buf, slot, 0, SUBTILE_SCALE_K, SCALE_A_LAYOUT, BLOCK_M,
+            BK_SCALE, BLOCK_M, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR,
+            SCALE_KWIDTH)
+        b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            SUBTILE_K, SUBTILE_K, 1).permute([1, 0]).load(layout=DOT_B)
+        bs1 = _load_scale(
+            bs_buf, slot, 0, SUBTILE_SCALE_K, SCALE_B_LAYOUT, BLOCK_N,
+            BK_SCALE, BLOCK_N, SUBTILE_SCALE_K, PRESHUFFLE_FACTOR,
+            SCALE_KWIDTH)
+    with gl.amd.warp_pipeline_stage("stage1_tail", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, DTYPE_A, b1, bs1, DTYPE_B, acc)
+    return acc
+
+
+@gluon.jit
 def _consume_and_refill(a_buf, b_buf, as_buf, bs_buf, slot,
                         a_desc, b_desc, as_desc, bs_desc, refill_idx, acc,
                         DTYPE_A: gl.constexpr, DTYPE_B: gl.constexpr,
@@ -286,7 +332,8 @@ def mxfp8_cluster_kernel_gfx1250(
         GRID_MN: gl.constexpr, NUM_XCDS: gl.constexpr,
         SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
         SHARED_SCALE_A: gl.constexpr, SHARED_SCALE_B: gl.constexpr,
-        WMMA_LAYOUT: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+        WMMA_LAYOUT: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr,
+        PIPELINE_TAIL: gl.constexpr):
     gl.static_assert(CTA_M == CTA_N and (CTA_M == 1 or CTA_M == 2 or CTA_M == 4))
     gl.static_assert(BLOCK_M == CTA_M * 256 and BLOCK_N == CTA_N * 256)
     gl.static_assert(BLOCK_K == 256)
@@ -371,21 +418,35 @@ def mxfp8_cluster_kernel_gfx1250(
         tdm.async_wait(wait_count)
 
     penultimate_slot = (iter_max - 2) % nbuf
-    acc = _consume_drain_tile(
-        a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc, DTYPE_A, DTYPE_B,
-        dot_a, dot_b, scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
-        BLOCK_K, bk_scale, subtile_k, subtile_scale_k, preshuffle_factor,
-        scale_kwidth)
+    if PIPELINE_TAIL:
+        acc = _consume_pipelined_drain_tile(
+            a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc,
+            DTYPE_A, DTYPE_B, dot_a, dot_b, scale_a_layout, scale_b_layout,
+            BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, preshuffle_factor, scale_kwidth)
+    else:
+        acc = _consume_drain_tile(
+            a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc,
+            DTYPE_A, DTYPE_B, dot_a, dot_b, scale_a_layout, scale_b_layout,
+            BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, preshuffle_factor, scale_kwidth)
 
     tdm.async_wait(0)
     if CTA_M * CTA_N > 1:
         _cluster_sync()
     last_slot = (iter_max - 1) % nbuf
-    acc = _consume_drain_tile(
-        a_buf, b_buf, as_buf, bs_buf, last_slot, acc, DTYPE_A, DTYPE_B,
-        dot_a, dot_b, scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
-        BLOCK_K, bk_scale, subtile_k, subtile_scale_k, preshuffle_factor,
-        scale_kwidth)
+    if PIPELINE_TAIL:
+        acc = _consume_pipelined_drain_tile(
+            a_buf, b_buf, as_buf, bs_buf, last_slot, acc,
+            DTYPE_A, DTYPE_B, dot_a, dot_b, scale_a_layout, scale_b_layout,
+            BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, preshuffle_factor, scale_kwidth)
+    else:
+        acc = _consume_drain_tile(
+            a_buf, b_buf, as_buf, bs_buf, last_slot, acc,
+            DTYPE_A, DTYPE_B, dot_a, dot_b, scale_a_layout, scale_b_layout,
+            BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
+            subtile_scale_k, preshuffle_factor, scale_kwidth)
 
     _tdm_store_output(
         c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc, WMMA_LAYOUT,
@@ -508,6 +569,7 @@ def _make_case(args):
             SHARED_SCALE_A=shared_scale_a, SHARED_SCALE_B=shared_scale_b,
             WMMA_LAYOUT=wmma,
             CTA_M=cluster_width, CTA_N=cluster_width,
+            PIPELINE_TAIL=args.pipeline_tail,
             num_warps=NUM_WARPS, num_ctas=cluster_width * cluster_width,
             waves_per_eu=NUM_WARPS // 4,
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
@@ -632,6 +694,9 @@ def _build_parser():
     parser.add_argument("--graph-ms", type=float, default=100.0)
     parser.add_argument("--n-replays", type=int, default=20)
     parser.add_argument("--iters-per-graph", type=int)
+    parser.add_argument(
+        "--pipeline-tail", action="store_true",
+        help="warp-pipeline the final two prefetched K tiles")
     return parser
 
 
