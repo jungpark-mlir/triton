@@ -2552,9 +2552,14 @@ def fp8_scaled_cluster_bf16_style_kernel_gfx1250(
         REFILL_BEFORE_WMMA: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr):
     gl.static_assert(DTYPE_A != "e2m1" and DTYPE_B != "e2m1",
                      "fp8_scaled_cluster_bf16_style_kernel_gfx1250 requires FP8 inputs")
-    gl.static_assert(CTA_M == CTA_N and (CTA_M == 1 or CTA_M == 2 or CTA_M == 4),
-                     "the BF16-style MXFP8 kernel supports 1x1, 2x2, and 4x4 clusters")
-    gl.static_assert(BLOCK_M == CTA_M * 256 and BLOCK_N == CTA_N * 256 and BLOCK_K == 256)
+    gl.static_assert(
+        (CTA_M == CTA_N and (CTA_M == 1 or CTA_M == 2 or CTA_M == 4))
+        or (CTA_M == 2 and (CTA_N == 1 or CTA_N == 4 or CTA_N == 8)),
+        "the BF16-style MXFP8 kernel supports 1x1, 2x1, 2x2, 2x4, 4x4, and 2x8 clusters")
+    gl.static_assert(
+        BLOCK_K == 256
+        and BLOCK_M // CTA_M == BLOCK_N // CTA_N
+        and (BLOCK_M // CTA_M == 128 or BLOCK_M // CTA_M == 256))
     gl.static_assert(SCALE_BLOCK == 16 or SCALE_BLOCK == 32)
     gl.static_assert(NUM_WARPS == 8)
     gl.static_assert(gl.num_ctas() == CTA_M * CTA_N,
@@ -4520,19 +4525,28 @@ def _make_fp8_scaled_case(args):
     elif args.fp8_cluster_bf16_style:
         cluster_m, cluster_n = args.fp8_cluster_shape
         expected_tile = (cluster_m * 256, cluster_n * 256, 256)
+        alternate_tile = (cluster_m * 128, cluster_n * 128, 256)
     elif args.fp8_cluster:
         expected_tile = (1024, 1024, 256)
     else:
         expected_tile = (256, 256, expected_bk)
-    if (args.BM, args.BN, args.BK) != expected_tile:
+    actual_tile = (args.BM, args.BN, args.BK)
+    if (actual_tile != expected_tile
+            and (not args.fp8_cluster_bf16_style
+                 or actual_tile != alternate_tile)):
         if args.fp8_scaled_cluster_bk128:
             kernel_name = "BK128 cluster"
         else:
             kernel_name = ("BF16-style cluster" if args.fp8_cluster_bf16_style else
                            ("cluster tutorial" if args.fp8_cluster else ("kernelC" if args.kernel_c else "tutorial")))
+        requirement = (
+            f"-BM/-BN {expected_tile[0]}/{expected_tile[1]} or "
+            f"{alternate_tile[0]}/{alternate_tile[1]}, -BK 256"
+            if args.fp8_cluster_bf16_style
+            else f"-BM {expected_tile[0]} -BN {expected_tile[1]} "
+                 f"-BK {expected_tile[2]}")
         raise ValueError(
-            f"The scaled FP8 {kernel_name} kernel requires -BM {expected_tile[0]} -BN {expected_tile[1]} "
-            f"-BK {expected_tile[2]}")
+            f"The scaled FP8 {kernel_name} kernel requires {requirement}")
     if args.num_warps != 8:
         raise ValueError("The scaled FP8 kernels require --num-warps 8")
     if (args.kernel_c or args.fp8_scaled_cluster_bk128) and args.num_buffers not in (3, 4):
@@ -4617,7 +4631,10 @@ def _make_fp8_scaled_case(args):
                                                             CTA_M=cta_m, CTA_N=cta_n,
                                                             HIPBLASLT_SCALE_LAYOUT=(
                                                                 args.fp8_scale_layout == "hipblaslt"),
-                                                            USE_PARTITIONED=args.fp8_cluster_bf16_style)
+                                                            USE_PARTITIONED=(
+                                                                args.fp8_cluster_bf16_style
+                                                                and (cta_m, cta_n)
+                                                                not in ((2, 1), (2, 4), (2, 8))))
 
     a_d = a.contiguous().cuda()
     b_d = b.T.contiguous().cuda()
@@ -4978,14 +4995,21 @@ def _build_arg_parser():
     parser.add_argument("--fp8-cluster", action="store_true",
                         help="Use the 16-CTA, 1024x1024 scaled-FP8 cluster tutorial kernel")
     parser.add_argument("--fp8-cluster-bf16-style", action="store_true",
-                        help="Use the parameterized square-cluster BK256 scaled-FP8 kernel with partitioned A/B LDS")
+                        help="Use the parameterized cluster BK256 scaled-FP8 kernel")
     parser.add_argument("--fp8-cluster-shape", type=int, nargs=2, metavar=("CTA_M", "CTA_N"),
                         default=(4, 4),
-                        help="Square cluster shape for --fp8-cluster-bf16-style: 1 1, 2 2, or 4 4")
+                        help="Cluster shape for --fp8-cluster-bf16-style: 1 1, 2 1, 2 2, 2 4, 4 4, or 2 8")
     parser.add_argument("--fp8-tdm-schedule", choices=["leading4", "fused-pairs", "ab-scales"], default=None,
                         help="TDM schedule for --fp8-cluster-bf16-style (default: two fused loads on warps 0..3)")
-    parser.add_argument("--fp8-refill-before-wmma", action="store_true",
-                        help="Issue refill before the final K128 scaled WMMA")
+    fp8_refill_group = parser.add_mutually_exclusive_group()
+    fp8_refill_group.add_argument(
+        "--fp8-refill-before-wmma", dest="fp8_refill_before_wmma",
+        action="store_true", default=None,
+        help="Issue refill before the final K128 scaled WMMA (default for --fp8-cluster-bf16-style)")
+    fp8_refill_group.add_argument(
+        "--no-fp8-refill-before-wmma", dest="fp8_refill_before_wmma",
+        action="store_false",
+        help="Issue the final K128 scaled WMMA before refill")
     parser.add_argument("--fp8-scaled-cluster-bk128", action="store_true",
                         help="Use the 2-CTA, 512x256 scaled-FP8 BK128 kernel")
     parser.add_argument("--fp8-bf16-output", action="store_true",
@@ -5073,8 +5097,10 @@ if __name__ == "__main__":
         raise ValueError("--fp8-cluster requires the plain-FP8 --with-scale path")
     if args.fp8_cluster_bf16_style and not (plain_fp8 and args.with_scale):
         raise ValueError("--fp8-cluster-bf16-style requires the plain-FP8 --with-scale path")
-    if tuple(args.fp8_cluster_shape) not in ((1, 1), (2, 2), (4, 4)):
-        raise ValueError("--fp8-cluster-shape must be 1 1, 2 2, or 4 4")
+    if tuple(args.fp8_cluster_shape) not in (
+            (1, 1), (2, 1), (2, 2), (2, 4), (4, 4), (2, 8)):
+        raise ValueError(
+            "--fp8-cluster-shape must be 1 1, 2 1, 2 2, 2 4, 4 4, or 2 8")
     if tuple(args.fp8_cluster_shape) != (4, 4) and not args.fp8_cluster_bf16_style:
         raise ValueError("--fp8-cluster-shape applies only to --fp8-cluster-bf16-style")
     valid_mxfp4_cluster_shapes = ((2, 2), (2, 4), (4, 2), (4, 4))
@@ -5090,6 +5116,8 @@ if __name__ == "__main__":
         args.fp8_tdm_schedule = "leading4" if args.fp8_cluster_bf16_style else "fused-pairs"
     elif not args.fp8_cluster_bf16_style:
         raise ValueError("--fp8-tdm-schedule applies only to --fp8-cluster-bf16-style")
+    if args.fp8_refill_before_wmma is None:
+        args.fp8_refill_before_wmma = args.fp8_cluster_bf16_style
     if args.fp8_refill_before_wmma and not args.fp8_cluster_bf16_style:
         raise ValueError("--fp8-refill-before-wmma applies only to --fp8-cluster-bf16-style")
     if args.fp8_scaled_cluster_bk128 and not (plain_fp8 and args.with_scale):

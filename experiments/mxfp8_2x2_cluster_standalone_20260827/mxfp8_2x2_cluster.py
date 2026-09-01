@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Standalone 2x2-CTA MXFP8 GEMM for AMD GFX1250.
 
-The kernel computes E4M3 x E4M3 with E8M0 block-32 scales and writes BF16.
+The kernel computes E4M3 x E4M3 with E8M0 block-32 scales and writes BF16
+or FP32.
 Its fixed aggregate tile is 512x512x256 (256x256 output elements per CTA).
 
 Run this file with a Triton checkout that includes the GFX1250 Gluon TDM and
@@ -30,7 +31,7 @@ NUM_WARPS = 8
 NUM_CTAS = 4
 GROUP_SIZE_M = 4
 NUM_XCDS = 8
-TARGET_WGPS = 256
+TARGET_WGPS = 512
 
 JIT_BLOCK_M = gl.constexpr(BLOCK_M)
 JIT_BLOCK_N = gl.constexpr(BLOCK_N)
@@ -42,18 +43,40 @@ JIT_NUM_XCDS = gl.constexpr(NUM_XCDS)
 
 
 @gluon.jit
-def get_xcd_swizzled_pid(GRID_MN: gl.constexpr):
+def get_xcd_swizzled_pid(
+        GRID_MN: gl.constexpr, XCD_SWIZZLE_CHUNK: gl.constexpr,
+        XCD_SWIZZLE_PERMUTE: gl.constexpr,
+        XCD_SWIZZLE_OFFSET: gl.constexpr):
     pid = gl.program_id(axis=0)
     pids_per_xcd = (GRID_MN + JIT_NUM_XCDS - 1) // JIT_NUM_XCDS
     tall_xcds = GRID_MN % JIT_NUM_XCDS
     tall_xcds = JIT_NUM_XCDS if tall_xcds == 0 else tall_xcds
     xcd = pid % JIT_NUM_XCDS
     local_pid = pid // JIT_NUM_XCDS
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
+    if (GRID_MN % JIT_NUM_XCDS == 0
+            and pids_per_xcd % XCD_SWIZZLE_CHUNK == 0):
+        # Assign contiguous N-tile chunks to each XCD. A chunk of one leaves
+        # logical PIDs interleaved across XCDs; pids_per_xcd reproduces the
+        # conventional contiguous-per-XCD mapping.
+        chunk_group = local_pid // XCD_SWIZZLE_CHUNK
+        chunk_offset = local_pid % XCD_SWIZZLE_CHUNK
+        tile_xcd = xcd
+        if XCD_SWIZZLE_PERMUTE == "rotate":
+            tile_xcd = (xcd + chunk_group) % JIT_NUM_XCDS
+        elif XCD_SWIZZLE_PERMUTE == "xor":
+            tile_xcd = xcd ^ (chunk_group % JIT_NUM_XCDS)
+        elif XCD_SWIZZLE_PERMUTE == "serpentine":
+            tile_xcd = (
+                JIT_NUM_XCDS - 1 - xcd if chunk_group % 2 else xcd)
+        pid = ((chunk_group * JIT_NUM_XCDS + tile_xcd)
+               * XCD_SWIZZLE_CHUNK + chunk_offset)
     else:
-        pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
-    return pid
+        if xcd < tall_xcds:
+            pid = xcd * pids_per_xcd + local_pid
+        else:
+            pid = (tall_xcds * pids_per_xcd
+                   + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
+    return (pid + XCD_SWIZZLE_OFFSET) % GRID_MN
 
 
 @gluon.jit
@@ -419,14 +442,18 @@ def compute_output_tile(
 def mxfp8_2x2_cluster_kernel(
         a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
         stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-        stride_scale, GRID_MN: gl.constexpr,
+        stride_scale, GRID_MN: gl.constexpr, OUTPUT_ITERS: gl.constexpr,
         SINGLE_TILE_PER_PROGRAM: gl.constexpr, SHARED_LAYOUT_A: gl.constexpr,
         SHARED_LAYOUT_B: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
         SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr,
         OUTPUT_STORE: gl.constexpr, PERSISTENT_TAIL: gl.constexpr,
-        NEXT_PREFETCH: gl.constexpr):
+        NEXT_PREFETCH: gl.constexpr, XCD_SWIZZLE_CHUNK: gl.constexpr,
+        XCD_SWIZZLE_PERMUTE: gl.constexpr,
+        XCD_SWIZZLE_OFFSET: gl.constexpr):
     gl.static_assert(gl.num_ctas() == JIT_NUM_CTAS)
-    persistent_pid = get_xcd_swizzled_pid(GRID_MN)
+    persistent_pid = get_xcd_swizzled_pid(
+        GRID_MN, XCD_SWIZZLE_CHUNK, XCD_SWIZZLE_PERMUTE,
+        XCD_SWIZZLE_OFFSET)
     total_tiles = gl.cdiv(M, JIT_BLOCK_M) * gl.cdiv(N, JIT_BLOCK_N)
 
     dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
@@ -452,35 +479,38 @@ def mxfp8_2x2_cluster_kernel(
             a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
             stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
             stride_cn, stride_scale, pid_m, pid_n, pid_m, pid_n, False,
-            quarter_c_buf, dot_a, dot_b, scale_a_layout, scale_b_layout,
+            quarter_c_buf, dot_a, dot_b, scale_a_layout,
+            scale_b_layout,
             SHARED_LAYOUT_A,
             SHARED_LAYOUT_B,
             SHARED_SCALE_A, SHARED_SCALE_B, quarter_c_layout, WMMA_LAYOUT,
             TAIL_MODE="explicit", OUTPUT_STORE=OUTPUT_STORE,
             NEXT_PREFETCH=NEXT_PREFETCH)
     else:
-        # A bounded launch stays resident and pulls additional output tiles
-        # with a grid-stride loop.
-        for output_tile in range(persistent_pid, total_tiles, GRID_MN):
-            pid_m, pid_n = get_grouped_tile_coords(output_tile, M, N)
-            next_output_tile = min(
-                output_tile + GRID_MN, total_tiles - 1)
-            next_pid_m, next_pid_n = get_grouped_tile_coords(
-                next_output_tile, M, N)
-            has_next = output_tile + GRID_MN < total_tiles
-            compute_output_tile(
-                a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
-                stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
-                stride_cn, stride_scale, pid_m, pid_n, next_pid_m, next_pid_n,
-                has_next, quarter_c_buf, dot_a, dot_b, scale_a_layout,
-                scale_b_layout, SHARED_LAYOUT_A,
-                SHARED_LAYOUT_B, SHARED_SCALE_A, SHARED_SCALE_B,
-                quarter_c_layout, WMMA_LAYOUT, TAIL_MODE=PERSISTENT_TAIL,
-                OUTPUT_STORE=OUTPUT_STORE,
-                NEXT_PREFETCH=NEXT_PREFETCH)
+        # OUTPUT_ITERS is a host-computed constexpr. The loop-unroll pass
+        # removes this outer loop before warp pipelining the K-tail loops.
+        for output_iteration in range(OUTPUT_ITERS):
+            output_tile = persistent_pid + output_iteration * GRID_MN
+            if output_tile < total_tiles:
+                pid_m, pid_n = get_grouped_tile_coords(output_tile, M, N)
+                next_output_tile = min(
+                    output_tile + GRID_MN, total_tiles - 1)
+                next_pid_m, next_pid_n = get_grouped_tile_coords(
+                    next_output_tile, M, N)
+                has_next = output_tile + GRID_MN < total_tiles
+                compute_output_tile(
+                    a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
+                    stride_am, stride_ak, stride_bk, stride_bn, stride_cm,
+                    stride_cn, stride_scale, pid_m, pid_n, next_pid_m,
+                    next_pid_n, has_next, quarter_c_buf,
+                    dot_a, dot_b, scale_a_layout, scale_b_layout, SHARED_LAYOUT_A,
+                    SHARED_LAYOUT_B, SHARED_SCALE_A, SHARED_SCALE_B,
+                    quarter_c_layout, WMMA_LAYOUT,
+                    TAIL_MODE=PERSISTENT_TAIL, OUTPUT_STORE=OUTPUT_STORE,
+                    NEXT_PREFETCH=NEXT_PREFETCH)
 
-            if output_tile + GRID_MN < total_tiles:
-                cluster_wait()
+                if output_tile + GRID_MN < total_tiles:
+                    cluster_wait()
 
     if OUTPUT_STORE == "tdm-quarter":
         tdm.async_wait(0)
@@ -538,18 +568,19 @@ def init_fp8(shape, mode, cosine=False):
     return output
 
 
-def reference_gemm(a, b, a_scale, b_scale):
+def reference_gemm(a, b, a_scale, b_scale, output_dtype):
     a_scale_f32 = a_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1)
     b_scale_f32 = b_scale.to(torch.float32).repeat_interleave(SCALE_BLOCK, dim=1).T.contiguous()
     return torch.matmul(
         a.to(torch.float32) * a_scale_f32,
         b.to(torch.float32) * b_scale_f32,
-    ).to(torch.bfloat16)
+    ).to(output_dtype)
 
 
 def make_case(
         M, N, K, mode, seed, need_reference, persistent_wgps, output_store,
-        persistent_tail, next_tile_prefetch):
+        output_dtype, persistent_tail, next_tile_prefetch, xcd_swizzle_chunk,
+        xcd_swizzle_permute, xcd_swizzle_offset):
     if M % BLOCK_M or N % BLOCK_N or K % BLOCK_K:
         raise ValueError("M, N, and K must be divisible by 512, 512, and 256")
     if K < 2 * BLOCK_K:
@@ -561,31 +592,42 @@ def make_case(
     scale_k = K // SCALE_BLOCK
     a_scale_obj = MXScaleTensor(size=(M, scale_k)).random(low=1.0, high=32.0)
     b_scale_obj = MXScaleTensor(size=(N, scale_k)).random(low=1.0, high=32.0)
-    reference = reference_gemm(a, b, a_scale_obj, b_scale_obj) if need_reference else None
+    torch_output_dtype = (
+        torch.bfloat16 if output_dtype == "bf16" else torch.float32)
+    reference = (
+        reference_gemm(
+            a, b, a_scale_obj, b_scale_obj, torch_output_dtype)
+        if need_reference else None)
 
     a_d = a.contiguous().cuda()
     b_d = b.T.contiguous().cuda()
     a_scale_d = pack_scale(a_scale_obj.data).cuda()
     b_scale_d = pack_scale(b_scale_obj.data).cuda()
-    c_d = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+    c_d = torch.empty((M, N), dtype=torch_output_dtype, device="cuda")
     layouts = build_layouts(output_store)
     total_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
     persistent_programs = max(1, persistent_wgps // NUM_CTAS)
     grid = (min(total_tiles, persistent_programs), 1)
+    output_iters = triton.cdiv(total_tiles, grid[0])
 
-    def launch():
+    def launch(
+            offset=xcd_swizzle_offset, chunk=xcd_swizzle_chunk,
+            permute=xcd_swizzle_permute):
         shared_a, shared_b, shared_as, shared_bs, wmma = layouts
         return mxfp8_2x2_cluster_kernel[grid](
             a_d, b_d, c_d, a_scale_d, b_scale_d, M, N, K,
             a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
             c_d.stride(0), c_d.stride(1), b_scale_d.stride(0),
-            GRID_MN=grid[0],
+            GRID_MN=grid[0], OUTPUT_ITERS=output_iters,
             SINGLE_TILE_PER_PROGRAM=total_tiles <= persistent_programs,
             SHARED_LAYOUT_A=shared_a,
             SHARED_LAYOUT_B=shared_b, SHARED_SCALE_A=shared_as,
             SHARED_SCALE_B=shared_bs, WMMA_LAYOUT=wmma,
             OUTPUT_STORE=output_store, PERSISTENT_TAIL=persistent_tail,
             NEXT_PREFETCH=next_tile_prefetch,
+            XCD_SWIZZLE_CHUNK=chunk,
+            XCD_SWIZZLE_PERMUTE=permute,
+            XCD_SWIZZLE_OFFSET=offset,
             num_ctas=NUM_CTAS, num_warps=NUM_WARPS,
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),), waves_per_eu=2)
 
@@ -674,22 +716,42 @@ def main():
         default="tdm",
         help="output epilogue implementation")
     parser.add_argument(
-        "--persistent-tail", choices=["nested", "plain"],
+        "--output-dtype", choices=["bf16", "fp32"], default="bf16",
+        help="output element type; FP32 is supported by direct register stores")
+    parser.add_argument(
+        "--persistent-tail", choices=["nested", "plain", "explicit"],
         default="plain", help="K-tail lowering inside the persistent loop")
     parser.add_argument(
         "--next-tile-prefetch", type=int, choices=[0, 1, 2, 4, 6], default=0,
         help="number of next-output K tiles to prefetch into L2")
+    parser.add_argument(
+        "--xcd-swizzle-chunk", type=int, choices=[1, 2, 4, 8, 16], default=2,
+        help="contiguous logical N tiles assigned to each XCD at a time")
+    parser.add_argument(
+        "--xcd-swizzle-permute",
+        choices=["identity", "rotate", "xor", "serpentine"],
+        default="identity",
+        help="per-cohort permutation of logical N chunks across XCDs")
+    parser.add_argument(
+        "--xcd-swizzle-offset", type=int, default=0,
+        help="cyclic logical tile offset after XCD assignment")
     args = parser.parse_args()
     if not args.check and not args.benchmark:
         args.check = True
 
     if args.persistent_wgps < NUM_CTAS:
         parser.error(f"--persistent-wgps must be at least {NUM_CTAS}")
+    if (args.output_dtype == "fp32"
+            and args.output_store not in ("direct", "buffer")):
+        parser.error(
+            "--output-dtype fp32 requires --output-store direct or buffer")
 
     launch, output, reference = make_case(
         args.M, args.N, args.K, args.input_mode, args.seed, args.check,
-        args.persistent_wgps, args.output_store, args.persistent_tail,
-        args.next_tile_prefetch)
+        args.persistent_wgps, args.output_store, args.output_dtype,
+        args.persistent_tail, args.next_tile_prefetch,
+        args.xcd_swizzle_chunk, args.xcd_swizzle_permute,
+        args.xcd_swizzle_offset)
     if args.check:
         check(launch, output, reference)
     if args.benchmark:
