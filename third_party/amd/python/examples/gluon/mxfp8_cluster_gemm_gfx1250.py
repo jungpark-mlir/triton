@@ -626,6 +626,16 @@ def _run_direct_benchmark(launch, args):
     _print_benchmark_result(elapsed, args.direct_iters, args)
 
 
+class _CapturedGraph:
+
+    def __init__(self, graph, keepalive):
+        self._graph = graph
+        self._keepalive = keepalive
+
+    def replay(self):
+        self._graph.replay()
+
+
 def _capture_graph(fn, iterations):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -639,7 +649,9 @@ def _capture_graph(fn, iterations):
                 fn()
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
-    return graph
+    # A CUDAGraph retains raw device addresses, but does not own the tensors
+    # captured by fn. Keep fn (and its tensor closure) alive with the graph.
+    return _CapturedGraph(graph, fn)
 
 
 def _run_graph_benchmark(launch, args):
