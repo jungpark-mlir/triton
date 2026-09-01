@@ -669,12 +669,18 @@ def capture_graph(fn, iterations):
     return graph
 
 
-def benchmark(launch, M, N, K, warmup, probe_iters, graph_ms, replays):
+def benchmark(
+        launch, M, N, K, warmup, probe_iters, graph_ms, replays,
+        iters_per_graph):
     for _ in range(warmup):
         launch()
     torch.cuda.synchronize()
     probe_ms = event_probe(launch, probe_iters)
-    iterations = max(1, int(graph_ms / max(probe_ms, 1e-6)))
+    iterations = iters_per_graph
+    if iterations is None:
+        iterations = max(1, int(graph_ms / max(probe_ms, 1e-6)))
+    if iterations <= 0:
+        raise ValueError("--iters-per-graph must be positive")
     graph = capture_graph(launch, iterations)
 
     torch.cuda.synchronize()
@@ -707,6 +713,9 @@ def main():
     parser.add_argument("--probe-iters", type=int, default=20)
     parser.add_argument("--graph-ms", type=float, default=100.0)
     parser.add_argument("--replays", type=int, default=20)
+    parser.add_argument(
+        "--iters-per-graph", type=int,
+        help="override the graph body iteration count")
     parser.add_argument(
         "--persistent-wgps", type=int, default=TARGET_WGPS,
         help="physical WGP budget (a 2x2 clustered program consumes four)")
@@ -757,7 +766,7 @@ def main():
     if args.benchmark:
         benchmark(
             launch, args.M, args.N, args.K, args.warmup, args.probe_iters,
-            args.graph_ms, args.replays)
+            args.graph_ms, args.replays, args.iters_per_graph)
 
 
 if __name__ == "__main__":
