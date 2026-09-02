@@ -100,6 +100,109 @@ def _tdm_store_output(c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
 
 
 @gluon.jit
+def _tdm_store_output_split_n2(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+    """Overlap the first half-tile TDM store with staging the second half."""
+    gl.static_assert(CTA_M == 2 and CTA_N == 2)
+    cta_m: gl.constexpr = BLOCK_M // CTA_M
+    cta_n: gl.constexpr = BLOCK_N // CTA_N
+    half_n: gl.constexpr = cta_n // 2
+    cga_layout: gl.constexpr = ((1, 0, 0, 0), (0, 1, 0, 0))
+    shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[half_n, 8]], [CTA_M, CTA_N, cta_m, half_n], [3, 2, 1, 0],
+        cga_layout)
+    shared0 = gl.allocate_shared_memory(
+        c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout)
+    shared1 = gl.allocate_shared_memory(
+        c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout)
+
+    acc4 = acc.reshape((CTA_M, cta_m, CTA_N, cta_n)).permute((0, 2, 1, 3))
+    output0 = gl.amd.slice(
+        acc4, [CTA_M, CTA_N, cta_m, half_n], [0, 0, 0, 0])
+    output1 = gl.amd.slice(
+        acc4, [CTA_M, CTA_N, cta_m, half_n], [0, 0, 0, half_n])
+    shared0.store(output0.to(c_ptr.type.element_ty))
+
+    desc = tdm.make_tensor_descriptor(
+        base=c_ptr,
+        shape=(M // cta_m, N // cta_n, cta_m, cta_n),
+        strides=(cta_m * stride_cm, cta_n * stride_cn, stride_cm, stride_cn),
+        block_shape=(CTA_M, CTA_N, cta_m, half_n),
+        layout=shared_layout)
+    tdm.async_store(
+        desc, [pid_m * CTA_M, pid_n * CTA_N, 0, 0], shared0)
+
+    shared1.store(output1.to(c_ptr.type.element_ty))
+    tdm.async_store(
+        desc, [pid_m * CTA_M, pid_n * CTA_N, 0, half_n], shared1)
+    tdm.async_wait(0)
+
+
+@gluon.jit
+def _tdm_store_output_quarters(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+    """Pipeline four quarter-tile TDM stores behind subsequent LDS staging."""
+    gl.static_assert(CTA_M == 2 and CTA_N == 2)
+    cta_m: gl.constexpr = BLOCK_M // CTA_M
+    cta_n: gl.constexpr = BLOCK_N // CTA_N
+    quarter_m: gl.constexpr = cta_m // 2
+    quarter_n: gl.constexpr = cta_n // 2
+    cga_layout: gl.constexpr = ((1, 0, 0, 0), (0, 1, 0, 0))
+    shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[quarter_n, 8]], [CTA_M, CTA_N, quarter_m, quarter_n],
+        [3, 2, 1, 0], cga_layout)
+    shared0 = gl.allocate_shared_memory(
+        c_ptr.type.element_ty,
+        [CTA_M, CTA_N, quarter_m, quarter_n], shared_layout)
+    shared1 = gl.allocate_shared_memory(
+        c_ptr.type.element_ty,
+        [CTA_M, CTA_N, quarter_m, quarter_n], shared_layout)
+    shared2 = gl.allocate_shared_memory(
+        c_ptr.type.element_ty,
+        [CTA_M, CTA_N, quarter_m, quarter_n], shared_layout)
+    shared3 = gl.allocate_shared_memory(
+        c_ptr.type.element_ty,
+        [CTA_M, CTA_N, quarter_m, quarter_n], shared_layout)
+
+    acc4 = acc.reshape((CTA_M, cta_m, CTA_N, cta_n)).permute((0, 2, 1, 3))
+    output0 = gl.amd.slice(
+        acc4, [CTA_M, CTA_N, quarter_m, quarter_n], [0, 0, 0, 0])
+    output1 = gl.amd.slice(
+        acc4, [CTA_M, CTA_N, quarter_m, quarter_n],
+        [0, 0, 0, quarter_n])
+    output2 = gl.amd.slice(
+        acc4, [CTA_M, CTA_N, quarter_m, quarter_n],
+        [0, 0, quarter_m, 0])
+    output3 = gl.amd.slice(
+        acc4, [CTA_M, CTA_N, quarter_m, quarter_n],
+        [0, 0, quarter_m, quarter_n])
+
+    desc = tdm.make_tensor_descriptor(
+        base=c_ptr,
+        shape=(M // cta_m, N // cta_n, cta_m, cta_n),
+        strides=(cta_m * stride_cm, cta_n * stride_cn, stride_cm, stride_cn),
+        block_shape=(CTA_M, CTA_N, quarter_m, quarter_n),
+        layout=shared_layout)
+    base_m = pid_m * CTA_M
+    base_n = pid_n * CTA_N
+
+    shared0.store(output0.to(c_ptr.type.element_ty))
+    tdm.async_store(desc, [base_m, base_n, 0, 0], shared0)
+    shared1.store(output1.to(c_ptr.type.element_ty))
+    tdm.async_store(desc, [base_m, base_n, 0, quarter_n], shared1)
+    shared2.store(output2.to(c_ptr.type.element_ty))
+    tdm.async_store(desc, [base_m, base_n, quarter_m, 0], shared2)
+    shared3.store(output3.to(c_ptr.type.element_ty))
+    tdm.async_store(
+        desc, [base_m, base_n, quarter_m, quarter_n], shared3)
+    tdm.async_wait(0)
+
+
+@gluon.jit
 def _cluster_sync():
     gl.amd.gfx1250.cluster.arrive()
     gl.amd.gfx1250.cluster.wait()
@@ -142,15 +245,19 @@ def _issue_leading4_data_load(a_desc, b_desc, a_buf, b_buf, tile_idx, slot,
     ])
 
 
-def _build_cluster_layouts(block_m, block_n, scale_block, cga_layout):
+def _build_cluster_layouts(
+        block_m, block_n, scale_block, cga_layout, split_output_store=False,
+        quarter_output_store=False):
     """Build CGA-distributed operand, scale, and accumulator layouts."""
     local_a = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [block_m, BLOCK_K], [1, 0])
     local_b = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [block_n, BLOCK_K], [1, 0])
+    slice_m = CTA_TILE // 2 if quarter_output_store else CTA_TILE
+    slice_n = CTA_TILE // 2 if split_output_store or quarter_output_store else CTA_TILE
     _, _, local_wmma = gl.amd.gfx1250.make_partitioned_dot_layouts(
         block_m, block_n, local_a, local_b, NUM_WARPS, [16, 16, 128],
-        a_transposed=False, b_transposed=True, slice_m=CTA_TILE, slice_n=CTA_TILE)
+        a_transposed=False, b_transposed=True, slice_m=slice_m, slice_n=slice_n)
 
     wmma = gl.amd.AMDWMMALayout(
         3, local_wmma.transposed, local_wmma.warp_bases, local_wmma.reg_bases,
@@ -333,7 +440,9 @@ def mxfp8_cluster_kernel_gfx1250(
         SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
         SHARED_SCALE_A: gl.constexpr, SHARED_SCALE_B: gl.constexpr,
         WMMA_LAYOUT: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr,
-        PIPELINE_TAIL: gl.constexpr):
+        PIPELINE_TAIL: gl.constexpr, SPLIT_OUTPUT_STORE: gl.constexpr,
+        QUARTER_OUTPUT_STORE: gl.constexpr,
+        SINGLE_SLOT_PROLOGUE: gl.constexpr):
     gl.static_assert(CTA_M == CTA_N and (CTA_M == 1 or CTA_M == 2 or CTA_M == 4))
     gl.static_assert(BLOCK_M == CTA_M * 256 and BLOCK_N == CTA_N * 256)
     gl.static_assert(BLOCK_K == 256)
@@ -393,19 +502,32 @@ def mxfp8_cluster_kernel_gfx1250(
         block_shape=(BLOCK_N // preshuffle_factor, bk_scale_preshuffled),
         layout=SHARED_SCALE_B)
 
-    for prefetch_idx in gl.static_range(nbuf):
-        _issue_refill(
-            a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
-            prefetch_idx, prefetch_idx, BLOCK_K, bk_scale_preshuffled)
-
-    wait_count: gl.constexpr = 2
-    tdm.async_wait(wait_count)
-    if CTA_M * CTA_N > 1:
-        _cluster_sync()
-
-    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     iter_max = gl.cdiv(K, BLOCK_K)
     gl.assume(iter_max >= nbuf)
+    wait_count: gl.constexpr = 2
+
+    if SINGLE_SLOT_PROLOGUE:
+        _issue_refill(
+            a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
+            0, 0, BLOCK_K, bk_scale_preshuffled)
+        tdm.async_wait(0)
+        if CTA_M * CTA_N > 1:
+            _cluster_sync()
+
+        _issue_refill(
+            a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
+            1, 1, BLOCK_K, bk_scale_preshuffled)
+    else:
+        for prefetch_idx in gl.static_range(nbuf):
+            _issue_refill(
+                a_desc, b_desc, as_desc, bs_desc, a_buf, b_buf, as_buf, bs_buf,
+                prefetch_idx, prefetch_idx, BLOCK_K, bk_scale_preshuffled)
+
+        tdm.async_wait(wait_count)
+        if CTA_M * CTA_N > 1:
+            _cluster_sync()
+
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
     for tile_idx in range(0, iter_max - nbuf):
         slot = tile_idx % nbuf
@@ -448,9 +570,18 @@ def mxfp8_cluster_kernel_gfx1250(
             BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
             subtile_scale_k, preshuffle_factor, scale_kwidth)
 
-    _tdm_store_output(
-        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc, WMMA_LAYOUT,
-        BLOCK_M, BLOCK_N, CTA_N)
+    if QUARTER_OUTPUT_STORE:
+        _tdm_store_output_quarters(
+            c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+            BLOCK_M, BLOCK_N, CTA_M, CTA_N)
+    elif SPLIT_OUTPUT_STORE:
+        _tdm_store_output_split_n2(
+            c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+            BLOCK_M, BLOCK_N, CTA_M, CTA_N)
+    else:
+        _tdm_store_output(
+            c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc, WMMA_LAYOUT,
+            BLOCK_M, BLOCK_N, CTA_N)
 
 
 def select_cluster_width(m, n):
@@ -503,10 +634,16 @@ def _validate_args(args):
     if args.M <= 0 or args.N <= 0 or args.K <= 0:
         raise ValueError("M, N, and K must be positive")
     cluster_width = select_cluster_width(args.M, args.N)
+    if args.split_output_store and args.quarter_output_store:
+        raise ValueError("select only one split-output mode")
+    if (args.split_output_store or args.quarter_output_store) and cluster_width != 2:
+        raise ValueError("split-output modes currently require a 2x2 cluster")
     if args.K % BLOCK_K:
         raise ValueError(f"K must be divisible by the BK={BLOCK_K} kernel tile")
     if args.K < NUM_BUFFERS * BLOCK_K:
         raise ValueError(f"K must contain at least {NUM_BUFFERS} BK={BLOCK_K} tiles")
+    if args.single_slot_prologue and args.K < (NUM_BUFFERS + 1) * BLOCK_K:
+        raise ValueError("--single-slot-prologue requires at least three K tiles")
     if args.scale_block not in (16, 32):
         raise ValueError("--scale-block must be 16 or 32")
     if args.K % args.scale_block:
@@ -551,7 +688,8 @@ def _make_case(args):
         [0, 1],
     )
     shared_a, shared_b, shared_scale_a, shared_scale_b, wmma = _build_cluster_layouts(
-        block_m, block_n, args.scale_block, cga_layout)
+        block_m, block_n, args.scale_block, cga_layout, args.split_output_store,
+        args.quarter_output_store)
 
     def launch():
         return mxfp8_cluster_kernel_gfx1250[grid](
@@ -570,6 +708,9 @@ def _make_case(args):
             WMMA_LAYOUT=wmma,
             CTA_M=cluster_width, CTA_N=cluster_width,
             PIPELINE_TAIL=args.pipeline_tail,
+            SPLIT_OUTPUT_STORE=args.split_output_store,
+            QUARTER_OUTPUT_STORE=args.quarter_output_store,
+            SINGLE_SLOT_PROLOGUE=args.single_slot_prologue,
             num_warps=NUM_WARPS, num_ctas=cluster_width * cluster_width,
             waves_per_eu=NUM_WARPS // 4,
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
@@ -709,6 +850,15 @@ def _build_parser():
     parser.add_argument(
         "--pipeline-tail", action="store_true",
         help="warp-pipeline the final two prefetched K tiles")
+    parser.add_argument(
+        "--split-output-store", action="store_true",
+        help="stage and TDM-store the 2x2 output tile in two N halves")
+    parser.add_argument(
+        "--quarter-output-store", action="store_true",
+        help="stage and TDM-store the 2x2 output tile in four quarters")
+    parser.add_argument(
+        "--single-slot-prologue", action="store_true",
+        help="load one K tile initially and overlap the second with first-tile compute")
     return parser
 
 
@@ -722,7 +872,10 @@ def main():
         f"shape             : {args.M}x{args.N}x{args.K}\n"
         f"cluster           : {cluster_width}x{cluster_width}\n"
         f"aggregate tile    : {block_m}x{block_m}x{BLOCK_K}\n"
-        f"output dtype      : {'bfloat16' if args.fp8_bf16_output else 'float16'}"
+        f"output dtype      : {'bfloat16' if args.fp8_bf16_output else 'float16'}\n"
+        f"prologue          : {'single-slot' if args.single_slot_prologue else 'two-slot'}\n"
+        f"output store      : "
+        f"{'quarter TDM' if args.quarter_output_store else 'split-n2 TDM' if args.split_output_store else 'full-tile TDM'}"
     )
 
     if args.check:
