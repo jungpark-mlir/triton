@@ -224,17 +224,9 @@ def bf16_kernelc_2pf_bk128_fused_cluster_4x4_gfx1250(
         slot = (tail_idx + 1) % 2
         acc = bf16_consume_slot(
             a_buf, b_buf, slot, acc, dot_a, dot_b, block_k)
-    c_layout: gl.constexpr = gl.SwizzledSharedLayout(
-        1, 1, 1, [1, 0], WMMA_LAYOUT.cga_layout)
-    c_shared = gl.allocate_shared_memory(
-        c_ptr.type.element_ty, [block_m, block_n], c_layout)
-    c_shared.store(acc.to(c_ptr.type.element_ty))
-    c_desc = tdm.make_tensor_descriptor(
-        base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
-        block_shape=(block_m, block_n), layout=c_layout)
-    tdm.async_store(
-        c_desc, [pid_m * block_m, pid_n * block_n], c_shared)
-    tdm.async_wait(0)
+    snapshot_tdm_store_full_tile(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+        WMMA_LAYOUT, block_m, block_n, 4)
 
 
 def build_bf16_layouts():
