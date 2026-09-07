@@ -2463,7 +2463,7 @@ def _fp8_scaled_cluster_bf16_style_consume_and_refill(
         BK_SCALE_PRESHUFFLED: gl.constexpr, SCALE_KWIDTH: gl.constexpr,
         HIPBLASLT_SCALE_LAYOUT: gl.constexpr, AB_SEPARATE_DATA: gl.constexpr,
         LEADING_FOUR_TDM: gl.constexpr, REFILL_BEFORE_WMMA: gl.constexpr,
-        CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr, ADJACENT_CLUSTER_ARRIVE: gl.constexpr):
     with gl.amd.warp_pipeline_stage("stage0", priority=0):
         a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(0, SUBTILE_K, 1).load(layout=DOT_A)
         if HIPBLASLT_SCALE_LAYOUT:
@@ -2506,12 +2506,23 @@ def _fp8_scaled_cluster_bf16_style_consume_and_refill(
             bs1 = _load_fp8_scaled_slice_mnk_scale(bs_buf, slot, 0, SUBTILE_SCALE_K, SCALE_B_LAYOUT,
                                                   BLOCK_N, BK_SCALE, BLOCK_N, SUBTILE_SCALE_K,
                                                   PRESHUFFLE_FACTOR, SCALE_KWIDTH)
-        if CTA_M * CTA_N > 1:
+        # The arrive tells peer CTAs they may multicast this slot's refill into
+        # our LDS. At this point waves 4-7, which trail waves 0-3 by one
+        # pipeline stage, have not yet issued their reads of the slot, so warp
+        # 0 is releasing the peers earlier than the reads it speaks for.
+        # ADJACENT_CLUSTER_ARRIVE (the default) moves the arrive past the stage
+        # barrier below, next to the wait, which is the conservative order.
+        # This kernel is bit-stable either way as long as its TDM warp hints
+        # stay inside warps 0-3; hints reaching warps 4-7 corrupt the output
+        # regardless of where the arrive sits.
+        if CTA_M * CTA_N > 1 and not ADJACENT_CLUSTER_ARRIVE:
             gl.amd.gfx1250.cluster.arrive()
     with gl.amd.warp_pipeline_stage("stage1", priority=1):
         if not REFILL_BEFORE_WMMA:
             acc = gl.amd.gfx1250.wmma_scaled(a1, as1, DTYPE_A, b1, bs1, DTYPE_B, acc)
         if CTA_M * CTA_N > 1:
+            if ADJACENT_CLUSTER_ARRIVE:
+                gl.amd.gfx1250.cluster.arrive()
             gl.amd.gfx1250.cluster.wait()
         if LEADING_FOUR_TDM:
             _issue_fp8_scaled_slice_mnk_leading4_fused_data_load(
@@ -2549,7 +2560,8 @@ def fp8_scaled_cluster_bf16_style_kernel_gfx1250(
         SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
         SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr, HIPBLASLT_SCALE_LAYOUT: gl.constexpr,
         AB_SEPARATE_DATA: gl.constexpr, LEADING_FOUR_TDM: gl.constexpr,
-        REFILL_BEFORE_WMMA: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+        REFILL_BEFORE_WMMA: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr,
+        ADJACENT_CLUSTER_ARRIVE: gl.constexpr = True):
     gl.static_assert(DTYPE_A != "e2m1" and DTYPE_B != "e2m1",
                      "fp8_scaled_cluster_bf16_style_kernel_gfx1250 requires FP8 inputs")
     gl.static_assert(
@@ -2663,7 +2675,7 @@ def fp8_scaled_cluster_bf16_style_kernel_gfx1250(
             DTYPE_A, DTYPE_B,
             dot_a, dot_b, scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, BLOCK_K, bk_scale, subtile_k,
             subtile_scale_k, preshuffle_factor, bk_scale_preshuffled, scale_kwidth, HIPBLASLT_SCALE_LAYOUT,
-            AB_SEPARATE_DATA, LEADING_FOUR_TDM, REFILL_BEFORE_WMMA, CTA_M, CTA_N)
+            AB_SEPARATE_DATA, LEADING_FOUR_TDM, REFILL_BEFORE_WMMA, CTA_M, CTA_N, ADJACENT_CLUSTER_ARRIVE)
         tdm.async_wait(wait_count)
 
     penultimate_slot = (iter_max - 2) % nbuf
@@ -4697,8 +4709,9 @@ def _make_fp8_scaled_case(args):
                       AB_SEPARATE_DATA=args.fp8_tdm_schedule == "ab-scales",
                       LEADING_FOUR_TDM=args.fp8_tdm_schedule == "leading4",
                       REFILL_BEFORE_WMMA=args.fp8_refill_before_wmma,
-                      CTA_M=cta_m, CTA_N=cta_n, num_ctas=cta_m * cta_n,
-                      **launch_options)
+                      CTA_M=cta_m, CTA_N=cta_n,
+                      ADJACENT_CLUSTER_ARRIVE=args.fp8_adjacent_cluster_arrive,
+                      num_ctas=cta_m * cta_n, **launch_options)
         if args.fp8_cluster:
             shared_a, shared_b, shared_scale_a, shared_scale_b, wmma = cluster_layouts
             return fp8_scaled_slice_mn_cluster_warp_pipeline_kernel_gfx1250[
@@ -5010,6 +5023,17 @@ def _build_arg_parser():
         "--no-fp8-refill-before-wmma", dest="fp8_refill_before_wmma",
         action="store_false",
         help="Issue the final K128 scaled WMMA before refill")
+    fp8_arrive_group = parser.add_mutually_exclusive_group()
+    fp8_arrive_group.add_argument(
+        "--fp8-adjacent-cluster-arrive", dest="fp8_adjacent_cluster_arrive",
+        action="store_true", default=None,
+        help="Place cluster.arrive next to cluster.wait, so every wave has finished its reads "
+             "before peers are allowed to refill the slot (default)")
+    fp8_arrive_group.add_argument(
+        "--fp8-early-cluster-arrive", dest="fp8_adjacent_cluster_arrive",
+        action="store_false",
+        help="Arrive at the end of the read stage, ahead of the stage barrier that waves 4-7 "
+             "have yet to reach, rather than next to the wait")
     parser.add_argument("--fp8-scaled-cluster-bk128", action="store_true",
                         help="Use the 2-CTA, 512x256 scaled-FP8 BK128 kernel")
     parser.add_argument("--fp8-bf16-output", action="store_true",
@@ -5120,6 +5144,10 @@ if __name__ == "__main__":
         args.fp8_refill_before_wmma = args.fp8_cluster_bf16_style
     if args.fp8_refill_before_wmma and not args.fp8_cluster_bf16_style:
         raise ValueError("--fp8-refill-before-wmma applies only to --fp8-cluster-bf16-style")
+    if args.fp8_adjacent_cluster_arrive is None:
+        args.fp8_adjacent_cluster_arrive = args.fp8_cluster_bf16_style
+    if args.fp8_adjacent_cluster_arrive and not args.fp8_cluster_bf16_style:
+        raise ValueError("--fp8-adjacent-cluster-arrive applies only to --fp8-cluster-bf16-style")
     if args.fp8_scaled_cluster_bk128 and not (plain_fp8 and args.with_scale):
         raise ValueError("--fp8-scaled-cluster-bk128 requires the plain-FP8 --with-scale path")
     if args.fp8_bf16_output and not (plain_fp8 and args.with_scale):
