@@ -1,0 +1,218 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1290" height="440" viewBox="0 0 1290 440" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <pattern id="hatch" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+      <rect width="6" height="6" fill="#ffffff"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#9aa0a6" stroke-width="1.6"/>
+    </pattern>
+  </defs>
+
+  <rect width="1290" height="440" fill="#ffffff"/>
+
+  <text x="16" y="28" font-size="16" font-weight="bold" fill="#202124">MI450 MXFP8 GEMM: the split-K TDM half-slot pipeline</text>
+  <text x="16" y="50" font-size="11" fill="#5f6368">mxfp8_splitk_tdm.py, splitk_consume_and_refill. Four K128 half-slots in one indexed ring, two half-steps per K256 tile, one scaled WMMA each.</text>
+
+  <!-- legend row 1 -->
+  <rect x="16"  y="66" width="14" height="14" rx="2" fill="#8b5fbf" stroke="#5b3d80"/>
+  <text x="36"  y="77" font-size="10.5" fill="#202124">operand read (ds_read)</text>
+  <rect x="176" y="66" width="14" height="14" rx="2" fill="#dccdf2" stroke="#a98fd0"/>
+  <text x="196" y="77" font-size="10.5" fill="#202124">scale read (ds_read)</text>
+  <rect x="326" y="66" width="14" height="14" rx="2" fill="#f0a030" stroke="#b3741a"/>
+  <text x="346" y="77" font-size="10.5" fill="#202124">WMMA (matrix unit)</text>
+  <rect x="476" y="66" width="14" height="14" rx="2" fill="#f48fb1" stroke="#b85f7f"/>
+  <text x="496" y="77" font-size="10.5" fill="#202124">cluster.arrive / cluster.wait</text>
+  <rect x="656" y="66" width="14" height="14" rx="2" fill="#4dd0e1" stroke="#2a8f9c"/>
+  <text x="676" y="77" font-size="10.5" fill="#202124">TDM async_load, global to LDS (K128)</text>
+
+  <!-- legend row 2 -->
+  <rect x="16"  y="88" width="14" height="14" rx="2" fill="url(#hatch)" stroke="#9aa0a6"/>
+  <text x="36"  y="99" font-size="10.5" fill="#202124">tdm.async_wait(6), outside every stage region</text>
+  <line x1="286" y1="86" x2="286" y2="104" stroke="#7b3fa0" stroke-width="2" stroke-dasharray="4 3"/>
+  <text x="296" y="99" font-size="10.5" fill="#202124">stage barrier</text>
+  <rect x="396" y="88" width="14" height="14" rx="2" fill="#f0a030" stroke="#b3741a" opacity="0.35"/>
+  <text x="416" y="99" font-size="10.5" fill="#202124">region from the adjacent tile</text>
+
+  <!-- stage region captions -->
+  <text x="259" y="140" font-size="10" fill="#5f6368" text-anchor="middle">stage0 refill</text>
+  <text x="430" y="140" font-size="10" fill="#5f6368" text-anchor="middle">stage0 read</text>
+  <text x="567" y="140" font-size="10" fill="#5f6368" text-anchor="middle">stage1</text>
+  <text x="715" y="140" font-size="10" fill="#5f6368" text-anchor="middle">stage0 refill</text>
+  <text x="886" y="140" font-size="10" fill="#5f6368" text-anchor="middle">stage0 read</text>
+  <text x="1023" y="140" font-size="10" fill="#5f6368" text-anchor="middle">stage1</text>
+
+  <!-- stage barriers spanning both wave groups -->
+  <g stroke="#7b3fa0" stroke-width="1.6" stroke-dasharray="4 3">
+    <line x1="350" y1="146" x2="350" y2="268"/>
+    <line x1="510" y1="146" x2="510" y2="268"/>
+    <line x1="624" y1="146" x2="624" y2="268"/>
+    <line x1="806" y1="146" x2="806" y2="268"/>
+    <line x1="966" y1="146" x2="966" y2="268"/>
+  </g>
+
+  <!-- ================= Group A : waves 0-3 ================= -->
+  <text x="16" y="172" font-size="11" font-weight="bold" fill="#202124">Group A</text>
+  <text x="16" y="186" font-size="9.5" fill="#5f6368">waves 0-3</text>
+
+  <rect x="154" y="161" width="12" height="24" fill="url(#hatch)" stroke="#9aa0a6"/>
+
+  <!-- half-step 0 : refill region -->
+  <g>
+    <rect x="170" y="152" width="48" height="42" rx="3" fill="#f48fb1" stroke="#b85f7f"/>
+    <text x="194" y="169" font-size="8.5" fill="#3d1f2b" text-anchor="middle">cluster</text>
+    <text x="194" y="180" font-size="8.5" fill="#3d1f2b" text-anchor="middle">arrive, wait</text>
+    <rect x="220" y="152" width="38" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="239" y="169" font-size="8.5" fill="#123" text-anchor="middle">TDM A</text>
+    <text x="239" y="180" font-size="8" fill="#123" text-anchor="middle">t+1 hi</text>
+    <rect x="260" y="152" width="38" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="279" y="169" font-size="8.5" fill="#123" text-anchor="middle">TDM B</text>
+    <text x="279" y="180" font-size="8" fill="#123" text-anchor="middle">t+1 hi</text>
+    <rect x="300" y="152" width="48" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="324" y="169" font-size="8.5" fill="#123" text-anchor="middle">TDM fused</text>
+    <text x="324" y="180" font-size="8" fill="#123" text-anchor="middle">As+Bs</text>
+  </g>
+  <!-- half-step 0 : read region -->
+  <g>
+    <rect x="352" y="152" width="44" height="42" rx="3" fill="#8b5fbf" stroke="#5b3d80"/>
+    <text x="374" y="169" font-size="8.5" fill="#fff" text-anchor="middle">ds_read A</text>
+    <text x="374" y="180" font-size="8" fill="#e8dcf5" text-anchor="middle">slot base+0</text>
+    <rect x="398" y="152" width="34" height="42" rx="3" fill="#dccdf2" stroke="#a98fd0"/>
+    <text x="415" y="174" font-size="8.5" fill="#2b1b3d" text-anchor="middle">scale</text>
+    <rect x="434" y="152" width="44" height="42" rx="3" fill="#8b5fbf" stroke="#5b3d80"/>
+    <text x="456" y="169" font-size="8.5" fill="#fff" text-anchor="middle">ds_read B</text>
+    <text x="456" y="180" font-size="8" fill="#e8dcf5" text-anchor="middle">slot base+0</text>
+    <rect x="480" y="152" width="30" height="42" rx="3" fill="#dccdf2" stroke="#a98fd0"/>
+    <text x="495" y="174" font-size="8.5" fill="#2b1b3d" text-anchor="middle">scale</text>
+  </g>
+  <!-- half-step 0 : compute -->
+  <rect x="512" y="152" width="110" height="42" rx="3" fill="#f0a030" stroke="#b3741a"/>
+  <text x="567" y="169" font-size="9" fill="#2b1a05" text-anchor="middle">wmma_scaled</text>
+  <text x="567" y="181" font-size="8" fill="#2b1a05" text-anchor="middle">e4m3 x e4m3, K128</text>
+
+  <rect x="610" y="161" width="12" height="24" fill="url(#hatch)" stroke="#9aa0a6"/>
+
+  <!-- half-step 1 : refill region -->
+  <g>
+    <rect x="626" y="152" width="48" height="42" rx="3" fill="#f48fb1" stroke="#b85f7f"/>
+    <text x="650" y="169" font-size="8.5" fill="#3d1f2b" text-anchor="middle">cluster</text>
+    <text x="650" y="180" font-size="8.5" fill="#3d1f2b" text-anchor="middle">arrive, wait</text>
+    <rect x="676" y="152" width="38" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="695" y="169" font-size="8.5" fill="#123" text-anchor="middle">TDM A</text>
+    <text x="695" y="180" font-size="8" fill="#123" text-anchor="middle">t+2 lo</text>
+    <rect x="716" y="152" width="38" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="735" y="169" font-size="8.5" fill="#123" text-anchor="middle">TDM B</text>
+    <text x="735" y="180" font-size="8" fill="#123" text-anchor="middle">t+2 lo</text>
+    <rect x="756" y="152" width="48" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="780" y="169" font-size="8.5" fill="#123" text-anchor="middle">TDM fused</text>
+    <text x="780" y="180" font-size="8" fill="#123" text-anchor="middle">As+Bs</text>
+  </g>
+  <!-- half-step 1 : read region -->
+  <g>
+    <rect x="808" y="152" width="44" height="42" rx="3" fill="#8b5fbf" stroke="#5b3d80"/>
+    <text x="830" y="169" font-size="8.5" fill="#fff" text-anchor="middle">ds_read A</text>
+    <text x="830" y="180" font-size="8" fill="#e8dcf5" text-anchor="middle">slot base+1</text>
+    <rect x="854" y="152" width="34" height="42" rx="3" fill="#dccdf2" stroke="#a98fd0"/>
+    <text x="871" y="174" font-size="8.5" fill="#2b1b3d" text-anchor="middle">scale</text>
+    <rect x="890" y="152" width="44" height="42" rx="3" fill="#8b5fbf" stroke="#5b3d80"/>
+    <text x="912" y="169" font-size="8.5" fill="#fff" text-anchor="middle">ds_read B</text>
+    <text x="912" y="180" font-size="8" fill="#e8dcf5" text-anchor="middle">slot base+1</text>
+    <rect x="936" y="152" width="30" height="42" rx="3" fill="#dccdf2" stroke="#a98fd0"/>
+    <text x="951" y="174" font-size="8.5" fill="#2b1b3d" text-anchor="middle">scale</text>
+  </g>
+  <!-- half-step 1 : compute -->
+  <rect x="968" y="152" width="110" height="42" rx="3" fill="#f0a030" stroke="#b3741a"/>
+  <text x="1023" y="169" font-size="9" fill="#2b1a05" text-anchor="middle">wmma_scaled</text>
+  <text x="1023" y="181" font-size="8" fill="#2b1a05" text-anchor="middle">e4m3 x e4m3, K128</text>
+
+  <!-- faded next-tile region -->
+  <rect x="1082" y="152" width="48" height="42" rx="3" fill="#f48fb1" stroke="#b85f7f" opacity="0.35"/>
+  <text x="1106" y="176" font-size="8" fill="#3d1f2b" text-anchor="middle" opacity="0.6">cluster</text>
+
+  <!-- ================= Group B : waves 4-7, one region later ================= -->
+  <text x="16" y="234" font-size="11" font-weight="bold" fill="#202124">Group B</text>
+  <text x="16" y="248" font-size="9.5" fill="#5f6368">waves 4-7</text>
+
+  <!-- trailing region of the previous tile -->
+  <rect x="170" y="214" width="110" height="42" rx="3" fill="#f0a030" stroke="#b3741a" opacity="0.35"/>
+  <text x="225" y="238" font-size="8.5" fill="#2b1a05" text-anchor="middle" opacity="0.7">wmma (prev tile)</text>
+  <rect x="292" y="223" width="12" height="24" fill="url(#hatch)" stroke="#9aa0a6" opacity="0.45"/>
+
+  <!-- half-step 0 : refill region -->
+  <g>
+    <rect x="352" y="214" width="48" height="42" rx="3" fill="#f48fb1" stroke="#b85f7f"/>
+    <text x="376" y="231" font-size="8.5" fill="#3d1f2b" text-anchor="middle">cluster</text>
+    <text x="376" y="242" font-size="8.5" fill="#3d1f2b" text-anchor="middle">arrive, wait</text>
+    <rect x="402" y="214" width="38" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="421" y="231" font-size="8.5" fill="#123" text-anchor="middle">TDM A</text>
+    <text x="421" y="242" font-size="8" fill="#123" text-anchor="middle">t+1 hi</text>
+    <rect x="442" y="214" width="38" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="461" y="231" font-size="8.5" fill="#123" text-anchor="middle">TDM B</text>
+    <text x="461" y="242" font-size="8" fill="#123" text-anchor="middle">t+1 hi</text>
+    <rect x="482" y="214" width="48" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="506" y="231" font-size="8.5" fill="#123" text-anchor="middle">TDM fused</text>
+    <text x="506" y="242" font-size="8" fill="#123" text-anchor="middle">As+Bs</text>
+  </g>
+  <!-- half-step 0 : read region -->
+  <g>
+    <rect x="534" y="214" width="44" height="42" rx="3" fill="#8b5fbf" stroke="#5b3d80"/>
+    <text x="556" y="231" font-size="8.5" fill="#fff" text-anchor="middle">ds_read A</text>
+    <text x="556" y="242" font-size="8" fill="#e8dcf5" text-anchor="middle">slot base+0</text>
+    <rect x="580" y="214" width="34" height="42" rx="3" fill="#dccdf2" stroke="#a98fd0"/>
+    <text x="597" y="236" font-size="8.5" fill="#2b1b3d" text-anchor="middle">scale</text>
+    <rect x="616" y="214" width="44" height="42" rx="3" fill="#8b5fbf" stroke="#5b3d80"/>
+    <text x="638" y="231" font-size="8.5" fill="#fff" text-anchor="middle">ds_read B</text>
+    <text x="638" y="242" font-size="8" fill="#e8dcf5" text-anchor="middle">slot base+0</text>
+    <rect x="662" y="214" width="30" height="42" rx="3" fill="#dccdf2" stroke="#a98fd0"/>
+    <text x="677" y="236" font-size="8.5" fill="#2b1b3d" text-anchor="middle">scale</text>
+  </g>
+  <!-- half-step 0 : compute -->
+  <rect x="694" y="214" width="110" height="42" rx="3" fill="#f0a030" stroke="#b3741a"/>
+  <text x="749" y="231" font-size="9" fill="#2b1a05" text-anchor="middle">wmma_scaled</text>
+  <text x="749" y="243" font-size="8" fill="#2b1a05" text-anchor="middle">e4m3 x e4m3, K128</text>
+
+  <rect x="792" y="223" width="12" height="24" fill="url(#hatch)" stroke="#9aa0a6"/>
+
+  <!-- half-step 1 : refill region -->
+  <g>
+    <rect x="808" y="214" width="48" height="42" rx="3" fill="#f48fb1" stroke="#b85f7f"/>
+    <text x="832" y="231" font-size="8.5" fill="#3d1f2b" text-anchor="middle">cluster</text>
+    <text x="832" y="242" font-size="8.5" fill="#3d1f2b" text-anchor="middle">arrive, wait</text>
+    <rect x="858" y="214" width="38" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="877" y="231" font-size="8.5" fill="#123" text-anchor="middle">TDM A</text>
+    <text x="877" y="242" font-size="8" fill="#123" text-anchor="middle">t+2 lo</text>
+    <rect x="898" y="214" width="38" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="917" y="231" font-size="8.5" fill="#123" text-anchor="middle">TDM B</text>
+    <text x="917" y="242" font-size="8" fill="#123" text-anchor="middle">t+2 lo</text>
+    <rect x="938" y="214" width="48" height="42" rx="3" fill="#4dd0e1" stroke="#2a8f9c"/>
+    <text x="962" y="231" font-size="8.5" fill="#123" text-anchor="middle">TDM fused</text>
+    <text x="962" y="242" font-size="8" fill="#123" text-anchor="middle">As+Bs</text>
+  </g>
+  <!-- half-step 1 : read region -->
+  <g>
+    <rect x="990" y="214" width="44" height="42" rx="3" fill="#8b5fbf" stroke="#5b3d80"/>
+    <text x="1012" y="231" font-size="8.5" fill="#fff" text-anchor="middle">ds_read A</text>
+    <text x="1012" y="242" font-size="8" fill="#e8dcf5" text-anchor="middle">slot base+1</text>
+    <rect x="1036" y="214" width="34" height="42" rx="3" fill="#dccdf2" stroke="#a98fd0"/>
+    <text x="1053" y="236" font-size="8.5" fill="#2b1b3d" text-anchor="middle">scale</text>
+    <rect x="1072" y="214" width="44" height="42" rx="3" fill="#8b5fbf" stroke="#5b3d80"/>
+    <text x="1094" y="231" font-size="8.5" fill="#fff" text-anchor="middle">ds_read B</text>
+    <text x="1094" y="242" font-size="8" fill="#e8dcf5" text-anchor="middle">slot base+1</text>
+    <rect x="1118" y="214" width="30" height="42" rx="3" fill="#dccdf2" stroke="#a98fd0"/>
+    <text x="1133" y="236" font-size="8.5" fill="#2b1b3d" text-anchor="middle">scale</text>
+  </g>
+  <!-- half-step 1 : compute -->
+  <rect x="1150" y="214" width="110" height="42" rx="3" fill="#f0a030" stroke="#b3741a" opacity="0.35"/>
+  <text x="1205" y="238" font-size="8.5" fill="#2b1a05" text-anchor="middle" opacity="0.7">wmma_scaled</text>
+
+  <!-- span brackets -->
+  <path d="M170 276 L170 282 L1078 282 L1078 276" fill="none" stroke="#5f6368" stroke-width="1"/>
+  <text x="624" y="296" font-size="9.5" fill="#5f6368" text-anchor="middle">Group A: one K256 tile = two half-steps, 6 warp_pipeline_stage regions, 6 TDM descriptors</text>
+  <path d="M352 306 L352 312 L1260 312 L1260 306" fill="none" stroke="#5f6368" stroke-width="1"/>
+  <text x="806" y="326" font-size="9.5" fill="#5f6368" text-anchor="middle">Group B: the same 6 regions, one region later</text>
+
+  <!-- footnote -->
+  <text x="16" y="352" font-size="9.5" fill="#3c4043">Split-K refill: each half-step refills the half-slot drained one half-step ago, so the lead rises from 1.0 tile (deferred K256) to 1.5 tiles without extra LDS. The refill sits</text>
+  <text x="16" y="366" font-size="9.5" fill="#3c4043">in its own stage0 region, ahead of a second stage0 region holding the reads, so the stage barrier between them is what the trailing waves rely on: base+3 and base+4 both</text>
+  <text x="16" y="380" font-size="9.5" fill="#3c4043">alias the half-slot read one half-step earlier, and base+4 reduces to base under the modulus. Ring wait is 6 = 3 descriptors x (4 - 2) half-slots.</text>
+  <text x="16" y="398" font-size="9.5" fill="#3c4043">Cost: a K128 copy moves 128 contiguous bytes per row instead of 256, which doubles GL2 requests for the same bytes. Measured 329.3 us against 297.9 us for deferred</text>
+  <text x="16" y="412" font-size="9.5" fill="#3c4043">K256 and 270.5 us for the shipped same-slot schedule, at 4096x4096x65536.</text>
+  <text x="16" y="430" font-size="8.5" fill="#80868b">Schematic. Region contents are from mxfp8_splitk_tdm.py, splitk_consume_and_refill. Box widths show the operation mix, not measured cycle counts.</text>
+</svg>
