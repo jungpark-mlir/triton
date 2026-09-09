@@ -225,6 +225,29 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
 
   sinkPureScalarsIntoNextStage(blk);
 
+  int phaseGap = 1;
+  bool hasExplicitPhaseGap = false;
+  for (Operation &op : blk) {
+    if (!isPipelineBorder(&op))
+      continue;
+    auto attr =
+        op.getAttrOfType<IntegerAttr>("triton.warp_pipeline.phase_gap");
+    if (!attr)
+      continue;
+    int requestedGap = attr.getInt();
+    if (requestedGap < 1) {
+      op.emitError("warp-pipeline phase gap must be positive");
+      return PipelineResult::Malformed;
+    }
+    if (hasExplicitPhaseGap && requestedGap != phaseGap) {
+      op.emitError("all explicit warp-pipeline phase gaps in a loop must "
+                   "agree");
+      return PipelineResult::Malformed;
+    }
+    phaseGap = requestedGap;
+    hasExplicitPhaseGap = true;
+  }
+
   // One pass over the body; collect clusters split by explicit borders.
   for (Operation &opRef : llvm::make_early_inc_range(blk)) {
     Operation *op = &opRef;
@@ -286,6 +309,8 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
   // Annotate the loop for the backend.
   b.setInsertionPoint(forOp);
   forOp->setAttr("triton.warp_pipeline.pipelined_for", b.getUnitAttr());
+  forOp->setAttr("triton.warp_pipeline.phase_gap",
+                 b.getI32IntegerAttr(phaseGap));
 
   LDBG("[warp-pipeline] total_stages=" << totalStages << "\n");
   return PipelineResult::Created;

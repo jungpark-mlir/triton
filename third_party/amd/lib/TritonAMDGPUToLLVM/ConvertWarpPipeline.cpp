@@ -329,7 +329,8 @@ static bool shouldPlaceBackedgeBarrierAtHead(
 // Emit pre-barrier, thread-ID partitioning, and phase-shift cond_barrier.
 // Returns warpLow (for reconverge) and warpHigh (consumed by phase shift).
 static std::pair<Value, Value>
-emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup) {
+emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup,
+                    int phaseGap = 1) {
   // Flush any pending shared-memory (LDS) dependencies before entering the
   // warp-pipelined region.  Without this barrier ModuleMembarAnalysis may
   // later insert a barrier inside the first pipeline stage, which would
@@ -346,7 +347,8 @@ emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup) {
                                        warpIDX, constZero);
   auto warpHigh = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
                                         warpIDX, constZero);
-  mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpHigh);
+  for (int i = 0; i < phaseGap; ++i)
+    mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpHigh);
 
   return {warpLow, warpHigh};
 }
@@ -355,12 +357,13 @@ emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup) {
 static void emitPipelinePostlude(OpBuilder &b, Location loc,
                                  bool anyHasPriority, Value warpLow,
                                  bool emitPostludeBarrier = false,
-                                 bool needLocal = false) {
+                                 bool needLocal = false, int phaseGap = 1) {
   if (emitPostludeBarrier)
     emitClusterBarrier(b, loc, needLocal);
   if (anyHasPriority)
     ROCDL::SetPrioOp::create(b, loc, 0);
-  mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
+  for (int i = 0; i < phaseGap; ++i)
+    mlir::triton::amdgpu::CondBarrierOp::create(b, loc, warpLow);
 }
 
 class ConvertPipelinedForPattern : public OpRewritePattern<scf::ForOp> {
@@ -387,20 +390,25 @@ public:
     if (!allocation)
       return rewriter.notifyMatchFailure(forOp, "no Allocation for function");
 
+    int phaseGap = 1;
+    if (auto attr =
+            forOp->getAttrOfType<IntegerAttr>("triton.warp_pipeline.phase_gap"))
+      phaseGap = attr.getInt();
     forOp->removeAttr("triton.warp_pipeline.pipelined_for");
+    forOp->removeAttr("triton.warp_pipeline.phase_gap");
     emitPipelinedFor(rewriter, forOp.getLoc(), forOp, allocation,
-                     threadsPerPipelineGroup);
+                     threadsPerPipelineGroup, phaseGap);
     return success();
   }
 
 private:
   void emitPipelinedFor(PatternRewriter &b, Location loc, scf::ForOp forOp,
-                        Allocation *allocation,
-                        int threadsPerPipelineGroup) const {
+                        Allocation *allocation, int threadsPerPipelineGroup,
+                        int phaseGap) const {
     // 1. Pre-barrier, thread partitioning, and phase shift.
     b.setInsertionPoint(forOp);
     auto [warpLow, warpHigh] =
-        emitPipelinePrelude(b, loc, threadsPerPipelineGroup);
+        emitPipelinePrelude(b, loc, threadsPerPipelineGroup, phaseGap);
 
     // 2. Walk the (already-validated) body once to collect clusters and any
     // pre-existing inter-cluster barriers (e.g. from prefetch patterns).
@@ -511,7 +519,7 @@ private:
     b.setInsertionPointAfter(forOp);
     bool emitPostludeBarrier = hasTopBarrier;
     emitPipelinePostlude(b, loc, anyHasPriority, warpLow, emitPostludeBarrier,
-                         /*needLocal=*/bars[0]);
+                         /*needLocal=*/bars[0], phaseGap);
   }
 
   ModuleAllocation &moduleAllocation;
