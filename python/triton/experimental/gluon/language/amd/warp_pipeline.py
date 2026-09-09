@@ -54,15 +54,24 @@ class warp_pipeline_stage:
                     acc += a_tile * b_tile
 
             gl.store(c_ptr, acc)
+
+    ``phase_gap`` optionally selects how many pipeline stages separate the two
+    warp groups. It only needs to be specified on one stage in a loop and
+    defaults to one. All explicit values in a loop must agree.
     """
 
-    __slots__ = ("label", "priority", "_semantic")
+    __slots__ = ("label", "priority", "phase_gap", "_semantic")
 
-    def __init__(self, label=None, *, priority: int | None = None, **_internal):
+    def __init__(
+            self, label=None, *, priority: int | None = None,
+            phase_gap: int | None = None, **_internal):
         self.label = getattr(label, "value", None)
         if priority is not None:
             assert priority > -1 and priority < 4, "priority should be 0 to 3."
+        if phase_gap is not None:
+            assert phase_gap > 0, "phase_gap must be positive."
         self.priority = priority
+        self.phase_gap = phase_gap
         self._semantic = _internal.get("_semantic", None)
 
     def __enter__(self):
@@ -75,5 +84,7 @@ class warp_pipeline_stage:
             return False
         marker = self.label if self.label is not None else "cluster"
         prio = self.priority if self.priority is not None else -1
-        self._semantic.builder.create_warp_pipeline_border(marker, prio)
+        phase_gap = self.phase_gap if self.phase_gap is not None else -1
+        self._semantic.builder.create_warp_pipeline_border(
+            marker, prio, phase_gap)
         return False

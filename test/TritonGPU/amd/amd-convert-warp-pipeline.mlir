@@ -1440,6 +1440,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+// ---- Explicit two-stage warp-group phase gap ----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+tt.func @two_stage_phase_gap(%n: index, %ptr: !tt.ptr<f32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %v0 = arith.constant 0.0 : f32
+  %v1 = arith.constant 1.0 : f32
+
+  scf.for %i = %c0 to %n step %c1 {
+    scf.execute_region {
+      tt.store %ptr, %v0 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage0"}
+    scf.execute_region {
+      tt.store %ptr, %v1 : !tt.ptr<f32>
+      scf.yield
+    } {triton.warp_pipeline.stage = "stage1"}
+    scf.yield
+  } {triton.warp_pipeline.pipelined_for,
+     triton.warp_pipeline.phase_gap = 2 : i32}
+
+  tt.return
+}
+}
+
+// CHECK-LABEL: tt.func @two_stage_phase_gap
+// CHECK: %[[WARPLOW:.+]] = arith.cmpi eq
+// CHECK: %[[WARPHIGH:.+]] = arith.cmpi ne
+// CHECK-COUNT-2: amdg.cond_barrier %[[WARPHIGH]]
+// CHECK: scf.for
+// CHECK-COUNT-2: amdg.cond_barrier %[[WARPLOW]]
+// CHECK: tt.return
+
+// -----
+
 module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
 tt.func @cluster_barriers_do_not_replace_stage_barrier(%n: index, %ptr: !tt.ptr<f32>) {
   %c0 = arith.constant 0 : index
