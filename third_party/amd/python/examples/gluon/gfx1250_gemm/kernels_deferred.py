@@ -188,6 +188,8 @@ AGPR_ATTRS = (("amdgpu-agpr-alloc", "0,0"),)
 KERNEL_NAMES = ("bf16", "mxfp8", "fp8_mxfp4", "mxfp4")
 EXPERIMENTAL_KERNEL_NAMES = (
     "bf16_8stage",
+    "bf16_l2prefetch",
+    "bf16_pidmap",
     "mxfp8_bk128",
     "mxfp8_bk256_opt",
     "mxfp8_bk512_128",
@@ -200,6 +202,16 @@ EXPERIMENTAL_KERNEL_NAMES = (
     "mxfp8_64x64x1024_cga2x2",
     "mxfp8_128x128x256_cga4x4",
 )
+BF16_PID_MAPS = {
+    "xcd-reuse-b": 0,
+    "xcd-reuse-a": 1,
+    "xcd-morton": 2,
+    "xcd-xor": 3,
+    "xcd-serpentine-b": 4,
+    "xcd-serpentine-a": 5,
+    "direct-column": 6,
+    "direct-row": 7,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +278,49 @@ def snapshot_get_xcd_swizzled_pids_reuse_a(
     group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
     pid_n = first_pid_n + ((pid % num_pid_in_group) % group_size_n)
     pid_m = (pid % num_pid_in_group) // group_size_n
+    return pid_m, pid_n
+
+
+@gluon.jit
+def snapshot_get_bf16_experimental_pids(
+        GRID_MN: gl.constexpr, PID_MAP: gl.constexpr):
+    physical_pid = gl.program_id(axis=0)
+    if PID_MAP == 6:
+        return physical_pid % 4, physical_pid // 4
+    if PID_MAP == 7:
+        return physical_pid // 4, physical_pid % 4
+
+    pids_per_xcd = (GRID_MN + 7) // 8
+    tall_xcds = GRID_MN % 8
+    tall_xcds = 8 if tall_xcds == 0 else tall_xcds
+    xcd = physical_pid % 8
+    local_pid = physical_pid // 8
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
+    else:
+        pid = (tall_xcds * pids_per_xcd
+               + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid)
+
+    if PID_MAP == 0:
+        return pid % 4, pid // 4
+    if PID_MAP == 1:
+        return pid // 4, pid % 4
+    if PID_MAP == 2:
+        pid_m = (pid & 1) | ((pid >> 1) & 2)
+        pid_n = ((pid >> 1) & 1) | ((pid >> 2) & 2)
+        return pid_m, pid_n
+    if PID_MAP == 3:
+        pid_m = pid & 3
+        pid_n = ((pid >> 2) ^ pid_m) & 3
+        return pid_m, pid_n
+    if PID_MAP == 4:
+        pid_n = pid // 4
+        offset = pid % 4
+        pid_m = offset if (pid_n & 1) == 0 else 3 - offset
+        return pid_m, pid_n
+    pid_m = pid // 4
+    offset = pid % 4
+    pid_n = offset if (pid_m & 1) == 0 else 3 - offset
     return pid_m, pid_n
 
 
@@ -384,6 +439,14 @@ def bf16_issue_loads(a_desc, b_desc, a_dst, b_dst, BLOCK_K: gl.constexpr):
 
 
 @gluon.jit
+def bf16_issue_loads_without_update(a_desc, b_desc, a_dst, b_dst):
+    tdm.async_load(
+        a_desc, [0, 0], a_dst, warp_used_hint=0b00001111)
+    tdm.async_load(
+        b_desc, [0, 0], b_dst, warp_used_hint=0b00001111)
+
+
+@gluon.jit
 def bf16_consume_slot(
         a_buf, b_buf, slot, acc, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
         BLOCK_K: gl.constexpr):
@@ -419,9 +482,9 @@ def bf16_cluster_consume_and_refill(
         # still read that slot.
         gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.cluster.wait()
-        a_desc, b_desc = bf16_issue_loads(
+        bf16_issue_loads_without_update(
             a_desc, b_desc, a_buf.index(refill_slot),
-            b_buf.index(refill_slot), BLOCK_K)
+            b_buf.index(refill_slot))
         a = a_buf.index(slot).slice(0, half_k, 1).load(layout=DOT_A)
         b = b_buf.index(slot).slice(
             0, half_k, 1).permute([1, 0]).load(layout=DOT_B)
@@ -432,7 +495,54 @@ def bf16_cluster_consume_and_refill(
             half_k, half_k, 1).load(layout=DOT_A)
         b = b_buf.index(slot).slice(
             half_k, half_k, 1).permute([1, 0]).load(layout=DOT_B)
+        a_desc = tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[0, BLOCK_K])
+        b_desc = tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[0, BLOCK_K])
     with gl.amd.warp_pipeline_stage("stage1", priority=1):
+        acc = gl.amd.gfx1250.wmma(a, b, acc)
+    return a_desc, b_desc, acc
+
+
+@gluon.jit
+def bf16_cluster_consume_refill_l2prefetch(
+        a_buf, b_buf, slot, refill_slot, a_desc, b_desc,
+        acc,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        BLOCK_K: gl.constexpr, PREFETCH_DISTANCE: gl.constexpr):
+    half_k: gl.constexpr = BLOCK_K // 2
+    tdm.async_wait(0)
+    with gl.amd.warp_pipeline_stage("bf16_pf_load_k0", priority=0):
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
+        prefetch_a_desc = a_desc
+        prefetch_b_desc = b_desc
+        a_desc, b_desc = bf16_issue_loads(
+            a_desc, b_desc, a_buf.index(refill_slot),
+            b_buf.index(refill_slot), BLOCK_K)
+        a = a_buf.index(slot).slice(0, half_k, 1).load(layout=DOT_A)
+        b = b_buf.index(slot).slice(
+            0, half_k, 1).permute([1, 0]).load(layout=DOT_B)
+        if PREFETCH_DISTANCE == 1:
+            tdm.prefetch(
+                prefetch_a_desc, [0, 0], in_bound=True)
+            tdm.prefetch(
+                prefetch_b_desc, [0, 0], in_bound=True)
+        else:
+            tdm.prefetch(
+                a_desc, [0, (PREFETCH_DISTANCE - 2) * BLOCK_K],
+                in_bound=True)
+            tdm.prefetch(
+                b_desc, [0, (PREFETCH_DISTANCE - 2) * BLOCK_K],
+                in_bound=True)
+    with gl.amd.warp_pipeline_stage("bf16_pf_compute_k0", priority=1):
+        acc = gl.amd.gfx1250.wmma(a, b, acc)
+    with gl.amd.warp_pipeline_stage("bf16_pf_load_k1", priority=0):
+        a = a_buf.index(slot).slice(
+            half_k, half_k, 1).load(layout=DOT_A)
+        b = b_buf.index(slot).slice(
+            half_k, half_k, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage("bf16_pf_compute_k1", priority=1):
         acc = gl.amd.gfx1250.wmma(a, b, acc)
     return a_desc, b_desc, acc
 
@@ -585,13 +695,16 @@ def bf16_kernelc_2pf_bk128_fused_cluster_4x4_gfx1250(
         a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk,
         stride_bn, stride_cm, stride_cn, GRID_MN: gl.constexpr,
         SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
-        WMMA_LAYOUT: gl.constexpr):
-    block_m: gl.constexpr = 1024
-    block_n: gl.constexpr = 1024
+        WMMA_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
+        BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+    block_m: gl.constexpr = BLOCK_M
+    block_n: gl.constexpr = BLOCK_N
     block_k: gl.constexpr = 128
     gl.static_assert(
         a_ptr.type.element_ty.is_bf16() and b_ptr.type.element_ty.is_bf16())
-    gl.static_assert(gl.num_ctas() == 16)
+    gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
+    gl.static_assert(BLOCK_M == CTA_M * 256)
+    gl.static_assert(BLOCK_N == CTA_N * 256)
     pid_m, pid_n = snapshot_get_xcd_swizzled_pids(
         M, N, block_m, block_n, GRID_MN, 8, 4)
     dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 8)
@@ -629,26 +742,142 @@ def bf16_kernelc_2pf_bk128_fused_cluster_4x4_gfx1250(
         a_buf, b_buf, 1, acc, dot_a, dot_b, block_k)
     snapshot_tdm_store_full_tile(
         c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+        WMMA_LAYOUT, block_m, block_n, CTA_N)
+
+
+@gluon.jit
+def bf16_bk128_l2prefetch_cluster_4x4_gfx1250(
+        a_ptr, b_ptr, c_ptr, M, N, K, stride_am: gl.constexpr, stride_ak,
+        stride_bk, stride_bn: gl.constexpr, stride_cm, stride_cn,
+        GRID_MN: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
+        WMMA_LAYOUT: gl.constexpr, PREFETCH_DISTANCE: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+    block_m: gl.constexpr = BLOCK_M
+    block_n: gl.constexpr = BLOCK_N
+    block_k: gl.constexpr = 128
+    gl.static_assert(
+        a_ptr.type.element_ty.is_bf16() and b_ptr.type.element_ty.is_bf16())
+    gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
+    gl.static_assert(BLOCK_M == CTA_M * 256)
+    gl.static_assert(BLOCK_N == CTA_N * 256)
+    gl.static_assert(PREFETCH_DISTANCE >= 1)
+    gl.static_assert(PREFETCH_DISTANCE <= 6)
+    pid_m, pid_n = snapshot_get_xcd_swizzled_pids(
+        M, N, block_m, block_n, GRID_MN, 8, 4)
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 8)
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * block_m * stride_am, shape=(M, K),
+        strides=(stride_am, stride_ak), block_shape=(block_m, block_k),
+        layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(
+        base=b_ptr + pid_n * block_n * stride_bn, shape=(N, K),
+        strides=(stride_bn, stride_bk), block_shape=(block_n, block_k),
+        layout=SHARED_LAYOUT_B)
+    a_buf = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [2, block_m, block_k], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [2, block_n, block_k], SHARED_LAYOUT_B)
+    a_desc, b_desc = bf16_issue_loads(
+        a_desc, b_desc, a_buf.index(0), b_buf.index(0), block_k)
+    acc = gl.zeros((block_m, block_n), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, block_k)
+    gl.assume(iter_max >= 2)
+    gl.assume((iter_max % 2) == 0)
+    for _ in range(0, (iter_max - PREFETCH_DISTANCE) // 2):
+        a_desc, b_desc, acc = bf16_cluster_consume_refill_l2prefetch(
+            a_buf, b_buf, 0, 1, a_desc, b_desc, acc,
+            dot_a, dot_b, block_k, PREFETCH_DISTANCE)
+        a_desc, b_desc, acc = bf16_cluster_consume_refill_l2prefetch(
+            a_buf, b_buf, 1, 0, a_desc, b_desc, acc,
+            dot_a, dot_b, block_k, PREFETCH_DISTANCE)
+    if PREFETCH_DISTANCE % 2:
+        a_desc, b_desc, acc = bf16_cluster_consume_refill_l2prefetch(
+            a_buf, b_buf, 0, 1, a_desc, b_desc, acc,
+            dot_a, dot_b, block_k, PREFETCH_DISTANCE)
+    for tail_idx in gl.static_range(PREFETCH_DISTANCE - 1):
+        a_desc, b_desc, acc = bf16_cluster_consume_and_refill(
+            a_buf, b_buf, (PREFETCH_DISTANCE + tail_idx) % 2,
+            (PREFETCH_DISTANCE + tail_idx + 1) % 2, a_desc, b_desc,
+            acc, dot_a, dot_b, block_k)
+    tdm.async_wait(0)
+    acc = bf16_consume_slot(
+        a_buf, b_buf, 1, acc, dot_a, dot_b, block_k)
+    snapshot_tdm_store_full_tile(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+        WMMA_LAYOUT, block_m, block_n, CTA_N)
+
+
+@gluon.jit
+def bf16_bk128_pidmap_cluster_4x4_gfx1250(
+        a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk,
+        stride_bn, stride_cm, stride_cn, GRID_MN: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
+        WMMA_LAYOUT: gl.constexpr, PID_MAP: gl.constexpr):
+    block_m: gl.constexpr = 1024
+    block_n: gl.constexpr = 1024
+    block_k: gl.constexpr = 128
+    gl.static_assert(
+        a_ptr.type.element_ty.is_bf16() and b_ptr.type.element_ty.is_bf16())
+    gl.static_assert(gl.num_ctas() == 16)
+    pid_m, pid_n = snapshot_get_bf16_experimental_pids(GRID_MN, PID_MAP)
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 8)
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * block_m * stride_am, shape=(M, K),
+        strides=(stride_am, stride_ak), block_shape=(block_m, block_k),
+        layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(
+        base=b_ptr + pid_n * block_n * stride_bn, shape=(N, K),
+        strides=(stride_bn, stride_bk), block_shape=(block_n, block_k),
+        layout=SHARED_LAYOUT_B)
+    a_buf = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [2, block_m, block_k], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [2, block_n, block_k], SHARED_LAYOUT_B)
+    a_desc, b_desc = bf16_issue_loads(
+        a_desc, b_desc, a_buf.index(0), b_buf.index(0), block_k)
+    acc = gl.zeros((block_m, block_n), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, block_k)
+    gl.assume(iter_max >= 2)
+    gl.assume((iter_max % 2) == 0)
+    for _ in range(0, (iter_max - 2) // 2):
+        a_desc, b_desc, acc = bf16_cluster_consume_and_refill(
+            a_buf, b_buf, 0, 1, a_desc, b_desc, acc, dot_a, dot_b, block_k)
+        a_desc, b_desc, acc = bf16_cluster_consume_and_refill(
+            a_buf, b_buf, 1, 0, a_desc, b_desc, acc, dot_a, dot_b, block_k)
+    a_desc, b_desc, acc = bf16_cluster_consume_and_refill(
+        a_buf, b_buf, 0, 1, a_desc, b_desc, acc, dot_a, dot_b, block_k)
+    tdm.async_wait(0)
+    acc = bf16_consume_slot(
+        a_buf, b_buf, 1, acc, dot_a, dot_b, block_k)
+    snapshot_tdm_store_full_tile(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
         WMMA_LAYOUT, block_m, block_n, 4)
 
 
-def build_bf16_layouts():
+def build_bf16_layouts(cluster_m=4, cluster_n=4):
     """Build matching distributed LDS and accumulator layouts for BF16.
 
     Layout construction is intentionally two-pass. First derive the local
     256x256-per-CTA WMMA ownership, then graft its operand CGA bases onto the
     padded shared layouts. This makes every CTA load the LDS partition consumed
-    by its accumulator partition while retaining a cluster-wide 1024x1024 view.
+    by its accumulator partition.
     """
-    cga_layout_c = make_cga_layout([4, 4], [4, 4], [0, 1])
-    slice_m = BLOCK_M // 4
-    slice_n = BLOCK_N // 4
+    block_m = 256 * cluster_m
+    block_n = 256 * cluster_n
+    cga_layout_c = make_cga_layout(
+        [cluster_m, cluster_n], [cluster_m, cluster_n], [0, 1])
+    slice_m = block_m // cluster_m
+    slice_n = block_n // cluster_n
     local_a = gl.PaddedSharedLayout.with_identity_for(
-        [[BF16_BLOCK_K, 8]], [BLOCK_M, BF16_BLOCK_K], [1, 0])
+        [[BF16_BLOCK_K, 8]], [block_m, BF16_BLOCK_K], [1, 0])
     local_b = gl.PaddedSharedLayout.with_identity_for(
-        [[BF16_BLOCK_K, 8]], [BLOCK_N, BF16_BLOCK_K], [1, 0])
+        [[BF16_BLOCK_K, 8]], [block_n, BF16_BLOCK_K], [1, 0])
     _, _, local_wmma = gl.amd.gfx1250.make_partitioned_dot_layouts(
-        BLOCK_M, BLOCK_N, local_a, local_b, NUM_WARPS, [16, 16, 32],
+        block_m, block_n, local_a, local_b, NUM_WARPS, [16, 16, 32],
         a_transposed=False, b_transposed=True, slice_m=slice_m,
         slice_n=slice_n, transposed=True)
     wmma = gl.amd.AMDWMMALayout(
@@ -660,9 +889,9 @@ def build_bf16_layouts():
     cga_b = tuple(tuple([basis[1], basis[0]])
                   for basis in dot_b.cga_layout)
     padded_a = gl.PaddedSharedLayout.with_identity_for(
-        [[BF16_BLOCK_K, 8]], [BLOCK_M, BF16_BLOCK_K], [1, 0], cga_a)
+        [[BF16_BLOCK_K, 8]], [block_m, BF16_BLOCK_K], [1, 0], cga_a)
     padded_b = gl.PaddedSharedLayout.with_identity_for(
-        [[BF16_BLOCK_K, 8]], [BLOCK_N, BF16_BLOCK_K], [1, 0], cga_b)
+        [[BF16_BLOCK_K, 8]], [block_n, BF16_BLOCK_K], [1, 0], cga_b)
     # One group per physical partition is the retained partitioned layout.
     shared_a, shared_b, _ = gl.amd.gfx1250.make_partitioned_dot_layouts(
         slice_m, slice_n, padded_a, padded_b, NUM_WARPS, [16, 16, 32],
@@ -3061,12 +3290,29 @@ def pack_scale(scale, scale_kwidth):
     return scale.view(non_k // 128, k_scale * 128)
 
 
-def make_bf16_case(args, eight_stage=False):
+def make_bf16_case(
+        args, eight_stage=False, pid_map=None, l2_prefetch_distance=None):
     """Build BF16 launch/check closures while keeping their GPU tensors alive."""
-    if args.M % 1024 or args.N % 1024 or args.K % 128:
-        raise ValueError("BF16 requires M/N divisible by 1024 and K by 128")
+    if l2_prefetch_distance is not None:
+        required_m = 256 * args.bf16_l2_prefetch_cluster_shape[0]
+        required_n = 256 * args.bf16_l2_prefetch_cluster_shape[1]
+    elif not eight_stage and pid_map is None:
+        required_m = 256 * args.bf16_cluster_shape[0]
+        required_n = 256 * args.bf16_cluster_shape[1]
+    else:
+        required_m = required_n = 1024
+    if args.M % required_m or args.N % required_n or args.K % 128:
+        raise ValueError(
+            f"BF16 requires M/N divisible by {required_m}/{required_n} "
+            "and K by 128")
+    if pid_map is not None and (args.M != 4096 or args.N != 4096):
+        raise ValueError("BF16 PID-map experiment requires M=N=4096")
     if args.K // 128 < 2 or (args.K // 128) % 2:
         raise ValueError("BF16 requires an even number of at least two BK128 tiles")
+    if (l2_prefetch_distance is not None
+            and args.K // 128 <= l2_prefetch_distance):
+        raise ValueError(
+            "BF16 L2 prefetch requires more K tiles than its distance")
     mode = args.input_mode or "trig"
     if mode == "random":
         torch.manual_seed(args.seed)
@@ -3091,10 +3337,52 @@ def make_bf16_case(args, eight_stage=False):
                 flat[begin:end].copy_(value.float())
     output_dtype = torch.bfloat16 if args.bf16_output else torch.float32
     c = torch.zeros((args.M, args.N), dtype=output_dtype, device="cuda")
-    layouts = build_bf16_8stage_layouts() if eight_stage else build_bf16_layouts()
-    grid = (triton.cdiv(args.M, 1024) * triton.cdiv(args.N, 1024), 1)
+    if l2_prefetch_distance is not None:
+        cluster_m, cluster_n = args.bf16_l2_prefetch_cluster_shape
+        block_m = 256 * cluster_m
+        block_n = 256 * cluster_n
+        layouts = build_bf16_layouts(cluster_m, cluster_n)
+        grid = (
+            triton.cdiv(args.M, block_m)
+            * triton.cdiv(args.N, block_n), 1)
+    elif not eight_stage and pid_map is None:
+        cluster_m, cluster_n = args.bf16_cluster_shape
+        block_m = 256 * cluster_m
+        block_n = 256 * cluster_n
+        layouts = build_bf16_layouts(cluster_m, cluster_n)
+        grid = (
+            triton.cdiv(args.M, block_m)
+            * triton.cdiv(args.N, block_n), 1)
+    else:
+        cluster_m = cluster_n = 4
+        block_m = block_n = 1024
+        layouts = (
+            build_bf16_8stage_layouts() if eight_stage
+            else build_bf16_layouts())
+        grid = (triton.cdiv(args.M, 1024) * triton.cdiv(args.N, 1024), 1)
 
     def launch():
+        if l2_prefetch_distance is not None:
+            shared_a, shared_b, wmma = layouts
+            return bf16_bk128_l2prefetch_cluster_4x4_gfx1250[grid](
+                a, b, c, args.M, args.N, args.K,
+                a.stride(0), a.stride(1), b.stride(1), b.stride(0),
+                c.stride(0), c.stride(1), GRID_MN=grid[0],
+                SHARED_LAYOUT_A=shared_a, SHARED_LAYOUT_B=shared_b,
+                WMMA_LAYOUT=wmma, PREFETCH_DISTANCE=l2_prefetch_distance,
+                BLOCK_M=block_m, BLOCK_N=block_n,
+                CTA_M=cluster_m, CTA_N=cluster_n,
+                num_warps=8, waves_per_eu=2,
+                num_ctas=cluster_m * cluster_n)
+        if pid_map is not None:
+            shared_a, shared_b, wmma = layouts
+            return bf16_bk128_pidmap_cluster_4x4_gfx1250[grid](
+                a, b, c, args.M, args.N, args.K,
+                a.stride(0), a.stride(1), b.stride(1), b.stride(0),
+                c.stride(0), c.stride(1), GRID_MN=grid[0],
+                SHARED_LAYOUT_A=shared_a, SHARED_LAYOUT_B=shared_b,
+                WMMA_LAYOUT=wmma, PID_MAP=pid_map,
+                num_warps=8, waves_per_eu=2, num_ctas=16)
         if eight_stage:
             shared_a, shared_b, wmma, load_wmma, output_cga = layouts
             return bf16_bk128_8stage_cluster_4x4_gfx1250[grid](
@@ -3111,7 +3399,10 @@ def make_bf16_case(args, eight_stage=False):
             b.stride(1), b.stride(0), c.stride(0), c.stride(1),
             GRID_MN=grid[0], SHARED_LAYOUT_A=shared_a,
             SHARED_LAYOUT_B=shared_b, WMMA_LAYOUT=wmma,
-            num_warps=8, waves_per_eu=2, num_ctas=16)
+            BLOCK_M=block_m, BLOCK_N=block_n,
+            CTA_M=cluster_m, CTA_N=cluster_n,
+            num_warps=8, waves_per_eu=2,
+            num_ctas=cluster_m * cluster_n)
 
     def check():
         c.zero_()
@@ -3127,6 +3418,16 @@ def make_bf16_case(args, eight_stage=False):
 
 def make_bf16_8stage_case(args):
     return make_bf16_case(args, eight_stage=True)
+
+
+def make_bf16_l2prefetch_case(args):
+    return make_bf16_case(
+        args, l2_prefetch_distance=args.bf16_l2_prefetch_distance)
+
+
+def make_bf16_pidmap_case(args):
+    return make_bf16_case(
+        args, pid_map=BF16_PID_MAPS[args.bf16_pid_map])
 
 
 def make_mxfp8_case(
@@ -3674,6 +3975,8 @@ def run_one(name, args):
     makers = {
         "bf16": make_bf16_case,
         "bf16_8stage": make_bf16_8stage_case,
+        "bf16_l2prefetch": make_bf16_l2prefetch_case,
+        "bf16_pidmap": make_bf16_pidmap_case,
         "mxfp8": make_mxfp8_case,
         "mxfp8_bk128": make_mxfp8_bk128_case,
         "mxfp8_bk256_opt": make_mxfp8_bk256_opt_case,
@@ -3714,6 +4017,22 @@ def parse_args():
         "--input-mode", choices=("random", "trig"),
         help=("input value pattern; defaults to trig for BF16/MXFP8 and random "
               "for FP8xMXFP4/MXFP4"))
+    parser.add_argument(
+        "--bf16-pid-map", choices=tuple(BF16_PID_MAPS),
+        default="xcd-reuse-b",
+        help="output-tile mapping for the experimental BF16 PID-map kernel")
+    parser.add_argument(
+        "--bf16-cluster-shape", type=int, nargs=2, choices=(2, 4),
+        default=(4, 4), metavar=("CTA_M", "CTA_N"),
+        help="CTA cluster shape for the retained BF16 kernel")
+    parser.add_argument(
+        "--bf16-l2-prefetch-distance", type=int, choices=range(1, 7),
+        default=2,
+        help="K-tile distance for experimental BF16 A/B L2 prefetch")
+    parser.add_argument(
+        "--bf16-l2-prefetch-cluster-shape", type=int, nargs=2,
+        choices=(2, 4), default=(4, 4), metavar=("CTA_M", "CTA_N"),
+        help="CTA cluster shape for experimental BF16 L2 prefetch")
     parser.add_argument(
         "--bf16-fp32-output", dest="bf16_output", action="store_false",
         help="Store BF16 kernel results as FP32 instead of the BF16 default")
