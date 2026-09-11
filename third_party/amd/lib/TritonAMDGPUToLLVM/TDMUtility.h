@@ -179,7 +179,8 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
                                    int numWarps, int numCTAs,
                                    ArrayRef<Value> offset, Value pred,
                                    Type elementType, Value laneId, Value warpId,
-                                   Value ctaId, bool isSpeculative);
+                                   Value ctaId, bool isSpeculative,
+                                   bool inBound);
 
 } // namespace mlir::LLVM::AMD
 

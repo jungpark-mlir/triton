@@ -2621,7 +2621,7 @@ struct TDMPrefetchConversion
     auto offsets = mlir::LLVM::AMD::emitTDMPrefetch(
         rewriter, loc, desc, blockShape, threadsPerWarp, numWarps, numCTAs,
         offset, op.getPred(), elementType, laneId, warpId, ctaId,
-        op.getSpeculative());
+        op.getSpeculative(), op.getInBound());
 
     // If the op has no results, just erase it
     if (op->getNumResults() == 0) {

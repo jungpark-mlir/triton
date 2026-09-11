@@ -1249,9 +1249,10 @@ void init_gluon_ir(py::module_ &m) {
            })
       .def("create_tdm_prefetch",
            [](GluonOpBuilder &self, Value descPtr, std::vector<Value> &indices,
-              Value pred, bool speculative, bool returnOffsets) -> Value {
+              Value pred, bool speculative, bool inBound,
+              bool returnOffsets) -> Value {
              auto op = self.create<ttag::TDMPrefetchOp>(
-                 descPtr, indices, pred, speculative,
+                 descPtr, indices, pred, speculative, inBound,
                  returnOffsets ? UnitAttr::get(self.getContext()) : nullptr);
              return returnOffsets ? op->getResult(0) : nullptr;
            })

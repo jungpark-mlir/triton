@@ -2240,19 +2240,24 @@ def test_tensor_descriptor_load_store_invalid_blocksize():
 
 @gluon.jit
 def tensor_descriptor_prefetch_nd_kernel_device_tdm(a_ptr, shape, strides, BLOCK_SHAPE, SHARED_LAYOUT: ttgl.constexpr,
-                                                    PREFETCH_SPECULATIVE: ttgl.constexpr):
+                                                    PREFETCH_SPECULATIVE: ttgl.constexpr,
+                                                    PREFETCH_IN_BOUND: ttgl.constexpr):
     ndim: ttgl.constexpr = len(BLOCK_SHAPE)
     desc = ttgl.amd.cdna5.tdm.make_tensor_descriptor(base=a_ptr, shape=shape, strides=strides, block_shape=BLOCK_SHAPE,
                                                      layout=SHARED_LAYOUT)
     offs = (0, ) * ndim
-    ttgl.amd.cdna5.tdm.prefetch(desc, offs, speculative=PREFETCH_SPECULATIVE)
+    ttgl.amd.cdna5.tdm.prefetch(
+        desc, offs, speculative=PREFETCH_SPECULATIVE, in_bound=PREFETCH_IN_BOUND)
 
 
 @gluon.jit
-def tensor_descriptor_prefetch_nd_kernel_host_tdm(inp_desc, SPECULATIVE: ttgl.constexpr):
+def tensor_descriptor_prefetch_nd_kernel_host_tdm(
+        inp_desc, SPECULATIVE: ttgl.constexpr,
+        IN_BOUND: ttgl.constexpr):
     ndim: ttgl.constexpr = len(inp_desc.block_shape)
     offs = (0, ) * ndim
-    ttgl.amd.cdna5.tdm.prefetch(inp_desc, offs, speculative=SPECULATIVE)
+    ttgl.amd.cdna5.tdm.prefetch(
+        inp_desc, offs, speculative=SPECULATIVE, in_bound=IN_BOUND)
 
 
 @pytest.mark.parametrize("ndim", [1, 2, 3, 4, 5])
@@ -2277,6 +2282,7 @@ def test_compile_tensor_descriptor_prefetch_nd(dtype, ndim, INNER_BLOCK, SPECULA
             "BLOCK_SHAPE": tuple("constexpr" for _ in range(ndim)),
             "SHARED_LAYOUT": "constexpr",
             "PREFETCH_SPECULATIVE": "constexpr",
+            "PREFETCH_IN_BOUND": "constexpr",
         }
         constexprs = {
             # For tuples we need to specifiy the parameter index
@@ -2286,6 +2292,7 @@ def test_compile_tensor_descriptor_prefetch_nd(dtype, ndim, INNER_BLOCK, SPECULA
                for i in range(ndim)},
             "SHARED_LAYOUT": SHARED_LAYOUT,
             "PREFETCH_SPECULATIVE": SPECULATIVE,
+            "PREFETCH_IN_BOUND": False,
         }
     else:
         assert TDM_TYPE == "HOST_TDM"
@@ -2293,8 +2300,9 @@ def test_compile_tensor_descriptor_prefetch_nd(dtype, ndim, INNER_BLOCK, SPECULA
         signature = {
             "inp_desc": f"tensordesc<{dtype}[{shape_str}],{SHARED_LAYOUT}>",
             "SPECULATIVE": "constexpr",
+            "IN_BOUND": "constexpr",
         }
-        constexprs = {"SPECULATIVE": SPECULATIVE}
+        constexprs = {"SPECULATIVE": SPECULATIVE, "IN_BOUND": False}
 
     k = triton.compile(
         gluon._runtime.GluonASTSource(fn, signature, constexprs),
@@ -2306,6 +2314,44 @@ def test_compile_tensor_descriptor_prefetch_nd(dtype, ndim, INNER_BLOCK, SPECULA
         assert re.search(pattern, amdgcn)
     if not SPECULATIVE:
         assert re.search("th:TH_LOAD_NT", amdgcn)
+
+
+def test_compile_tensor_descriptor_prefetch_in_bound():
+    ndim = 2
+    inner_block = 256
+    shared_layout = ttgl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    block_shape = (8, inner_block)
+    strides = (inner_block, 1)
+    signature = {
+        "a_ptr": "*bf16",
+        "shape": ("i32", "i32"),
+        "strides": ("constexpr", "constexpr"),
+        "BLOCK_SHAPE": ("constexpr", "constexpr"),
+        "SHARED_LAYOUT": "constexpr",
+        "PREFETCH_SPECULATIVE": "constexpr",
+        "PREFETCH_IN_BOUND": "constexpr",
+    }
+    constexprs = {
+        **{(2, i): strides[i]
+           for i in range(ndim)},
+        **{(3, i): block_shape[i]
+           for i in range(ndim)},
+        "SHARED_LAYOUT": shared_layout,
+        "PREFETCH_SPECULATIVE": False,
+        "PREFETCH_IN_BOUND": True,
+    }
+
+    k = triton.compile(
+        gluon._runtime.GluonASTSource(
+            tensor_descriptor_prefetch_nd_kernel_device_tdm,
+            signature, constexprs),
+        target=GPUTarget("hip", "gfx1250", 32),
+    )
+    amdgcn = k.asm["amdgcn"]
+    assert "global_prefetch_b8" in amdgcn
+    assert "th:TH_LOAD_NT" in amdgcn
+    assert "v_min_i64" not in amdgcn
 
 
 @pytest.mark.parametrize("ndim", [1, 2, 3, 4, 5])
@@ -2335,11 +2381,11 @@ def test_runtime_tensor_descriptor_prefetch_nd(dtype_str, ndim, INNER_BLOCK, SPE
     if TDM_TYPE == "DEVICE_TDM":
         constexpr_block_shape = tuple(ttgl.constexpr(v) for v in BLOCK_SHAPE)
         tensor_descriptor_prefetch_nd_kernel_device_tdm[(1, )](inp, inp.shape, inp.stride(), constexpr_block_shape,
-                                                               SHARED_LAYOUT, SPECULATIVE)
+                                                               SHARED_LAYOUT, SPECULATIVE, False)
     else:
         assert TDM_TYPE == "HOST_TDM"
         inp_desc = gluon.amd.cdna5.TensorDescriptor.from_tensor(inp, list(BLOCK_SHAPE), layout=SHARED_LAYOUT)
-        tensor_descriptor_prefetch_nd_kernel_host_tdm[(1, )](inp_desc, SPECULATIVE)
+        tensor_descriptor_prefetch_nd_kernel_host_tdm[(1, )](inp_desc, SPECULATIVE, False)
 
 
 @gluon.jit

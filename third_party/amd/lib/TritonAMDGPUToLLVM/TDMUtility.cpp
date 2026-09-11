@@ -1556,7 +1556,8 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
                                    int numWarps, int numCTAs,
                                    ArrayRef<Value> offset, Value pred,
                                    Type elementType, Value laneId, Value warpId,
-                                   Value ctaId, bool isSpeculative) {
+                                   Value ctaId, bool isSpeculative,
+                                   bool inBound) {
   // TDM prefetch uses the same syntax as a regular load. Each lane can prefetch
   // a different address; hardware aligns to a 256-byte boundary and makes that
   // 256-byte region available in L2. We distribute the nD tile (blockShape)
@@ -1651,8 +1652,11 @@ SmallVector<Value> emitTDMPrefetch(RewriterBase &rewriter, Location loc,
 
     // Mask the prefetch if the offset is out of bounds
     Value inBounds = b.icmp_sle(localOffset, maxInBoundsLocalOffset);
-    // Only predicate based in inBounds for non-speculative prefetches.
-    Value combinedPred = isSpeculative ? pred : b.and_(pred, inBounds);
+    // Skip the per-lane bounds clamp when the caller guarantees that the
+    // complete distributed prefetch block is in bounds. Unlike speculative
+    // prefetch, this does not change the hardware translation-miss behavior.
+    Value combinedPred =
+        (isSpeculative || inBound) ? pred : b.and_(pred, inBounds);
 
     // Predicate and emit prefetch
     // For OOB/pred we clamp the address to the last valid address

@@ -465,35 +465,41 @@ def async_gather(desc: tensor_descriptor, src_row_indices: ttgl.tensor, dst: sha
 
 @builtin
 def prefetch(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tensor], pred: bool = True,
-             speculative: bool = False, _semantic=None) -> None:
+             speculative: bool = False, in_bound: bool = False, _semantic=None) -> None:
     """Prefetches a block of tensor specified in tensor descriptor from global memory into L2.
 
     Speculative prefetches can generate more efficient assembly because they do not require out of bounds checks.
     However, they are dropped by the hardware if their virtual address translation is not cached.
     So speculative should only be set if previous iterations have accessed the same virtual page (e.g. column major).
 
+    Setting ``in_bound`` asserts that every address distributed across the prefetch block is within the tensor.
+    This removes the per-lane bounds clamp without changing the speculative hardware hint.
+
     Args:
         src (tensor_descriptor): the source tensor descriptor.
         offsets (List[int]): the offsets from the base pointer in the tensor descriptor.
         pred (bool, optional): Predicate to enable or disable the prefetch. Defaults to True.
         speculative (bool, optional): Whether the prefetch is speculative. Defaults to False.
+        in_bound (bool, optional): Whether every distributed prefetch address is known to be in bounds. Defaults to False.
     """
     offset_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
     pred = _semantic.to_tensor(pred)
     pred_handle = pred.handle
     speculative = _unwrap_if_constexpr(speculative)
-    _semantic.builder.create_tdm_prefetch(src.handle, offset_handles, pred_handle, speculative, False)
+    in_bound = _unwrap_if_constexpr(in_bound)
+    _semantic.builder.create_tdm_prefetch(src.handle, offset_handles, pred_handle, speculative, in_bound, False)
 
 
 @builtin
 def _test_prefetch_with_offsets(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tensor], pred: bool = True,
-                                speculative: bool = False, _semantic=None) -> ttgl.tensor:
+                                speculative: bool = False, in_bound: bool = False, _semantic=None) -> ttgl.tensor:
     """Test-only prefetch variant that returns offsets for validation."""
     offset_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
     pred = _semantic.to_tensor(pred)
     pred_handle = pred.handle
     speculative = _unwrap_if_constexpr(speculative)
-    handle = _semantic.builder.create_tdm_prefetch(src.handle, offset_handles, pred_handle, speculative, True)
+    in_bound = _unwrap_if_constexpr(in_bound)
+    handle = _semantic.builder.create_tdm_prefetch(src.handle, offset_handles, pred_handle, speculative, in_bound, True)
     shape = _semantic.builder.get_shape_from_tensor(handle)
     layout = _semantic.builder.get_gluon_layout_from_tensor(handle)
     ret_ty = ttgl.distributed_type(ttgl.int64, shape, layout)

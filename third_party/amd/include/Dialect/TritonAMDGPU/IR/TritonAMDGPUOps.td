@@ -1031,6 +1031,7 @@ def TDMPrefetchOp : TT_AMDGPU_Op<"tdm_prefetch", [
     Variadic<I32>:$indices,
     I1:$pred,
     BoolAttr:$speculative,
+    BoolAttr:$inBound,
     // Optional attribute (intended for testing) that, when set, causes the prefetch operation to return the computed offsets.
     // This should not be used in production code and is only for validation or debugging purposes.
     OptionalAttr<UnitAttr>:$returnOffsets
@@ -1041,6 +1042,7 @@ def TDMPrefetchOp : TT_AMDGPU_Op<"tdm_prefetch", [
 
   let assemblyFormat = [{
     $desc `[` $indices `]` `,` $pred `,` `speculative` `=` $speculative
+    `,` `in_bound` `=` $inBound
     (`returnOffsets` $returnOffsets^)?
     attr-dict `:` qualified(type($desc))
     (`->` type($maybeOffsets)^)?
