@@ -40,7 +40,8 @@ class warp_pipeline_stage:
 
             for k in range(0, K):
                 # Stage 0: prefetch tiles.
-                with gl.amd.warp_pipeline_stage("load", priority=3):
+                with gl.amd.warp_pipeline_stage(
+                        "load", priority=3, phase_gap=2):
                     a = gl.load(a_ptr + k)
                     b = gl.load(b_ptr + k)
 
@@ -55,21 +56,20 @@ class warp_pipeline_stage:
 
             gl.store(c_ptr, acc)
 
-    ``phase_gap`` optionally selects how many pipeline stages separate the two
-    warp groups. It only needs to be specified on one stage in a loop and
-    defaults to one. All explicit values in a loop must agree.
+    ``phase_gap`` is a loop-wide setting for the number of stages separating
+    the two warp groups. Specify it only on the first stage; the default is
+    one. Values 1 and 2 are supported; wider gaps are not yet validated.
+    Flat pipelines produced by unrolling support only the default gap.
     """
 
     __slots__ = ("label", "priority", "phase_gap", "_semantic")
 
-    def __init__(
-            self, label=None, *, priority: int | None = None,
-            phase_gap: int | None = None, **_internal):
+    def __init__(self, label=None, *, priority: int | None = None, phase_gap: int | None = None, **_internal):
         self.label = getattr(label, "value", None)
         if priority is not None:
             assert priority > -1 and priority < 4, "priority should be 0 to 3."
         if phase_gap is not None:
-            assert phase_gap > 0, "phase_gap must be positive."
+            assert phase_gap in (1, 2), "phase_gap must be 1 or 2."
         self.priority = priority
         self.phase_gap = phase_gap
         self._semantic = _internal.get("_semantic", None)
@@ -85,6 +85,5 @@ class warp_pipeline_stage:
         marker = self.label if self.label is not None else "cluster"
         prio = self.priority if self.priority is not None else -1
         phase_gap = self.phase_gap if self.phase_gap is not None else -1
-        self._semantic.builder.create_warp_pipeline_border(
-            marker, prio, phase_gap)
+        self._semantic.builder.create_warp_pipeline_border(marker, prio, phase_gap)
         return False

@@ -23,6 +23,10 @@ namespace tt = mlir::triton;
 
 namespace mlir {
 
+constexpr StringLiteral kPhaseGapAttr = "triton.warp_pipeline.phase_gap";
+constexpr int kDefaultPhaseGap = 1;
+constexpr int kMaxSupportedPhaseGap = 2;
+
 #define GEN_PASS_DEF_TRITONAMDGPUWARPPIPELINE
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
@@ -225,27 +229,38 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
 
   sinkPureScalarsIntoNextStage(blk);
 
-  int phaseGap = 1;
-  bool hasExplicitPhaseGap = false;
+  // phase_gap is a loop-level stagger, so only the first stage may set it.
+  int phaseGap = kDefaultPhaseGap;
+  bool seenFirstBorder = false;
   for (Operation &op : blk) {
     if (!isPipelineBorder(&op))
       continue;
-    auto attr =
-        op.getAttrOfType<IntegerAttr>("triton.warp_pipeline.phase_gap");
-    if (!attr)
+    Attribute attr = op.getAttr(kPhaseGapAttr);
+    if (!seenFirstBorder) {
+      seenFirstBorder = true;
+      if (!attr)
+        continue;
+      auto intAttr = dyn_cast<IntegerAttr>(attr);
+      if (!intAttr || !intAttr.getType().isInteger(32)) {
+        op.emitError("warp-pipeline phase_gap must be an i32 integer");
+        return PipelineResult::Malformed;
+      }
+      int64_t requestedGap = intAttr.getInt();
+      // Wider phase gaps are technically possible, but the dependency and
+      // cross-pipeline analyses have only been validated for gaps of 1 and 2.
+      if (requestedGap < kDefaultPhaseGap ||
+          requestedGap > kMaxSupportedPhaseGap) {
+        op.emitError("warp-pipeline phase_gap must be 1 or 2");
+        return PipelineResult::Malformed;
+      }
+      phaseGap = requestedGap;
       continue;
-    int requestedGap = attr.getInt();
-    if (requestedGap < 1) {
-      op.emitError("warp-pipeline phase gap must be positive");
+    }
+    if (attr) {
+      op.emitError(
+          "warp-pipeline phase_gap may only be specified on the first stage");
       return PipelineResult::Malformed;
     }
-    if (hasExplicitPhaseGap && requestedGap != phaseGap) {
-      op.emitError("all explicit warp-pipeline phase gaps in a loop must "
-                   "agree");
-      return PipelineResult::Malformed;
-    }
-    phaseGap = requestedGap;
-    hasExplicitPhaseGap = true;
   }
 
   // One pass over the body; collect clusters split by explicit borders.
@@ -309,10 +324,9 @@ static PipelineResult createPipeline(OpBuilder &b, Location loc,
   // Annotate the loop for the backend.
   b.setInsertionPoint(forOp);
   forOp->setAttr("triton.warp_pipeline.pipelined_for", b.getUnitAttr());
-  forOp->setAttr("triton.warp_pipeline.phase_gap",
-                 b.getI32IntegerAttr(phaseGap));
+  forOp->setAttr(kPhaseGapAttr, b.getI32IntegerAttr(phaseGap));
 
-  LDBG("[warp-pipeline] total_stages=" << totalStages << "\n");
+  LDBG("total_stages=" << totalStages << " phase_gap=" << phaseGap);
   return PipelineResult::Created;
 }
 
@@ -335,6 +349,23 @@ static PipelineResult createFlatPipeline(OpBuilder &b, Block &block) {
   // No borders at all means the block did not opt into flat pipelining.
   if (allBorders.empty())
     return PipelineResult::NotApplicable;
+
+  // Flat pipelines use the original one-stage offset. Accept an explicit
+  // default, but do not silently ignore a wider requested gap.
+  for (Operation *border : allBorders) {
+    Attribute attr = border->getAttr(kPhaseGapAttr);
+    if (!attr)
+      continue;
+    auto intAttr = dyn_cast<IntegerAttr>(attr);
+    if (!intAttr || !intAttr.getType().isInteger(32)) {
+      border->emitError("warp-pipeline phase_gap must be an i32 integer");
+      return PipelineResult::Malformed;
+    }
+    if (intAttr.getInt() != kDefaultPhaseGap) {
+      border->emitError("flat warp pipelines only support phase_gap=1");
+      return PipelineResult::Malformed;
+    }
+  }
 
   // A single border cannot form a 2-stage pipeline; treat as malformed input
   // since the user did opt in (the lone border would otherwise leak through

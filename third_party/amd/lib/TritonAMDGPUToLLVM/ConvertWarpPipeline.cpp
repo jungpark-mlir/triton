@@ -53,6 +53,29 @@ namespace mlir::triton {
 
 namespace {
 
+constexpr StringLiteral kPhaseGapAttr = "triton.warp_pipeline.phase_gap";
+constexpr int kDefaultPhaseGap = 1;
+constexpr int kMaxSupportedPhaseGap = 2;
+
+static int getPhaseGap(Operation *op) {
+  if (auto attr = op->getAttrOfType<IntegerAttr>(kPhaseGapAttr))
+    return attr.getInt();
+  return kDefaultPhaseGap;
+}
+
+static LogicalResult validatePhaseGap(Operation *op) {
+  Attribute attr = op->getAttr(kPhaseGapAttr);
+  if (!attr)
+    return success();
+  auto intAttr = dyn_cast<IntegerAttr>(attr);
+  if (!intAttr || !intAttr.getType().isInteger(32))
+    return op->emitError("warp-pipeline phase_gap must be an i32 integer");
+  int64_t value = intAttr.getInt();
+  if (value < kDefaultPhaseGap || value > kMaxSupportedPhaseGap)
+    return op->emitError("warp-pipeline phase_gap must be 1 or 2");
+  return success();
+}
+
 // Construct a virtual block describing a pipeline cluster's buffer R/W set.
 // Walks recursively so that LDS effects inside nested non-loop regions
 // (scf.if / tt.reduce / tt.scan / etc.) are accounted for.  Loops (scf.for /
@@ -120,6 +143,11 @@ static scf::ExecuteRegionOp getPipelineStage(Operation *op) {
 // failure on any deviation.  Side-effect free: leaves the IR untouched so
 // callers can fail fast before mutating anything.
 static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
+  // Wider gaps are technically possible, but have not yet been validated by
+  // the dependency analysis or the cross-pipeline barrier optimization.
+  if (failed(validatePhaseGap(forOp.getOperation())))
+    return failure();
+
   std::map<int, Operation *> existingBarrierMap;
   int numClusters = 0;
   for (auto &op : *forOp.getBody()) {
@@ -150,63 +178,21 @@ static LogicalResult validatePipelinedForBody(scf::ForOp forOp) {
   return success();
 }
 
-// Pairwise LDS-dependency analysis between pipeline clusters.
+// Mark cluster boundaries that need an LDS fence. bars[i] is immediately
+// before cluster i; for a loop, bars[0] is the wrap-around boundary.
 //
-// `circular` selects the index topology used by the analysis:
-//   * true  — the schedule wraps modulo N.  Used by loop pipelines (scf.for)
-//             where the wrap-around represents iter-i feeding iter-(i+1).
-//   * false — the schedule is straight-line, indices stay in [0, N).  Used
-//             by flat (unrolled) pipelines.
-// The rest of this comment uses "circular" / "linear" exclusively, since
-// the analysis only cares about topology and not about the source IR kind.
+// Sequential pairs may use any LOCAL barrier on their path. For non-adjacent
+// pairs we preserve the existing placement at dst - 1. Loop stages separated
+// by phaseGap execute concurrently across warp groups, so their fence must be
+// immediately before dst; an earlier barrier does not cover that pair.
 //
-// LAYOUT
-// ------
-//   cluster:   c0    c1    c2    ...    c_{N-1}
-//   bars:    b0    b1    b2    b3   ...        b_{N-1}        (b_i sits
-//                                                              before c_i)
-//
-//   * circular: b0 is the wrap-around barrier inside the loop body —
-//     sitting between c_{N-1} of one iteration and c0 of the next.
-//   * linear:   b0 has no physical slot (no barrier exists before the first
-//     cluster), and the schedule never wraps around.
-//
-// GOAL
-// ----
-//   For every ordered pair (src, dst) whose LDS effects intersect, guarantee
-//   that the schedule has at least one LOCAL (ds_wait + s_barrier) barrier
-//   somewhere on the path src → dst.  If no existing slot on the path is
-//   LOCAL, mark one as LOCAL.
-//
-// PLACEMENT CHOICE
-// ----------------
-//   When forced to place a LOCAL barrier we pick:
-//     dist == 1 → bars[dst]      (the only slot between src and dst)
-//     dist >  1 → bars[dst - 1]  (the second-rightmost slot on the path)
-//   The `dst - 1` choice is somewhat arbitrary — any slot in (src, dst] is
-//   correct for memory ordering — and is preserved here to match upstream
-//   behavior and existing tests.
-//
-// COVERAGE CHECK
-// --------------
-//   A pair is "covered" if any slot in (src, barrierLoc] is already LOCAL.
-//   Note that bars[dst] is intentionally NOT consulted when dist > 1; this
-//   mirrors the placement choice (we never look at, nor place into, the
-//   slot owned by the adjacent (dst-1, dst) pair).
-//
-// ITERATION ORDER
-// ---------------
-//   We sweep `dist` from 1 up to `maxDist`:
-//     * circular: maxDist = N.  dist == N is the self-loop (src == dst),
-//       which captures iter-i write vs iter-(i+1) read across the
-//       wrap-around when only one cluster touches the buffer.
-//     * linear:   maxDist = N - 1.  No wrap.
-//   Walking by increasing distance ensures the shorter-range LOCAL
-//   barriers we just placed are visible when checking longer-range pairs,
-//   skipping many redundant placements.
+// Circular analysis includes distance N to model dependencies across the next
+// loop iteration. Iteration-varying descriptor origins are invalidated only
+// for pairs that cross that boundary.
 static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
                                         SmallVectorImpl<bool> &bars,
-                                        Allocation *allocation, bool circular) {
+                                        Allocation *allocation, bool circular,
+                                        int phaseGap) {
   const int N = clusterInfo.size();
   const int maxDist = circular ? N : N - 1;
 
@@ -242,8 +228,12 @@ static void analyzePipelineDependencies(ArrayRef<BlockInfo> clusterInfo,
     const int srcEnd = circular ? N : N - dist;
     for (int src = 0; src < srcEnd; src++) {
       const int dst = wrap(src + dist);
-      const int barrierLoc = (dist == 1) ? dst : wrap(dst - 1);
-      if (isCovered(src, barrierLoc))
+      const bool isConcurrentPair = circular && dist == phaseGap;
+      const int barrierLoc =
+          (dist == 1 || isConcurrentPair) ? dst : wrap(dst - 1);
+      const bool covered =
+          isConcurrentPair ? bars[barrierLoc] : isCovered(src, barrierLoc);
+      if (covered)
         continue;
       const BlockInfo &sourceInfo =
           src + dist >= N ? previousIterationInfo[src] : clusterInfo[src];
@@ -280,16 +270,20 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
 // Wrap a pre-existing barrier op (e.g. async_wait) with sched_barriers so the
 // backend scheduler cannot move ops across it, and emit the cluster's
 // priority just before the barrier.  Used in place of inserting a fresh
-// cluster barrier when one already exists at the cluster boundary.
+// cluster barrier when one already exists at the cluster boundary. If the
+// dependency analysis requires an LDS fence, add one after a non-LOCAL wait.
 static void wrapExistingBarrier(OpBuilder &b, Location loc,
                                 Operation *clusterOp,
                                 Operation *existingBarrier, bool anyHasPriority,
-                                bool emitPriority = true) {
+                                bool needLocal, bool emitPriority = true) {
   b.setInsertionPoint(existingBarrier);
   if (emitPriority)
     emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
   b.setInsertionPointAfter(existingBarrier);
+  auto localBarrier = dyn_cast<triton::gpu::BarrierOp>(existingBarrier);
+  if (needLocal && (!localBarrier || !localBarrier.hasLocal()))
+    triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
 }
 
@@ -330,7 +324,7 @@ static bool shouldPlaceBackedgeBarrierAtHead(
 // Returns warpLow (for reconverge) and warpHigh (consumed by phase shift).
 static std::pair<Value, Value>
 emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup,
-                    int phaseGap = 1) {
+                    int phaseGap = kDefaultPhaseGap) {
   // Flush any pending shared-memory (LDS) dependencies before entering the
   // warp-pipelined region.  Without this barrier ModuleMembarAnalysis may
   // later insert a barrier inside the first pipeline stage, which would
@@ -357,7 +351,8 @@ emitPipelinePrelude(OpBuilder &b, Location loc, int threadsPerPipelineGroup,
 static void emitPipelinePostlude(OpBuilder &b, Location loc,
                                  bool anyHasPriority, Value warpLow,
                                  bool emitPostludeBarrier = false,
-                                 bool needLocal = false, int phaseGap = 1) {
+                                 bool needLocal = false,
+                                 int phaseGap = kDefaultPhaseGap) {
   if (emitPostludeBarrier)
     emitClusterBarrier(b, loc, needLocal);
   if (anyHasPriority)
@@ -390,12 +385,8 @@ public:
     if (!allocation)
       return rewriter.notifyMatchFailure(forOp, "no Allocation for function");
 
-    int phaseGap = 1;
-    if (auto attr =
-            forOp->getAttrOfType<IntegerAttr>("triton.warp_pipeline.phase_gap"))
-      phaseGap = attr.getInt();
+    int phaseGap = getPhaseGap(forOp.getOperation());
     forOp->removeAttr("triton.warp_pipeline.pipelined_for");
-    forOp->removeAttr("triton.warp_pipeline.phase_gap");
     emitPipelinedFor(rewriter, forOp.getLoc(), forOp, allocation,
                      threadsPerPipelineGroup, phaseGap);
     return success();
@@ -459,15 +450,18 @@ private:
 
     // 3. Circular dependency analysis (wrap-around for loop pipelines).
     analyzePipelineDependencies(clusterInfo, bars, allocation,
-                                /*circular=*/true);
-    if (shouldPlaceBackedgeBarrierAtHead(isaFamily, clusterOps, clusterBlocks,
+                                /*circular=*/true, phaseGap);
+    // This placement heuristic is tuned for the original one-stage phase
+    // offset. Keep the analyzed backedge placement for wider gaps.
+    if (phaseGap == kDefaultPhaseGap &&
+        shouldPlaceBackedgeBarrierAtHead(isaFamily, clusterOps, clusterBlocks,
                                          bars, hasTopBarrier, hasBottomBarrier))
       hasTopBarrier = true;
 
     // 4. Materializing final cluster-scope barriers.  For each cluster index:
     //  • If there is a pre-existing barrier at that location, we wrap it with
-    //    sched_barriers so that backend scheduling cannot move operations
-    //    across it.
+    //    sched_barriers and add a LOCAL fence if the dependency analysis
+    //    requires one.
     //  • If no barrier exists but `bars[i]` is true, we insert a new cluster
     //    barrier (SchedBarrier + Local/SBarrier + SchedBarrier).
     //    The “local” variant is chosen when cluster-to-cluster memory
@@ -502,12 +496,9 @@ private:
 
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
-        // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing
-        // barrier is not enough to satisfy LDS ordering.  For now we rely on
-        // the producer to place such barriers only where no local fence is
-        // needed.
         wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
-                            anyHasPriority, emitPriorityAtBoundary);
+                            anyHasPriority, /*needLocal=*/bars[i],
+                            emitPriorityAtBoundary);
       } else {
         if (emitPriorityAtBoundary)
           emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
@@ -602,7 +593,7 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
   // 1. Pre-barrier and phase shift before the first execute_region.
   b.setInsertionPoint(clusterOps.front());
   auto [warpLow, warpHigh] =
-      emitPipelinePrelude(b, loc, threadsPerPipelineGroup);
+      emitPipelinePrelude(b, loc, threadsPerPipelineGroup, kDefaultPhaseGap);
 
   // 2. Collect cluster info.
   SmallVector<Block *> clusterBlocks;
@@ -623,13 +614,13 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
 
   // 3. Linear dependency analysis (no wrap-around for flat pipelines).
   analyzePipelineDependencies(clusterInfo, bars, allocation,
-                              /*circular=*/false);
+                              /*circular=*/false, kDefaultPhaseGap);
 
   // 4. Materialize cluster barriers.
   //    Cluster 0 gets only its priority (inserted after cond_barrier above).
   //    Clusters 1..N get priority + cluster barrier, unless a pre-existing
   //    barrier op (e.g., async_wait) already exists between the clusters —
-  //    in that case, wrap it with sched_barriers instead of adding a new one.
+  //    in that case, wrap it and add a LOCAL fence only when required.
   emitClusterPriority(b, loc, clusterOps[0], anyHasPriority);
 
   for (int i = 1; i < numClusters; i++) {
@@ -643,11 +634,8 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     }
 
     if (existingBarrier) {
-      // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing barrier
-      // is not enough to satisfy LDS ordering.  For now we rely on the
-      // producer to place such barriers only where no local fence is needed.
       wrapExistingBarrier(b, loc, clusterOps[i], existingBarrier,
-                          anyHasPriority);
+                          anyHasPriority, /*needLocal=*/bars[i]);
     } else {
       b.setInsertionPoint(clusterOps[i]);
       emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
@@ -657,7 +645,9 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
 
   // 5. Post-sequence reconverge.
   b.setInsertionPointAfter(clusterOps.back());
-  emitPipelinePostlude(b, loc, anyHasPriority, warpLow);
+  emitPipelinePostlude(b, loc, anyHasPriority, warpLow,
+                       /*emitPostludeBarrier=*/false,
+                       /*needLocal=*/false, kDefaultPhaseGap);
 }
 
 // Walk the module for flat warp-pipeline execute_region sequences
@@ -981,6 +971,16 @@ static void eliminateRedundantCondBarriers(ModuleOp m,
           continue;
         }
 
+        // The carry-over analysis below models a one-stage offset. For wider
+        // offsets, retain the next pipeline's LOCAL prelude barrier and both
+        // reconvergence/phase-shift sequences. This is also conservative when
+        // adjacent pipelines request different gaps.
+        if (getPhaseGap(prevFor.getOperation()) != kDefaultPhaseGap ||
+            getPhaseGap(next) != kDefaultPhaseGap) {
+          LDBG("phase gap is not 1 on both pipelines; keeping barriers");
+          continue;
+        }
+
         // The post-loop cond_barrier must be immediately followed by the
         // prelude's ttg.barrier local — this proves no operations were
         // inserted between the two pipelines.
@@ -1060,9 +1060,11 @@ public:
     // offending op; we bail out hard rather than producing half-converted
     // IR.
     bool malformed = false;
+    SmallVector<scf::ForOp> pipelinedLoops;
     m.walk([&](scf::ForOp forOp) {
       if (!forOp->getAttr("triton.warp_pipeline.pipelined_for"))
         return;
+      pipelinedLoops.push_back(forOp);
       if (failed(validatePipelinedForBody(forOp)))
         malformed = true;
     });
@@ -1087,6 +1089,13 @@ public:
     // barriers inserted) but before patternInline (inlining execute_regions
     // would flatten the IR and obscure the cond_barrier adjacency we rely on).
     eliminateRedundantCondBarriers(m, moduleAllocation);
+
+    // phase_gap is retained through conversion so the adjacent-pipeline
+    // optimization can make a conservative decision. It is no longer needed
+    // after that optimization.
+    for (scf::ForOp forOp : pipelinedLoops)
+      if (!forOp->hasAttr("triton.warp_pipeline.pipelined_for"))
+        forOp->removeAttr(kPhaseGapAttr);
 
     if (failed(applyPatternsGreedily(m, std::move(patternInline))))
       return signalPassFailure();
