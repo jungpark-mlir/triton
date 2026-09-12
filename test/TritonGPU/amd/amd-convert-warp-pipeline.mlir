@@ -775,16 +775,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // ---- Flat pipeline with pre-existing barrier between stages ----
 //
-// When an async_wait (or similar barrier op) already exists between
-// flat pipeline stages, the pass should wrap it with sched_barriers
-// instead of inserting a redundant s_barrier.
+// An async_wait between flat pipeline stages is preserved before the
+// boundary's single synchronization barrier.
 //
 // Stage layout: stage0 -- async_wait -- stage1 -- (nothing) -- stage2
 //
 // Expected between stage0 and stage1:
-//   sched_barrier + async_wait + sched_barrier   (wrapped, no s_barrier)
+//   sched_barrier + async_wait + s_barrier + sched_barrier
 // Expected between stage1 and stage2:
-//   sched_barrier + s_barrier + sched_barrier     (inserted, no async_wait)
+//   sched_barrier + s_barrier + sched_barrier
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
   tt.func @flat_pipeline_existing_barrier(%ptr: !tt.ptr<f32>) {
@@ -823,14 +822,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Stage 0 ops.
 // CHECK: tt.store
 //
-// Between stage 0 and 1: existing async_wait wrapped, no s_barrier.
+// Between stage 0 and 1: existing async_wait followed by one s_barrier.
 // The per-mem-op barrier (non_mem_non_sideeffect) follows stage 0's store; the
 // cluster barrier (none) is next.
 // CHECK: rocdl.sched.barrier non_mem_non_sideeffect
 // CHECK-NEXT: rocdl.sched.barrier none
 // CHECK-NEXT: amdg.async_wait
+// CHECK-NEXT: rocdl.s.barrier
 // CHECK-NEXT: rocdl.sched.barrier none
-// CHECK-NOT: rocdl.s.barrier
 // Stage 1 ops.
 // CHECK: tt.store
 //
@@ -1646,6 +1645,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
         scf.yield
       } {triton.warp_pipeline.stage = "war_write_waw_write"}
 
+      ttg.barrier none
+
       scf.execute_region no_inline {
         %data = tt.load %ptr : tensor<256x64x!tt.ptr<f16>, #hz1_blocked>
         ttg.local_store %data, %waw : tensor<256x64xf16, #hz1_blocked> -> !hz1_buf
@@ -1685,7 +1686,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // Stage 2: write WAR buffer, write WAW buffer.
 // CHECK: ttg.local_store
 // CHECK: ttg.local_store
-// bars[3] LOCAL (WAW stage2 write -> stage3 write).
+// The existing control barrier is upgraded in place for the stage2 -> stage3
+// WAW. The CHECK-NEXT chain ensures no second barrier is inserted.
 // CHECK: rocdl.sched.barrier none
 // CHECK-NEXT: ttg.barrier local
 // CHECK-NEXT: rocdl.sched.barrier none

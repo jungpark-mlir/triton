@@ -111,9 +111,11 @@ static BlockInfo buildBlockInfoFromBlock(Block *block, Allocation *allocation) {
 // isPipelineIgnorable in WarpPipeliner.cpp plus the ROCDL-lowered forms that
 // can appear after intermediate passes.
 static bool isWarpPipelineIgnorableBarrier(Operation *op) {
-  return isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::BarrierOp,
-             triton::gpu::AsyncWaitOp, triton::amdgpu::AsyncWaitOp,
-             triton::amdgpu::AsyncTDMWait,
+  if (auto barrier = dyn_cast<gpu::BarrierOp>(op))
+    return barrier.getScope() == gpu::BarrierScope::Workgroup &&
+           !barrier.getNamedBarrier();
+  return isa<ROCDL::BarrierOp, triton::gpu::BarrierOp, triton::gpu::AsyncWaitOp,
+             triton::amdgpu::AsyncWaitOp, triton::amdgpu::AsyncTDMWait,
              triton::amdgpu::AsyncTDMIntrinsicWait>(op);
 }
 
@@ -267,23 +269,40 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
   }
 }
 
-// Wrap a pre-existing barrier op (e.g. async_wait) with sched_barriers so the
-// backend scheduler cannot move ops across it, and emit the cluster's
-// priority just before the barrier.  Used in place of inserting a fresh
-// cluster barrier when one already exists at the cluster boundary. If the
-// dependency analysis requires an LDS fence, add one after a non-LOCAL wait.
-static void wrapExistingBarrier(OpBuilder &b, Location loc,
-                                Operation *clusterOp,
-                                Operation *existingBarrier, bool anyHasPriority,
-                                bool needLocal, bool emitPriority = true) {
-  b.setInsertionPoint(existingBarrier);
+// Materialize a boundary containing a pre-existing wait or barrier. Every
+// boundary has exactly one synchronization barrier; waits precede it, while an
+// existing barrier is reused or upgraded with the required LDS fence.
+static void materializeExistingBoundary(OpBuilder &b, Location loc,
+                                        Operation *clusterOp,
+                                        Operation *existingOp,
+                                        bool anyHasPriority, bool needLocal,
+                                        bool emitPriority = true) {
+  if (needLocal) {
+    if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(existingOp)) {
+      if (!barrier.hasLocal()) {
+        b.setInsertionPoint(barrier);
+        auto addrSpace = barrier.getAddrSpace() | triton::gpu::AddrSpace::Local;
+        auto replacement =
+            triton::gpu::BarrierOp::create(b, barrier.getLoc(), addrSpace);
+        barrier.erase();
+        existingOp = replacement;
+      }
+    }
+    // gpu.barrier and rocdl.barrier already provide workgroup memory ordering.
+  }
+
+  b.setInsertionPoint(existingOp);
   if (emitPriority)
     emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
-  b.setInsertionPointAfter(existingBarrier);
-  auto localBarrier = dyn_cast<triton::gpu::BarrierOp>(existingBarrier);
-  if (needLocal && (!localBarrier || !localBarrier.hasLocal()))
-    triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
+  b.setInsertionPointAfter(existingOp);
+  if (!isa<ROCDL::BarrierOp, gpu::BarrierOp, triton::gpu::BarrierOp>(
+          existingOp)) {
+    if (needLocal)
+      triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
+    else
+      ROCDL::SBarrierOp::create(b, loc);
+  }
   ROCDL::SchedBarrier::create(b, loc, ROCDL::SchedGroupMask::none);
 }
 
@@ -459,9 +478,9 @@ private:
       hasTopBarrier = true;
 
     // 4. Materializing final cluster-scope barriers.  For each cluster index:
-    //  • If there is a pre-existing barrier at that location, we wrap it with
-    //    sched_barriers and add a LOCAL fence if the dependency analysis
-    //    requires one.
+    //  • A pre-existing wait or barrier is preserved inside the boundary,
+    //    which contains exactly one synchronization barrier with the required
+    //    memory scope.
     //  • If no barrier exists but `bars[i]` is true, we insert a new cluster
     //    barrier (SchedBarrier + Local/SBarrier + SchedBarrier).
     //    The “local” variant is chosen when cluster-to-cluster memory
@@ -496,9 +515,9 @@ private:
 
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
-        wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
-                            anyHasPriority, /*needLocal=*/bars[i],
-                            emitPriorityAtBoundary);
+        materializeExistingBoundary(
+            b, loc, clusterOps[i], exBar->second, anyHasPriority,
+            /*needLocal=*/bars[i], emitPriorityAtBoundary);
       } else {
         if (emitPriorityAtBoundary)
           emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);
@@ -619,8 +638,8 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
   // 4. Materialize cluster barriers.
   //    Cluster 0 gets only its priority (inserted after cond_barrier above).
   //    Clusters 1..N get priority + cluster barrier, unless a pre-existing
-  //    barrier op (e.g., async_wait) already exists between the clusters —
-  //    in that case, wrap it and add a LOCAL fence only when required.
+  //    wait or barrier already exists between the clusters. Such an op is
+  //    preserved in a boundary containing exactly one synchronization barrier.
   emitClusterPriority(b, loc, clusterOps[0], anyHasPriority);
 
   for (int i = 1; i < numClusters; i++) {
@@ -634,8 +653,8 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     }
 
     if (existingBarrier) {
-      wrapExistingBarrier(b, loc, clusterOps[i], existingBarrier,
-                          anyHasPriority, /*needLocal=*/bars[i]);
+      materializeExistingBoundary(b, loc, clusterOps[i], existingBarrier,
+                                  anyHasPriority, /*needLocal=*/bars[i]);
     } else {
       b.setInsertionPoint(clusterOps[i]);
       emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);

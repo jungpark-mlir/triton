@@ -30,6 +30,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// ==== Subgroup barriers cannot synchronize a pipeline boundary ====
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @bad_subgroup_barrier(%n: index, %ptr: !tt.ptr<f32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %v0 = arith.constant 0.0 : f32
+
+    scf.for %i = %c0 to %n step %c1 {
+      scf.execute_region {
+        tt.store %ptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "stage0"}
+
+      // expected-error @+1 {{unexpected op inside pipelined_for body}}
+      gpu.barrier scope <subgroup>
+
+      scf.execute_region {
+        tt.store %ptr, %v0 : !tt.ptr<f32>
+        scf.yield
+      } {triton.warp_pipeline.stage = "stage1"}
+      scf.yield
+    } {triton.warp_pipeline.pipelined_for}
+
+    tt.return
+  }
+}
 // -----
 
 // ==== Unsupported phase gap ====
