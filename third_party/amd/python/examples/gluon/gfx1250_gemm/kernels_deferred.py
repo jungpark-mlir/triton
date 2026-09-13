@@ -188,10 +188,20 @@ AGPR_ATTRS = (("amdgpu-agpr-alloc", "0,0"),)
 KERNEL_NAMES = ("bf16", "mxfp8", "fp8_mxfp4", "mxfp4")
 EXPERIMENTAL_KERNEL_NAMES = (
     "bf16_8stage",
+    "bf16_9stage",
     "bf16_l2prefetch",
     "bf16_pidmap",
+    "mxfp8_wait0_merged",
+    "mxfp8_wait0_merged_u4",
     "mxfp8_bk128",
     "mxfp8_bk256_opt",
+    "mxfp8_bk256_stage8",
+    "mxfp8_bk256_stage8_b_stage1",
+    "mxfp8_bk256_stage8_desc_stage5",
+    "mxfp8_bk256_stage8_scale_stage1",
+    "mxfp8_bk256_stage8_two_tdm",
+    "mxfp8_bk256_stage8_bscale_contiguous",
+    "mxfp8_bk256_stage8_ascale_combined",
     "mxfp8_bk512_128",
     "mxfp8_512x128x128_cga1",
     "mxfp8_64x64x512_cga1",
@@ -201,6 +211,11 @@ EXPERIMENTAL_KERNEL_NAMES = (
     "mxfp8_64x128x512_cga4x4",
     "mxfp8_64x64x1024_cga2x2",
     "mxfp8_128x128x256_cga4x4",
+    "fp8_mxfp4_stage8",
+    "fp8_mxfp4_stage8_b_stage1",
+    "fp8_mxfp4_bk512_stage8",
+    "mxfp4_stage8",
+    "mxfp4_stage8_b_stage1",
 )
 BF16_PID_MAPS = {
     "xcd-reuse-b": 0,
@@ -608,6 +623,51 @@ def bf16_8stage_consume_and_refill(
 
 
 @gluon.jit
+def bf16_9stage_consume_and_refill(
+        a_buf, b_buf, slot, a_desc, b_desc, acc0, acc1,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        DOT_B_LOAD: gl.constexpr, BLOCK_M: gl.constexpr,
+        BLOCK_N: gl.constexpr, CTA_N: gl.constexpr,
+        WAITCNT: gl.constexpr):
+    tdm.async_wait(WAITCNT)
+    with gl.amd.warp_pipeline_stage(
+            "bf16_9s_stage0_load_k0", priority=0, phase_gap=2):
+        a0 = a_buf.index(slot).slice(0, 64, 1).load(layout=DOT_A)
+        b0_full = b_buf.index(slot).slice(
+            0, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+        b0, b1 = bf16_8stage_split_b(b0_full, DOT_B, BLOCK_N, CTA_N)
+    with gl.amd.warp_pipeline_stage("bf16_9s_stage1_bubble"):
+        pass
+    with gl.amd.warp_pipeline_stage(
+            "bf16_9s_stage2_compute_k0_n0", priority=1):
+        acc0 = gl.amd.gfx1250.wmma(a0, b0, acc0)
+    with gl.amd.warp_pipeline_stage(
+            "bf16_9s_stage3_compute_k0_n1", priority=1):
+        acc1 = gl.amd.gfx1250.wmma(a0, b1, acc1)
+    with gl.amd.warp_pipeline_stage(
+            "bf16_9s_stage4_load_k1", priority=0):
+        a1 = a_buf.index(slot).slice(64, 64, 1).load(layout=DOT_A)
+        b1_full = b_buf.index(slot).slice(
+            64, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+        b2, b3 = bf16_8stage_split_b(b1_full, DOT_B, BLOCK_N, CTA_N)
+    with gl.amd.warp_pipeline_stage("bf16_9s_stage5_bubble"):
+        pass
+    with gl.amd.warp_pipeline_stage(
+            "bf16_9s_stage6_compute_k1_n0", priority=1):
+        acc0 = gl.amd.gfx1250.wmma(a1, b2, acc0)
+    with gl.amd.warp_pipeline_stage(
+            "bf16_9s_stage7_arrive_compute_k1_n1", priority=1):
+        gl.amd.gfx1250.cluster.arrive()
+        acc1 = gl.amd.gfx1250.wmma(a1, b3, acc1)
+    with gl.amd.warp_pipeline_stage(
+            "bf16_9s_stage8_wait_refill", priority=0):
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc = bf16_issue_loads(
+            a_desc, b_desc, a_buf.index(slot), b_buf.index(slot), 128)
+    return a_desc, b_desc, acc0, acc1
+
+
+@gluon.jit
 def bf16_8stage_consume_tail(
         a_buf, b_buf, slot, acc0, acc1,
         DOT_A: gl.constexpr, DOT_B: gl.constexpr,
@@ -683,6 +743,71 @@ def bf16_bk128_8stage_cluster_4x4_gfx1250(
     acc0, acc1 = bf16_8stage_consume_tail(
         a_buf, b_buf, last_slot, acc0, acc1, dot_a, dot_b, dot_b_load,
         block_m, block_n, cta_n)
+    a_buf._keep_alive()
+    b_buf._keep_alive()
+    mxfp8_tdm_store_split_n2(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc0, acc1,
+        OUTPUT_CGA_LAYOUT, cta_m, cta_n)
+
+
+@gluon.jit
+def bf16_bk128_9stage_cluster_4x4_gfx1250(
+        a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk,
+        stride_bn, stride_cm, stride_cn, GRID_MN: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
+        WMMA_LAYOUT: gl.constexpr, LOAD_WMMA_LAYOUT: gl.constexpr,
+        OUTPUT_CGA_LAYOUT: gl.constexpr, WAITCNT: gl.constexpr):
+    block_m: gl.constexpr = 1024
+    block_n: gl.constexpr = 1024
+    block_k: gl.constexpr = 128
+    cta_m: gl.constexpr = 4
+    cta_n: gl.constexpr = 4
+    gl.static_assert(
+        a_ptr.type.element_ty.is_bf16() and b_ptr.type.element_ty.is_bf16())
+    gl.static_assert(gl.num_ctas() == cta_m * cta_n)
+    pid_m, pid_n = snapshot_get_xcd_swizzled_pids(
+        M, N, block_m, block_n, GRID_MN, 8, 4)
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 8)
+    dot_b_load: gl.constexpr = gl.DotOperandLayout(1, LOAD_WMMA_LAYOUT, 8)
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * block_m * stride_am, shape=(M, K),
+        strides=(stride_am, stride_ak), block_shape=(block_m, block_k),
+        layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(
+        base=b_ptr + pid_n * block_n * stride_bn, shape=(N, K),
+        strides=(stride_bn, stride_bk), block_shape=(block_n, block_k),
+        layout=SHARED_LAYOUT_B)
+    a_buf = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [2, block_m, block_k], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [2, block_n, block_k], SHARED_LAYOUT_B)
+    for prefetch_idx in gl.static_range(2):
+        a_desc, b_desc = bf16_issue_loads(
+            a_desc, b_desc, a_buf.index(prefetch_idx),
+            b_buf.index(prefetch_idx), block_k)
+    acc0 = gl.zeros(
+        (block_m, block_n // 2), dtype=gl.float32, layout=WMMA_LAYOUT)
+    acc1 = gl.zeros(
+        (block_m, block_n // 2), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, block_k)
+    gl.assume(iter_max >= 3)
+    for tile_idx in range(0, iter_max - 2):
+        slot = tile_idx % 2
+        a_desc, b_desc, acc0, acc1 = bf16_9stage_consume_and_refill(
+            a_buf, b_buf, slot, a_desc, b_desc, acc0, acc1,
+            dot_a, dot_b, dot_b_load, block_m, block_n, cta_n, WAITCNT)
+    tdm.async_wait(WAITCNT)
+    penultimate_slot = (iter_max - 2) % 2
+    acc0, acc1 = bf16_8stage_consume_tail(
+        a_buf, b_buf, penultimate_slot, acc0, acc1,
+        dot_a, dot_b, dot_b_load, block_m, block_n, cta_n)
+    tdm.async_wait(0)
+    last_slot = (iter_max - 1) % 2
+    acc0, acc1 = bf16_8stage_consume_tail(
+        a_buf, b_buf, last_slot, acc0, acc1,
+        dot_a, dot_b, dot_b_load, block_m, block_n, cta_n)
+    snapshot_cluster_wait()
     a_buf._keep_alive()
     b_buf._keep_alive()
     mxfp8_tdm_store_split_n2(
@@ -974,6 +1099,41 @@ def mxfp8_load_scale(
 
 
 @gluon.jit
+def mxfp8_load_a_scale_b128(
+        scale_buffer, slot, LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr):
+    # The width-eight host packing makes K[0:8] contiguous before the M/32
+    # register repetition. Together they form one 16-byte fragment per lane.
+    scale_slice = scale_buffer.index(slot).reshape(
+        (BLOCK_M // 128, 1, 32, 4, 8)
+    ).permute((0, 3, 2, 1, 4)).reshape((BLOCK_M, 8))
+    return scale_slice.load(layout=LAYOUT)
+
+
+@gluon.jit
+def mxfp8_load_b_scale(
+        scale_buffer, slot, start_k: gl.constexpr, LAYOUT: gl.constexpr,
+        BLOCK_N: gl.constexpr, CONTIGUOUS: gl.constexpr):
+    if CONTIGUOUS:
+        return scale_buffer.index(slot).slice(
+            start_k, 4, 1).load(layout=LAYOUT)
+    return mxfp8_load_scale(
+        scale_buffer, slot, start_k, LAYOUT, BLOCK_N, 8, 4)
+
+
+@gluon.jit
+def mxfp8_split_a_scale(
+        scale, SCALE_A_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr):
+    scale0 = gl.convert_layout(
+        gl.amd.slice(scale, [BLOCK_M, 4], [0, 0]),
+        SCALE_A_LAYOUT, assert_trivial=True)
+    scale1 = gl.convert_layout(
+        gl.amd.slice(scale, [BLOCK_M, 4], [0, 4]),
+        SCALE_A_LAYOUT, assert_trivial=True)
+    return scale0, scale1
+
+
+@gluon.jit
 def mxfp8_issue_leading4_data(
         a_desc, b_desc, a_buf, b_buf, slot):
     # Both standalone copies use all four leading warps. Narrowing A to two
@@ -1000,6 +1160,41 @@ def mxfp8_issue_leading4_scale(
     bs_desc = tdm.update_tensor_descriptor(
         bs_desc, add_offsets=[0, 1024])
     return as_desc, bs_desc
+
+
+@gluon.jit
+def mxfp8_issue_two_tdm(
+        a_desc, b_desc, as_desc, bs_desc,
+        a_buf, b_buf, as_buf, bs_buf, slot,
+        B_SCALE_CONTIGUOUS: gl.constexpr):
+    tdm.async_load(
+        b_desc, dest=b_buf.index(slot), warp_used_hint=0b00001111)
+    tdm.async_load_fused([
+        (a_desc, a_buf.index(slot), 0b00000011),
+        (as_desc, as_buf.index(slot), 0b00000100),
+        (bs_desc, bs_buf.index(slot), 0b00001000),
+    ])
+    a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, 256])
+    b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, 256])
+    as_desc = tdm.update_tensor_descriptor(
+        as_desc, add_offsets=[0, 1024])
+    bs_desc = tdm.update_tensor_descriptor(
+        bs_desc, add_offsets=[0, 8 if B_SCALE_CONTIGUOUS else 1024])
+    return a_desc, b_desc, as_desc, bs_desc
+
+
+@gluon.jit
+def mxfp8_issue_leading4_without_update(
+        a_desc, b_desc, as_desc, bs_desc,
+        a_buf, b_buf, as_buf, bs_buf, slot):
+    tdm.async_load(
+        a_desc, dest=a_buf.index(slot), warp_used_hint=0b00001111)
+    tdm.async_load(
+        b_desc, dest=b_buf.index(slot), warp_used_hint=0b00001111)
+    tdm.async_load_fused([
+        (as_desc, as_buf.index(slot), 0b00000011),
+        (bs_desc, bs_buf.index(slot), 0b00001100),
+    ])
 
 
 @gluon.jit
@@ -1108,14 +1303,67 @@ def mxfp8_consume_and_refill(
 
 
 @gluon.jit
+def mxfp8_consume_and_refill_wait0_merged(
+        a_buf, b_buf, as_buf, bs_buf, slot, refill_slot,
+        a_desc, b_desc, as_desc, bs_desc, acc,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        CLUSTERED: gl.constexpr):
+    tdm.async_wait(0)
+    with gl.amd.warp_pipeline_stage("refill_load_low", priority=0):
+        if CLUSTERED:
+            gl.amd.gfx1250.cluster.arrive()
+            gl.amd.gfx1250.cluster.wait()
+        mxfp8_issue_leading4_without_update(
+            a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, refill_slot)
+        a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            0, 128, 1).load(layout=DOT_A)
+        as0 = mxfp8_load_scale(
+            as_buf, slot, 0, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
+        b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            0, 128, 1).permute([1, 0]).load(layout=DOT_B)
+        bs0 = mxfp8_load_scale(
+            bs_buf, slot, 0, SCALE_B_LAYOUT, BLOCK_N, 8, 4)
+    with gl.amd.warp_pipeline_stage("compute_low", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e4m3", b0, bs0, "e4m3", acc)
+    with gl.amd.warp_pipeline_stage("load_high_update", priority=0):
+        a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            128, 128, 1).load(layout=DOT_A)
+        as1 = mxfp8_load_scale(
+            as_buf, slot, 4, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
+        b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            128, 128, 1).permute([1, 0]).load(layout=DOT_B)
+        bs1 = mxfp8_load_scale(
+            bs_buf, slot, 4, SCALE_B_LAYOUT, BLOCK_N, 8, 4)
+        a_desc = tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[0, 256])
+        b_desc = tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[0, 256])
+        as_desc = tdm.update_tensor_descriptor(
+            as_desc, add_offsets=[0, 1024])
+        bs_desc = tdm.update_tensor_descriptor(
+            bs_desc, add_offsets=[0, 1024])
+    with gl.amd.warp_pipeline_stage("compute_high", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e4m3", b1, bs1, "e4m3", acc)
+    return a_desc, b_desc, as_desc, bs_desc, acc
+
+
+@gluon.jit
 def fp8_scaled_cluster_bf16_style_kernel_gfx1250(
         a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
         stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-        stride_scale, GRID_MN: gl.constexpr, SHARED_LAYOUT_A: gl.constexpr,
+        stride_scale_a, stride_scale_b, GRID_MN: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr,
         SHARED_LAYOUT_B: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
         SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr,
         OUTPUT_CGA_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
-        BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+        BLOCK_N: gl.constexpr, CTA_M: gl.constexpr, CTA_N: gl.constexpr,
+        WAIT0_MERGED: gl.constexpr,
+        WAIT0_MERGED_UNROLL4: gl.constexpr):
     gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
     gl.static_assert(BLOCK_M // CTA_M == 256)
     gl.static_assert(BLOCK_N // CTA_N == 256)
@@ -1167,23 +1415,82 @@ def fp8_scaled_cluster_bf16_style_kernel_gfx1250(
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     iter_max = gl.cdiv(K, 256)
     gl.assume(iter_max >= 2)
-    for tile_idx in range(0, iter_max - 1):
-        slot = tile_idx % 2
-        a_desc, b_desc, as_desc, bs_desc, acc = mxfp8_consume_and_refill(
-            a_buf, b_buf, as_buf, bs_buf, slot, (tile_idx + 1) % 2,
-            a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
-            scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N, ring_wait)
+    if WAIT0_MERGED_UNROLL4:
+        gl.assume(iter_max >= 4)
+        gl.assume((iter_max % 4) == 0)
+        for _ in range(0, (iter_max - 4) // 4):
+            a_desc, b_desc, as_desc, bs_desc, acc = (
+                mxfp8_consume_and_refill_wait0_merged(
+                    a_buf, b_buf, as_buf, bs_buf, 0, 1,
+                    a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
+                    scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
+                    CTA_M * CTA_N > 1))
+            a_desc, b_desc, as_desc, bs_desc, acc = (
+                mxfp8_consume_and_refill_wait0_merged(
+                    a_buf, b_buf, as_buf, bs_buf, 1, 0,
+                    a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
+                    scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
+                    CTA_M * CTA_N > 1))
+            a_desc, b_desc, as_desc, bs_desc, acc = (
+                mxfp8_consume_and_refill_wait0_merged(
+                    a_buf, b_buf, as_buf, bs_buf, 0, 1,
+                    a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
+                    scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
+                    CTA_M * CTA_N > 1))
+            a_desc, b_desc, as_desc, bs_desc, acc = (
+                mxfp8_consume_and_refill_wait0_merged(
+                    a_buf, b_buf, as_buf, bs_buf, 1, 0,
+                    a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
+                    scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
+                    CTA_M * CTA_N > 1))
+        a_desc, b_desc, as_desc, bs_desc, acc = (
+            mxfp8_consume_and_refill_wait0_merged(
+                a_buf, b_buf, as_buf, bs_buf, 0, 1,
+                a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
+                scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
+                CTA_M * CTA_N > 1))
+        a_desc, b_desc, as_desc, bs_desc, acc = (
+            mxfp8_consume_and_refill_wait0_merged(
+                a_buf, b_buf, as_buf, bs_buf, 1, 0,
+                a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
+                scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
+                CTA_M * CTA_N > 1))
+        a_desc, b_desc, as_desc, bs_desc, acc = (
+            mxfp8_consume_and_refill_wait0_merged(
+                a_buf, b_buf, as_buf, bs_buf, 0, 1,
+                a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
+                scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N,
+                CTA_M * CTA_N > 1))
+    else:
+        for tile_idx in range(0, iter_max - 1):
+            slot = tile_idx % 2
+            if WAIT0_MERGED:
+                a_desc, b_desc, as_desc, bs_desc, acc = (
+                    mxfp8_consume_and_refill_wait0_merged(
+                        a_buf, b_buf, as_buf, bs_buf, slot,
+                        (tile_idx + 1) % 2, a_desc, b_desc, as_desc, bs_desc,
+                        acc, dot_a, dot_b, scale_a_layout, scale_b_layout,
+                        BLOCK_M, BLOCK_N, CTA_M * CTA_N > 1))
+            else:
+                a_desc, b_desc, as_desc, bs_desc, acc = (
+                    mxfp8_consume_and_refill(
+                        a_buf, b_buf, as_buf, bs_buf, slot,
+                        (tile_idx + 1) % 2, a_desc, b_desc, as_desc, bs_desc,
+                        acc, dot_a, dot_b, scale_a_layout, scale_b_layout,
+                        BLOCK_M, BLOCK_N, ring_wait))
 
     # The final tile has no successor refill.
     tdm.async_wait(0)
-    snapshot_cluster_wait()
+    if CTA_M * CTA_N > 1:
+        snapshot_cluster_wait()
     last_slot = (iter_max - 1) % 2
     acc = mxfp8_consume_pipelined_tail(
         a_buf, b_buf, as_buf, bs_buf, last_slot, acc, dot_a, dot_b,
         scale_a_layout, scale_b_layout, BLOCK_M, BLOCK_N)
     # The serial output stage aliases cluster-distributed operand LDS. All CTAs
     # must finish the final operand reads before any CTA repurposes that arena.
-    snapshot_cluster_wait()
+    if CTA_M * CTA_N > 1:
+        snapshot_cluster_wait()
     a_buf._keep_alive()
     b_buf._keep_alive()
     as_buf._keep_alive()
@@ -1198,39 +1505,79 @@ def mxfp8_bk256_opt_consume_and_refill(
         a_buf, b_buf, as_buf, bs_buf, slot, refill_slot, a_desc, b_desc,
         as_desc, bs_desc, acc0, acc1, DOT_A: gl.constexpr,
         DOT_B: gl.constexpr, DOT_B_LOAD: gl.constexpr,
-        SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        SCALE_A_LAYOUT: gl.constexpr, SCALE_A_LOAD: gl.constexpr,
+        SCALE_B_LAYOUT: gl.constexpr,
         SCALE_B_LOAD: gl.constexpr, BLOCK_M: gl.constexpr,
-        BLOCK_N: gl.constexpr, CTA_N: gl.constexpr):
+        BLOCK_N: gl.constexpr, CTA_N: gl.constexpr,
+        STAGE8_REFILL: gl.constexpr, TWO_TDM: gl.constexpr,
+        B_SCALE_CONTIGUOUS: gl.constexpr,
+        A_SCALE_COMBINED: gl.constexpr,
+        DESC_UPDATE_STAGE5: gl.constexpr,
+        SCALE_LOAD_STAGE1: gl.constexpr,
+        B_LOAD_STAGE1: gl.constexpr):
     cta_n: gl.constexpr = 256
     half_n: gl.constexpr = 128
     packed_n: gl.constexpr = BLOCK_N // 2
-    tdm.async_wait(3)
+    gl.static_assert(
+        not DESC_UPDATE_STAGE5 or (STAGE8_REFILL and not TWO_TDM))
+    gl.static_assert(not SCALE_LOAD_STAGE1 or not A_SCALE_COMBINED)
+    tdm.async_wait(2 if TWO_TDM else 3)
     with gl.amd.warp_pipeline_stage(
             "stage0_load_k0", priority=0, phase_gap=2):
         a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
             0, 128, 1).load(layout=DOT_A)
-        as0 = mxfp8_load_scale(
-            as_buf, slot, 0, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
-        b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
-            0, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
-        bs0 = mxfp8_load_scale(
-            bs_buf, slot, 0, SCALE_B_LOAD, BLOCK_N, 8, 4)
-        b0_grid = b0.reshape((128, CTA_N, cta_n))
-        b0_lo = gl.convert_layout(gl.amd.slice(
-            b0_grid, [128, CTA_N, half_n], [0, 0, 0]
-        ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
-        b0_hi = gl.convert_layout(gl.amd.slice(
-            b0_grid, [128, CTA_N, half_n], [0, 0, half_n]
-        ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
-        bs0_grid = bs0.reshape((CTA_N, cta_n, 4))
-        bs0_lo = gl.convert_layout(gl.amd.slice(
-            bs0_grid, [CTA_N, half_n, 4], [0, 0, 0]
-        ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
-        bs0_hi = gl.convert_layout(gl.amd.slice(
-            bs0_grid, [CTA_N, half_n, 4], [0, half_n, 0]
-        ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+        if not SCALE_LOAD_STAGE1:
+            if A_SCALE_COMBINED:
+                as_full = mxfp8_load_a_scale_b128(
+                    as_buf, slot, SCALE_A_LOAD, BLOCK_M)
+                as0, as1 = mxfp8_split_a_scale(
+                    as_full, SCALE_A_LAYOUT, BLOCK_M)
+            else:
+                as0 = mxfp8_load_scale(
+                    as_buf, slot, 0, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
+        if not B_LOAD_STAGE1:
+            b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+                0, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+            b0_grid = b0.reshape((128, CTA_N, cta_n))
+            b0_lo = gl.convert_layout(gl.amd.slice(
+                b0_grid, [128, CTA_N, half_n], [0, 0, 0]
+            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+            b0_hi = gl.convert_layout(gl.amd.slice(
+                b0_grid, [128, CTA_N, half_n], [0, 0, half_n]
+            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+        if not SCALE_LOAD_STAGE1:
+            bs0 = mxfp8_load_b_scale(
+                bs_buf, slot, 0, SCALE_B_LOAD, BLOCK_N, B_SCALE_CONTIGUOUS)
+            bs0_grid = bs0.reshape((CTA_N, cta_n, 4))
+            bs0_lo = gl.convert_layout(gl.amd.slice(
+                bs0_grid, [CTA_N, half_n, 4], [0, 0, 0]
+            ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+            bs0_hi = gl.convert_layout(gl.amd.slice(
+                bs0_grid, [CTA_N, half_n, 4], [0, half_n, 0]
+            ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
     with gl.amd.warp_pipeline_stage("stage1_bubble"):
-        pass
+        if SCALE_LOAD_STAGE1:
+            as0 = mxfp8_load_scale(
+                as_buf, slot, 0, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
+            bs0 = mxfp8_load_b_scale(
+                bs_buf, slot, 0, SCALE_B_LOAD, BLOCK_N, B_SCALE_CONTIGUOUS)
+            bs0_grid = bs0.reshape((CTA_N, cta_n, 4))
+            bs0_lo = gl.convert_layout(gl.amd.slice(
+                bs0_grid, [CTA_N, half_n, 4], [0, 0, 0]
+            ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+            bs0_hi = gl.convert_layout(gl.amd.slice(
+                bs0_grid, [CTA_N, half_n, 4], [0, half_n, 0]
+            ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+        if B_LOAD_STAGE1:
+            b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+                0, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+            b0_grid = b0.reshape((128, CTA_N, cta_n))
+            b0_lo = gl.convert_layout(gl.amd.slice(
+                b0_grid, [128, CTA_N, half_n], [0, 0, 0]
+            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+            b0_hi = gl.convert_layout(gl.amd.slice(
+                b0_grid, [128, CTA_N, half_n], [0, 0, half_n]
+            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
     with gl.amd.warp_pipeline_stage("stage2_compute_k0_n0", priority=1):
         acc0 = gl.amd.gfx1250.wmma_scaled(
             a0, as0, "e4m3", b0_lo, bs0_lo, "e4m3", acc0)
@@ -1240,41 +1587,112 @@ def mxfp8_bk256_opt_consume_and_refill(
     with gl.amd.warp_pipeline_stage("stage4_load_k1", priority=0):
         a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
             128, 128, 1).load(layout=DOT_A)
-        as1 = mxfp8_load_scale(
-            as_buf, slot, 4, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
-        b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
-            128, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
-        bs1 = mxfp8_load_scale(
-            bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N, 8, 4)
-        b1_grid = b1.reshape((128, CTA_N, cta_n))
-        b1_lo = gl.convert_layout(gl.amd.slice(
-            b1_grid, [128, CTA_N, half_n], [0, 0, 0]
-        ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
-        b1_hi = gl.convert_layout(gl.amd.slice(
-            b1_grid, [128, CTA_N, half_n], [0, 0, half_n]
-        ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
-        bs1_grid = bs1.reshape((CTA_N, cta_n, 4))
-        bs1_lo = gl.convert_layout(gl.amd.slice(
-            bs1_grid, [CTA_N, half_n, 4], [0, 0, 0]
-        ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
-        bs1_hi = gl.convert_layout(gl.amd.slice(
-            bs1_grid, [CTA_N, half_n, 4], [0, half_n, 0]
-        ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+        if not A_SCALE_COMBINED and not SCALE_LOAD_STAGE1:
+            as1 = mxfp8_load_scale(
+                as_buf, slot, 4, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
+        if not B_LOAD_STAGE1:
+            b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+                128, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+            b1_grid = b1.reshape((128, CTA_N, cta_n))
+            b1_lo = gl.convert_layout(gl.amd.slice(
+                b1_grid, [128, CTA_N, half_n], [0, 0, 0]
+            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+            b1_hi = gl.convert_layout(gl.amd.slice(
+                b1_grid, [128, CTA_N, half_n], [0, 0, half_n]
+            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+        if not SCALE_LOAD_STAGE1:
+            bs1 = mxfp8_load_b_scale(
+                bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N, B_SCALE_CONTIGUOUS)
+            bs1_grid = bs1.reshape((CTA_N, cta_n, 4))
+            bs1_lo = gl.convert_layout(gl.amd.slice(
+                bs1_grid, [CTA_N, half_n, 4], [0, 0, 0]
+            ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+            bs1_hi = gl.convert_layout(gl.amd.slice(
+                bs1_grid, [CTA_N, half_n, 4], [0, half_n, 0]
+            ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+    next_a_desc = a_desc
+    next_b_desc = b_desc
+    next_as_desc = as_desc
+    next_bs_desc = bs_desc
     with gl.amd.warp_pipeline_stage("stage5_bubble"):
-        pass
+        if SCALE_LOAD_STAGE1:
+            as1 = mxfp8_load_scale(
+                as_buf, slot, 4, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
+            bs1 = mxfp8_load_b_scale(
+                bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N, B_SCALE_CONTIGUOUS)
+            bs1_grid = bs1.reshape((CTA_N, cta_n, 4))
+            bs1_lo = gl.convert_layout(gl.amd.slice(
+                bs1_grid, [CTA_N, half_n, 4], [0, 0, 0]
+            ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+            bs1_hi = gl.convert_layout(gl.amd.slice(
+                bs1_grid, [CTA_N, half_n, 4], [0, half_n, 0]
+            ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+        if B_LOAD_STAGE1:
+            b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+                128, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+            b1_grid = b1.reshape((128, CTA_N, cta_n))
+            b1_lo = gl.convert_layout(gl.amd.slice(
+                b1_grid, [128, CTA_N, half_n], [0, 0, 0]
+            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+            b1_hi = gl.convert_layout(gl.amd.slice(
+                b1_grid, [128, CTA_N, half_n], [0, 0, half_n]
+            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+        if DESC_UPDATE_STAGE5:
+            next_a_desc = tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, 256])
+            next_b_desc = tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, 256])
+            next_as_desc = tdm.update_tensor_descriptor(
+                as_desc, add_offsets=[0, 1024])
+            next_bs_desc = tdm.update_tensor_descriptor(
+                bs_desc, add_offsets=[0, 1024])
     with gl.amd.warp_pipeline_stage("stage6_compute_k1_n0", priority=1):
         acc0 = gl.amd.gfx1250.wmma_scaled(
             a1, as1, "e4m3", b1_lo, bs1_lo, "e4m3", acc0)
-    with gl.amd.warp_pipeline_stage(
-            "stage7_arrive_compute_k1_n1_wait_refill", priority=1):
-        gl.amd.gfx1250.cluster.arrive()
-        acc1 = gl.amd.gfx1250.wmma_scaled(
-            a1, as1, "e4m3", b1_hi, bs1_hi, "e4m3", acc1)
-        gl.amd.gfx1250.cluster.wait()
-        a_desc, b_desc = mxfp8_issue_leading4_data(
-            a_desc, b_desc, a_buf, b_buf, refill_slot)
-        as_desc, bs_desc = mxfp8_issue_leading4_scale(
-            as_desc, bs_desc, as_buf, bs_buf, refill_slot)
+    if STAGE8_REFILL:
+        with gl.amd.warp_pipeline_stage(
+                "stage7_arrive_compute_k1_n1", priority=1):
+            gl.amd.gfx1250.cluster.arrive()
+            acc1 = gl.amd.gfx1250.wmma_scaled(
+                a1, as1, "e4m3", b1_hi, bs1_hi, "e4m3", acc1)
+        with gl.amd.warp_pipeline_stage(
+                "stage8_wait_refill", priority=0):
+            gl.amd.gfx1250.cluster.wait()
+            if TWO_TDM:
+                a_desc, b_desc, as_desc, bs_desc = mxfp8_issue_two_tdm(
+                    a_desc, b_desc, as_desc, bs_desc,
+                    a_buf, b_buf, as_buf, bs_buf, refill_slot,
+                    B_SCALE_CONTIGUOUS)
+            elif DESC_UPDATE_STAGE5:
+                mxfp8_issue_leading4_without_update(
+                    a_desc, b_desc, as_desc, bs_desc,
+                    a_buf, b_buf, as_buf, bs_buf, refill_slot)
+                a_desc = next_a_desc
+                b_desc = next_b_desc
+                as_desc = next_as_desc
+                bs_desc = next_bs_desc
+            else:
+                a_desc, b_desc = mxfp8_issue_leading4_data(
+                    a_desc, b_desc, a_buf, b_buf, refill_slot)
+                as_desc, bs_desc = mxfp8_issue_leading4_scale(
+                    as_desc, bs_desc, as_buf, bs_buf, refill_slot)
+    else:
+        with gl.amd.warp_pipeline_stage(
+                "stage7_arrive_compute_k1_n1_wait_refill", priority=1):
+            gl.amd.gfx1250.cluster.arrive()
+            acc1 = gl.amd.gfx1250.wmma_scaled(
+                a1, as1, "e4m3", b1_hi, bs1_hi, "e4m3", acc1)
+            gl.amd.gfx1250.cluster.wait()
+            if TWO_TDM:
+                a_desc, b_desc, as_desc, bs_desc = mxfp8_issue_two_tdm(
+                    a_desc, b_desc, as_desc, bs_desc,
+                    a_buf, b_buf, as_buf, bs_buf, refill_slot,
+                    B_SCALE_CONTIGUOUS)
+            else:
+                a_desc, b_desc = mxfp8_issue_leading4_data(
+                    a_desc, b_desc, a_buf, b_buf, refill_slot)
+                as_desc, bs_desc = mxfp8_issue_leading4_scale(
+                    as_desc, bs_desc, as_buf, bs_buf, refill_slot)
     return a_desc, b_desc, as_desc, bs_desc, acc0, acc1
 
 
@@ -1283,21 +1701,29 @@ def mxfp8_bk256_opt_consume_tail_split_n(
         a_buf, b_buf, as_buf, bs_buf, slot, acc0, acc1,
         DOT_A: gl.constexpr, DOT_B: gl.constexpr,
         DOT_B_LOAD: gl.constexpr, SCALE_A_LAYOUT: gl.constexpr,
+        SCALE_A_LOAD: gl.constexpr,
         SCALE_B_LAYOUT: gl.constexpr, SCALE_B_LOAD: gl.constexpr,
         BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
-        CTA_N: gl.constexpr):
+        CTA_N: gl.constexpr, B_SCALE_CONTIGUOUS: gl.constexpr,
+        A_SCALE_COMBINED: gl.constexpr):
     cta_n: gl.constexpr = 256
     half_n: gl.constexpr = 128
     packed_n: gl.constexpr = BLOCK_N // 2
     with gl.amd.warp_pipeline_stage("gap2_tail_load_k0", priority=0):
         a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
             0, 128, 1).load(layout=DOT_A)
-        as0 = mxfp8_load_scale(
-            as_buf, slot, 0, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
+        if A_SCALE_COMBINED:
+            as_full = mxfp8_load_a_scale_b128(
+                as_buf, slot, SCALE_A_LOAD, BLOCK_M)
+            as0, as1 = mxfp8_split_a_scale(
+                as_full, SCALE_A_LAYOUT, BLOCK_M)
+        else:
+            as0 = mxfp8_load_scale(
+                as_buf, slot, 0, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
         b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
             0, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
-        bs0 = mxfp8_load_scale(
-            bs_buf, slot, 0, SCALE_B_LOAD, BLOCK_N, 8, 4)
+        bs0 = mxfp8_load_b_scale(
+            bs_buf, slot, 0, SCALE_B_LOAD, BLOCK_N, B_SCALE_CONTIGUOUS)
         b0_grid = b0.reshape((128, CTA_N, cta_n))
         b0_lo = gl.convert_layout(gl.amd.slice(
             b0_grid, [128, CTA_N, half_n], [0, 0, 0]
@@ -1320,12 +1746,13 @@ def mxfp8_bk256_opt_consume_tail_split_n(
     with gl.amd.warp_pipeline_stage("gap2_tail_load_k1", priority=0):
         a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
             128, 128, 1).load(layout=DOT_A)
-        as1 = mxfp8_load_scale(
-            as_buf, slot, 4, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
+        if not A_SCALE_COMBINED:
+            as1 = mxfp8_load_scale(
+                as_buf, slot, 4, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
         b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
             128, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
-        bs1 = mxfp8_load_scale(
-            bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N, 8, 4)
+        bs1 = mxfp8_load_b_scale(
+            bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N, B_SCALE_CONTIGUOUS)
         b1_grid = b1.reshape((128, CTA_N, cta_n))
         b1_lo = gl.convert_layout(gl.amd.slice(
             b1_grid, [128, CTA_N, half_n], [0, 0, 0]
@@ -1352,12 +1779,19 @@ def mxfp8_bk256_opt_consume_tail_split_n(
 def fp8_scaled_cluster_bk256_opt_kernel_gfx1250(
         a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
         stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-        stride_scale, GRID_MN: gl.constexpr, SHARED_LAYOUT_A: gl.constexpr,
+        stride_scale_a, stride_scale_b, GRID_MN: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr,
         SHARED_LAYOUT_B: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
         SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr,
         LOAD_WMMA_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr,
         BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
-        CTA_M: gl.constexpr, CTA_N: gl.constexpr):
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr,
+        STAGE8_REFILL: gl.constexpr, TWO_TDM: gl.constexpr,
+        B_SCALE_CONTIGUOUS: gl.constexpr,
+        A_SCALE_COMBINED: gl.constexpr,
+        DESC_UPDATE_STAGE5: gl.constexpr,
+        SCALE_LOAD_STAGE1: gl.constexpr,
+        B_LOAD_STAGE1: gl.constexpr):
     gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
     gl.static_assert(BLOCK_M // CTA_M == 256)
     gl.static_assert(BLOCK_N // CTA_N == 256)
@@ -1369,6 +1803,8 @@ def fp8_scaled_cluster_bk256_opt_kernel_gfx1250(
         1, LOAD_WMMA_LAYOUT, 16)
     scale_a_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
         dot_a, [BLOCK_M, 4])
+    scale_a_load: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_a, [BLOCK_M, 8])
     scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
         dot_b, [BLOCK_N // 2, 4])
     scale_b_load: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
@@ -1381,9 +1817,13 @@ def fp8_scaled_cluster_bk256_opt_kernel_gfx1250(
     as_buf = gl.allocate_shared_memory(
         a_scale_ptr.type.element_ty,
         [slots, BLOCK_M // 128, 1024], SHARED_SCALE_A)
-    bs_buf = gl.allocate_shared_memory(
-        b_scale_ptr.type.element_ty,
-        [slots, BLOCK_N // 128, 1024], SHARED_SCALE_B)
+    if B_SCALE_CONTIGUOUS:
+        bs_buf = gl.allocate_shared_memory(
+            b_scale_ptr.type.element_ty, [slots, BLOCK_N, 8], SHARED_SCALE_B)
+    else:
+        bs_buf = gl.allocate_shared_memory(
+            b_scale_ptr.type.element_ty,
+            [slots, BLOCK_N // 128, 1024], SHARED_SCALE_B)
     a_desc = tdm.make_tensor_descriptor(
         base=a_ptr + pid_m * BLOCK_M * stride_am, shape=(M, K),
         strides=(stride_am, stride_ak), block_shape=(BLOCK_M, 256),
@@ -1393,18 +1833,30 @@ def fp8_scaled_cluster_bk256_opt_kernel_gfx1250(
         strides=(stride_bn, stride_bk), block_shape=(BLOCK_N, 256),
         layout=SHARED_LAYOUT_B)
     as_desc = tdm.make_tensor_descriptor(
-        base=a_scale_ptr + (pid_m * BLOCK_M) // 128 * stride_scale,
-        shape=(M // 128, K // 32 * 128), strides=(stride_scale, 1),
+        base=a_scale_ptr + (pid_m * BLOCK_M) // 128 * stride_scale_a,
+        shape=(M // 128, K // 32 * 128), strides=(stride_scale_a, 1),
         block_shape=(BLOCK_M // 128, 1024), layout=SHARED_SCALE_A)
-    bs_desc = tdm.make_tensor_descriptor(
-        base=b_scale_ptr + (pid_n * BLOCK_N) // 128 * stride_scale,
-        shape=(N // 128, K // 32 * 128), strides=(stride_scale, 1),
-        block_shape=(BLOCK_N // 128, 1024), layout=SHARED_SCALE_B)
+    if B_SCALE_CONTIGUOUS:
+        bs_desc = tdm.make_tensor_descriptor(
+            base=b_scale_ptr + pid_n * BLOCK_N * stride_scale_b,
+            shape=(N, K // 32), strides=(stride_scale_b, 1),
+            block_shape=(BLOCK_N, 8), layout=SHARED_SCALE_B)
+    else:
+        bs_desc = tdm.make_tensor_descriptor(
+            base=b_scale_ptr + (pid_n * BLOCK_N) // 128 * stride_scale_b,
+            shape=(N // 128, K // 32 * 128), strides=(stride_scale_b, 1),
+            block_shape=(BLOCK_N // 128, 1024), layout=SHARED_SCALE_B)
     for prefetch_idx in gl.static_range(2):
-        a_desc, b_desc = mxfp8_issue_leading4_data(
-            a_desc, b_desc, a_buf, b_buf, prefetch_idx)
-        as_desc, bs_desc = mxfp8_issue_leading4_scale(
-            as_desc, bs_desc, as_buf, bs_buf, prefetch_idx)
+        if TWO_TDM:
+            a_desc, b_desc, as_desc, bs_desc = mxfp8_issue_two_tdm(
+                a_desc, b_desc, as_desc, bs_desc,
+                a_buf, b_buf, as_buf, bs_buf, prefetch_idx,
+                B_SCALE_CONTIGUOUS)
+        else:
+            a_desc, b_desc = mxfp8_issue_leading4_data(
+                a_desc, b_desc, a_buf, b_buf, prefetch_idx)
+            as_desc, bs_desc = mxfp8_issue_leading4_scale(
+                as_desc, bs_desc, as_buf, bs_buf, prefetch_idx)
     acc0 = gl.zeros(
         (BLOCK_M, BLOCK_N // 2), dtype=gl.float32, layout=WMMA_LAYOUT)
     acc1 = gl.zeros(
@@ -1417,21 +1869,26 @@ def fp8_scaled_cluster_bk256_opt_kernel_gfx1250(
             mxfp8_bk256_opt_consume_and_refill(
                 a_buf, b_buf, as_buf, bs_buf, slot, slot,
                 a_desc, b_desc, as_desc, bs_desc, acc0, acc1, dot_a, dot_b,
-                dot_b_load, scale_a_layout, scale_b_layout, scale_b_load,
-                BLOCK_M, BLOCK_N, CTA_N))
+                dot_b_load, scale_a_layout, scale_a_load,
+                scale_b_layout, scale_b_load,
+                BLOCK_M, BLOCK_N, CTA_N, STAGE8_REFILL, TWO_TDM,
+                B_SCALE_CONTIGUOUS, A_SCALE_COMBINED,
+                DESC_UPDATE_STAGE5, SCALE_LOAD_STAGE1, B_LOAD_STAGE1))
 
-    tdm.async_wait(3)
+    tdm.async_wait(2 if TWO_TDM else 3)
     penultimate_slot = (iter_max - 2) % 2
     acc0, acc1 = mxfp8_bk256_opt_consume_tail_split_n(
         a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc0, acc1,
-        dot_a, dot_b, dot_b_load, scale_a_layout, scale_b_layout,
-        scale_b_load, BLOCK_M, BLOCK_N, CTA_N)
+        dot_a, dot_b, dot_b_load, scale_a_layout, scale_a_load,
+        scale_b_layout, scale_b_load, BLOCK_M, BLOCK_N, CTA_N,
+        B_SCALE_CONTIGUOUS, A_SCALE_COMBINED)
     tdm.async_wait(0)
     last_slot = (iter_max - 1) % 2
     acc0, acc1 = mxfp8_bk256_opt_consume_tail_split_n(
         a_buf, b_buf, as_buf, bs_buf, last_slot, acc0, acc1, dot_a, dot_b,
-        dot_b_load, scale_a_layout, scale_b_layout, scale_b_load,
-        BLOCK_M, BLOCK_N, CTA_N)
+        dot_b_load, scale_a_layout, scale_a_load, scale_b_layout,
+        scale_b_load, BLOCK_M, BLOCK_N, CTA_N,
+        B_SCALE_CONTIGUOUS, A_SCALE_COMBINED)
     snapshot_cluster_wait()
     a_buf._keep_alive()
     b_buf._keep_alive()
@@ -1471,8 +1928,11 @@ def mxfp8_bk128_consume_and_refill(
         REFILL_SCHEDULE: gl.constexpr):
     # Two prefetched tiles are outstanding. Retire the older one while leaving
     # the next tile in flight, then refill the third, disjoint slot.
-    tdm.async_wait(3)
-    if REFILL_SCHEDULE == 0:
+    if REFILL_SCHEDULE == 3:
+        tdm.async_wait(0)
+    else:
+        tdm.async_wait(3)
+    if REFILL_SCHEDULE == 0 or REFILL_SCHEDULE == 3:
         with gl.amd.warp_pipeline_stage(
                 "bk128_refill_then_load", priority=0):
             gl.amd.gfx1250.cluster.arrive()
@@ -2495,6 +2955,19 @@ def build_mxfp8_bk256_opt_layouts(cluster_m=4, cluster_n=None):
             output_cga)
 
 
+def build_mxfp8_bk256_opt_bscale_contiguous_layouts(
+        cluster_m=4, cluster_n=None):
+    """Use an N-major B-scale LDS tile while retaining all other layouts."""
+    cluster_n = cluster_m if cluster_n is None else cluster_n
+    (shared_a, shared_b, shared_as, shared_bs, wmma, load_wmma,
+     output_cga) = build_mxfp8_bk256_opt_layouts(cluster_m, cluster_n)
+    block_n = 256 * cluster_n
+    shared_bs = gl.PaddedSharedLayout.with_identity_for(
+        [[8, 8]], [block_n, 8], [1, 0], shared_bs.cga_layout)
+    return (shared_a, shared_b, shared_as, shared_bs, wmma, load_wmma,
+            output_cga)
+
+
 def build_mxfp8_bk128_layouts(cluster_m=4, cluster_n=None):
     """Build three-slot BK128 MXFP8 layouts."""
     cluster_n = cluster_m if cluster_n is None else cluster_n
@@ -2842,6 +3315,282 @@ def fp8_mxfp4_consume_and_refill(
 
 
 @gluon.jit
+def fp8_mxfp4_bk512_issue_refill(
+        a_desc, b_desc, bs_desc, a_buf, b_buf, bs_buf, slot,
+        B_WARP_HINT: gl.constexpr):
+    tdm.async_load_fused([
+        (a_desc, a_buf.index(slot), 0b00000011),
+        (b_desc, b_buf.index(slot), B_WARP_HINT),
+    ])
+    tdm.async_load(
+        bs_desc, dest=bs_buf.index(slot), warp_used_hint=0b00001111)
+    a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, 512])
+    b_desc = tdm.update_tensor_descriptor(b_desc, add_offsets=[0, 256])
+    bs_desc = tdm.update_tensor_descriptor(bs_desc, add_offsets=[0, 2048])
+    return a_desc, b_desc, bs_desc
+
+
+@gluon.jit
+def fp8_mxfp4_bk512_load_scale(
+        scale_buffer, slot, start_k: gl.constexpr, LAYOUT: gl.constexpr,
+        BLOCK_N: gl.constexpr):
+    scale_slice = scale_buffer.index(slot).reshape(
+        (BLOCK_N // 128, 4, 32, 4, 4)
+    ).permute((0, 3, 2, 1, 4)).reshape((BLOCK_N, 16))
+    return scale_slice.slice(0, BLOCK_N, 0).slice(
+        start_k, 4, 1).load(layout=LAYOUT)
+
+
+@gluon.jit
+def fp8_mxfp4_bk512_stage8_consume_and_refill(
+        a_buf, b_buf, bs_buf, slot, a_desc, b_desc, bs_desc, acc,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_B_LAYOUT: gl.constexpr, B_WARP_HINT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        WAITCNT: gl.constexpr):
+    tdm.async_wait(WAITCNT)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_bk512_stage0_load_k0", priority=0, phase_gap=2):
+        a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            0, 128, 1).load(layout=DOT_A)
+        b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            0, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        bs0 = fp8_mxfp4_bk512_load_scale(
+            bs_buf, slot, 0, SCALE_B_LAYOUT, BLOCK_N)
+        a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            128, 128, 1).load(layout=DOT_A)
+        b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            64, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        bs1 = fp8_mxfp4_bk512_load_scale(
+            bs_buf, slot, 4, SCALE_B_LAYOUT, BLOCK_N)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_bk512_stage1_bubble"):
+        pass
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_bk512_stage2_compute_k0", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a0, None, "e4m3", b0, bs0, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_bk512_stage3_compute_k1", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a1, None, "e4m3", b1, bs1, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_bk512_stage4_load_k2", priority=0):
+        a2 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            256, 128, 1).load(layout=DOT_A)
+        b2 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            128, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        bs2 = fp8_mxfp4_bk512_load_scale(
+            bs_buf, slot, 8, SCALE_B_LAYOUT, BLOCK_N)
+        a3 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            384, 128, 1).load(layout=DOT_A)
+        b3 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            192, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        bs3 = fp8_mxfp4_bk512_load_scale(
+            bs_buf, slot, 12, SCALE_B_LAYOUT, BLOCK_N)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_bk512_stage5_bubble"):
+        pass
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_bk512_stage6_compute_k2", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a2, None, "e4m3", b2, bs2, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_bk512_stage7_arrive_compute_k3", priority=1):
+        gl.amd.gfx1250.cluster.arrive()
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a3, None, "e4m3", b3, bs3, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_bk512_stage8_wait_refill", priority=0):
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc, bs_desc = fp8_mxfp4_bk512_issue_refill(
+            a_desc, b_desc, bs_desc, a_buf, b_buf, bs_buf, slot,
+            B_WARP_HINT)
+    return a_desc, b_desc, bs_desc, acc
+
+
+@gluon.jit
+def fp8_mxfp4_bk512_consume_tail(
+        a_buf, b_buf, bs_buf, slot, acc,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_B_LAYOUT: gl.constexpr, BLOCK_M: gl.constexpr,
+        BLOCK_N: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_bk512_tail_load_k0",
+                                    priority=0):
+        a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            0, 128, 1).load(layout=DOT_A)
+        b0 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            0, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        bs0 = fp8_mxfp4_bk512_load_scale(
+            bs_buf, slot, 0, SCALE_B_LAYOUT, BLOCK_N)
+        a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            128, 128, 1).load(layout=DOT_A)
+        b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            64, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        bs1 = fp8_mxfp4_bk512_load_scale(
+            bs_buf, slot, 4, SCALE_B_LAYOUT, BLOCK_N)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_bk512_tail_compute_k0",
+                                    priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a0, None, "e4m3", b0, bs0, "e2m1", acc)
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a1, None, "e4m3", b1, bs1, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_bk512_tail_load_k1",
+                                    priority=0):
+        a2 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            256, 128, 1).load(layout=DOT_A)
+        b2 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            128, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        bs2 = fp8_mxfp4_bk512_load_scale(
+            bs_buf, slot, 8, SCALE_B_LAYOUT, BLOCK_N)
+        a3 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            384, 128, 1).load(layout=DOT_A)
+        b3 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            192, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        bs3 = fp8_mxfp4_bk512_load_scale(
+            bs_buf, slot, 12, SCALE_B_LAYOUT, BLOCK_N)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_bk512_tail_compute_k1",
+                                    priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a2, None, "e4m3", b2, bs2, "e2m1", acc)
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a3, None, "e4m3", b3, bs3, "e2m1", acc)
+    return acc
+
+
+@gluon.jit
+def fp8_mxfp4_stage8_split_scale(
+        bs, SCALE_B_LAYOUT: gl.constexpr, BLOCK_N: gl.constexpr,
+        CTA_N: gl.constexpr):
+    cta_n: gl.constexpr = 256
+    half_n: gl.constexpr = 128
+    packed_n: gl.constexpr = BLOCK_N // 2
+    bs_grid = bs.reshape((CTA_N, cta_n, 4))
+    bs_lo = gl.convert_layout(gl.amd.slice(
+        bs_grid, [CTA_N, half_n, 4], [0, 0, 0]
+    ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+    bs_hi = gl.convert_layout(gl.amd.slice(
+        bs_grid, [CTA_N, half_n, 4], [0, half_n, 0]
+    ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
+    return bs_lo, bs_hi
+
+
+@gluon.jit
+def fp8_mxfp4_stage8_consume_and_refill(
+        a_buf, b_buf, bs_buf, slot, a_desc, b_desc, bs_desc,
+        acc0, acc1, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        DOT_B_LOAD: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        SCALE_B_LOAD: gl.constexpr, B_WARP_HINT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        CTA_N: gl.constexpr, WAITCNT: gl.constexpr,
+        B_LOAD_STAGE1: gl.constexpr):
+    tdm.async_wait(WAITCNT)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_stage0_load_k0", priority=0, phase_gap=2):
+        a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            0, 128, 1).load(layout=DOT_A)
+        bs0_full = fp8_mxfp4_load_scale(
+            bs_buf, slot, 0, SCALE_B_LOAD, BLOCK_N)
+        bs0, bs1 = fp8_mxfp4_stage8_split_scale(
+            bs0_full, SCALE_B_LAYOUT, BLOCK_N, CTA_N)
+        if not B_LOAD_STAGE1:
+            b0_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+                0, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+            b0, b1 = bf16_8stage_split_b(
+                b0_full, DOT_B, BLOCK_N, CTA_N)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_stage1_bubble"):
+        if B_LOAD_STAGE1:
+            b0_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+                0, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+            b0, b1 = bf16_8stage_split_b(
+                b0_full, DOT_B, BLOCK_N, CTA_N)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_stage2_compute_k0_n0", priority=1):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a0, None, "e4m3", b0, bs0, "e2m1", acc0)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_stage3_compute_k0_n1", priority=1):
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a0, None, "e4m3", b1, bs1, "e2m1", acc1)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_stage4_load_k1", priority=0):
+        a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            128, 128, 1).load(layout=DOT_A)
+        bs1_full = fp8_mxfp4_load_scale(
+            bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N)
+        bs2, bs3 = fp8_mxfp4_stage8_split_scale(
+            bs1_full, SCALE_B_LAYOUT, BLOCK_N, CTA_N)
+        if not B_LOAD_STAGE1:
+            b1_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+                64, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+            b2, b3 = bf16_8stage_split_b(
+                b1_full, DOT_B, BLOCK_N, CTA_N)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_stage5_bubble"):
+        if B_LOAD_STAGE1:
+            b1_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+                64, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+            b2, b3 = bf16_8stage_split_b(
+                b1_full, DOT_B, BLOCK_N, CTA_N)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_stage6_compute_k1_n0", priority=1):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a1, None, "e4m3", b2, bs2, "e2m1", acc0)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_stage7_arrive_compute_k1_n1", priority=1):
+        gl.amd.gfx1250.cluster.arrive()
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a1, None, "e4m3", b3, bs3, "e2m1", acc1)
+    with gl.amd.warp_pipeline_stage(
+            "fp8mxfp4_stage8_wait_refill", priority=0):
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc = fp8_mxfp4_issue_leading4_data(
+            a_desc, b_desc, a_buf, b_buf, slot, B_WARP_HINT)
+        bs_desc = fp8_mxfp4_issue_leading4_scale(
+            bs_desc, bs_buf, slot)
+    return a_desc, b_desc, bs_desc, acc0, acc1
+
+
+@gluon.jit
+def fp8_mxfp4_stage8_consume_tail(
+        a_buf, b_buf, bs_buf, slot, acc0, acc1,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        DOT_B_LOAD: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        SCALE_B_LOAD: gl.constexpr, BLOCK_M: gl.constexpr,
+        BLOCK_N: gl.constexpr, CTA_N: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_tail_load_k0", priority=0):
+        a0 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            0, 128, 1).load(layout=DOT_A)
+        b0_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            0, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+        bs0_full = fp8_mxfp4_load_scale(
+            bs_buf, slot, 0, SCALE_B_LOAD, BLOCK_N)
+        b0, b1 = bf16_8stage_split_b(
+            b0_full, DOT_B, BLOCK_N, CTA_N)
+        bs0, bs1 = fp8_mxfp4_stage8_split_scale(
+            bs0_full, SCALE_B_LAYOUT, BLOCK_N, CTA_N)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_tail_compute_k0", priority=1):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a0, None, "e4m3", b0, bs0, "e2m1", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a0, None, "e4m3", b1, bs1, "e2m1", acc1)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_tail_load_k1", priority=0):
+        a1 = a_buf.index(slot).slice(0, BLOCK_M, 0).slice(
+            128, 128, 1).load(layout=DOT_A)
+        b1_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            64, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+        bs1_full = fp8_mxfp4_load_scale(
+            bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N)
+        b2, b3 = bf16_8stage_split_b(
+            b1_full, DOT_B, BLOCK_N, CTA_N)
+        bs2, bs3 = fp8_mxfp4_stage8_split_scale(
+            bs1_full, SCALE_B_LAYOUT, BLOCK_N, CTA_N)
+    with gl.amd.warp_pipeline_stage("fp8mxfp4_tail_compute_k1", priority=1):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a1, None, "e4m3", b2, bs2, "e2m1", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a1, None, "e4m3", b3, bs3, "e2m1", acc1)
+    return acc0, acc1
+
+
+@gluon.jit
 def fp8_mxfp4_cluster_gemm_gfx1250(
         a_ptr, b_ptr, c_ptr, b_scale_ptr, M, N, K,
         stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
@@ -2970,6 +3719,175 @@ def fp8_mxfp4_cluster_gemm_gfx1250(
         WMMA_LAYOUT, BLOCK_M, BLOCK_N, CTA_N)
 
 
+@gluon.jit
+def fp8_mxfp4_bk512_stage8_gfx1250(
+        a_ptr, b_ptr, c_ptr, b_scale_ptr, M, N, K,
+        stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        stride_scale, GRID_MN: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
+        SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr,
+        REUSE_A: gl.constexpr, GROUP_SIZE: gl.constexpr,
+        WAITCNT: gl.constexpr):
+    gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
+    if REUSE_A:
+        pid_m, pid_n = snapshot_get_xcd_swizzled_pids_reuse_a(
+            M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, GROUP_SIZE)
+    else:
+        pid_m, pid_n = snapshot_get_xcd_swizzled_pids(
+            M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, GROUP_SIZE)
+    wmma_packed: gl.constexpr = gl.amd.AMDWMMALayout(
+        3, WMMA_LAYOUT.transposed, WMMA_LAYOUT.warp_bases,
+        WMMA_LAYOUT.reg_bases, [16, 16, 64], WMMA_LAYOUT.cga_layout)
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma_packed, 16)
+    scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_b, [BLOCK_N, 4])
+    b_warp_hint: gl.constexpr = 0b00001100
+    a_buf = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [2, BLOCK_M, 512], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [2, BLOCK_N, 256], SHARED_LAYOUT_B)
+    bs_buf = gl.allocate_shared_memory(
+        b_scale_ptr.type.element_ty,
+        [2, BLOCK_N // 128, 2048], SHARED_SCALE_B)
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * BLOCK_M * stride_am, shape=(M, K),
+        strides=(stride_am, stride_ak), block_shape=(BLOCK_M, 512),
+        layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(
+        base=b_ptr + pid_n * BLOCK_N * stride_bn, shape=(N, K // 2),
+        strides=(stride_bn, stride_bk), block_shape=(BLOCK_N, 256),
+        layout=SHARED_LAYOUT_B)
+    bs_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + (pid_n * BLOCK_N) // 128 * stride_scale,
+        shape=(N // 128, K // 32 * 128), strides=(stride_scale, 1),
+        block_shape=(BLOCK_N // 128, 2048), layout=SHARED_SCALE_B)
+    for prefetch_idx in gl.static_range(2):
+        a_desc, b_desc, bs_desc = fp8_mxfp4_bk512_issue_refill(
+            a_desc, b_desc, bs_desc, a_buf, b_buf, bs_buf,
+            prefetch_idx, b_warp_hint)
+    acc = gl.zeros(
+        (BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, 512)
+    gl.assume(iter_max >= 3)
+    for tile_idx in range(0, iter_max - 2):
+        slot = tile_idx % 2
+        a_desc, b_desc, bs_desc, acc = (
+            fp8_mxfp4_bk512_stage8_consume_and_refill(
+                a_buf, b_buf, bs_buf, slot, a_desc, b_desc, bs_desc, acc,
+                dot_a, dot_b, scale_b_layout, b_warp_hint,
+                BLOCK_M, BLOCK_N, WAITCNT))
+    tdm.async_wait(WAITCNT)
+    penultimate_slot = (iter_max - 2) % 2
+    acc = fp8_mxfp4_bk512_consume_tail(
+        a_buf, b_buf, bs_buf, penultimate_slot, acc,
+        dot_a, dot_b, scale_b_layout, BLOCK_M, BLOCK_N)
+    tdm.async_wait(0)
+    last_slot = (iter_max - 1) % 2
+    acc = fp8_mxfp4_bk512_consume_tail(
+        a_buf, b_buf, bs_buf, last_slot, acc,
+        dot_a, dot_b, scale_b_layout, BLOCK_M, BLOCK_N)
+    snapshot_cluster_wait()
+    a_buf._keep_alive()
+    b_buf._keep_alive()
+    bs_buf._keep_alive()
+    snapshot_tdm_store_full_tile(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+        WMMA_LAYOUT, BLOCK_M, BLOCK_N, CTA_N)
+
+
+@gluon.jit
+def fp8_mxfp4_stage8_gfx1250(
+        a_ptr, b_ptr, c_ptr, b_scale_ptr, M, N, K,
+        stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        stride_scale, GRID_MN: gl.constexpr,
+        SHARED_LAYOUT_A: gl.constexpr, SHARED_LAYOUT_B: gl.constexpr,
+        SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr,
+        LOAD_WMMA_LAYOUT: gl.constexpr, OUTPUT_CGA_LAYOUT: gl.constexpr,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        CTA_M: gl.constexpr, CTA_N: gl.constexpr,
+        REUSE_A: gl.constexpr, GROUP_SIZE: gl.constexpr,
+        WAITCNT: gl.constexpr, B_LOAD_STAGE1: gl.constexpr):
+    gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
+    if REUSE_A:
+        pid_m, pid_n = snapshot_get_xcd_swizzled_pids_reuse_a(
+            M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, GROUP_SIZE)
+    else:
+        pid_m, pid_n = snapshot_get_xcd_swizzled_pids(
+            M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, GROUP_SIZE)
+    wmma_packed: gl.constexpr = gl.amd.AMDWMMALayout(
+        3, WMMA_LAYOUT.transposed, WMMA_LAYOUT.warp_bases,
+        WMMA_LAYOUT.reg_bases, [16, 16, 64], WMMA_LAYOUT.cga_layout)
+    load_wmma_packed: gl.constexpr = gl.amd.AMDWMMALayout(
+        3, LOAD_WMMA_LAYOUT.transposed, LOAD_WMMA_LAYOUT.warp_bases,
+        LOAD_WMMA_LAYOUT.reg_bases, [16, 16, 64],
+        LOAD_WMMA_LAYOUT.cga_layout)
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma_packed, 16)
+    dot_b_load: gl.constexpr = gl.DotOperandLayout(
+        1, load_wmma_packed, 16)
+    scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_b, [BLOCK_N // 2, 4])
+    scale_b_load: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_b_load, [BLOCK_N, 4])
+    b_warp_hint: gl.constexpr = 0b00001100
+    slots: gl.constexpr = 3
+    a_buf = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [slots, BLOCK_M, 256], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [slots, BLOCK_N, 128], SHARED_LAYOUT_B)
+    bs_buf = gl.allocate_shared_memory(
+        b_scale_ptr.type.element_ty,
+        [slots, BLOCK_N // 128, 1024], SHARED_SCALE_B)
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * BLOCK_M * stride_am, shape=(M, K),
+        strides=(stride_am, stride_ak), block_shape=(BLOCK_M, 256),
+        layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(
+        base=b_ptr + pid_n * BLOCK_N * stride_bn, shape=(N, K // 2),
+        strides=(stride_bn, stride_bk), block_shape=(BLOCK_N, 128),
+        layout=SHARED_LAYOUT_B)
+    bs_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + (pid_n * BLOCK_N) // 128 * stride_scale,
+        shape=(N // 128, K // 32 * 128), strides=(stride_scale, 1),
+        block_shape=(BLOCK_N // 128, 1024), layout=SHARED_SCALE_B)
+    for prefetch_idx in gl.static_range(slots):
+        a_desc, b_desc = fp8_mxfp4_issue_leading4_data(
+            a_desc, b_desc, a_buf, b_buf, prefetch_idx, b_warp_hint)
+        bs_desc = fp8_mxfp4_issue_leading4_scale(
+            bs_desc, bs_buf, prefetch_idx)
+    acc0 = gl.zeros(
+        (BLOCK_M, BLOCK_N // 2), dtype=gl.float32, layout=WMMA_LAYOUT)
+    acc1 = gl.zeros(
+        (BLOCK_M, BLOCK_N // 2), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, 256)
+    gl.assume(iter_max >= slots + 1)
+    for tile_idx in range(0, iter_max - slots):
+        slot = tile_idx % slots
+        a_desc, b_desc, bs_desc, acc0, acc1 = (
+            fp8_mxfp4_stage8_consume_and_refill(
+                a_buf, b_buf, bs_buf, slot, a_desc, b_desc, bs_desc,
+                acc0, acc1, dot_a, dot_b, dot_b_load, scale_b_layout,
+                scale_b_load, b_warp_hint, BLOCK_M, BLOCK_N, CTA_N,
+                WAITCNT, B_LOAD_STAGE1))
+    for drain_idx in gl.static_range(slots):
+        tdm.async_wait(2 * (slots - 1 - drain_idx))
+        slot = (iter_max - slots + drain_idx) % slots
+        acc0, acc1 = fp8_mxfp4_stage8_consume_tail(
+            a_buf, b_buf, bs_buf, slot, acc0, acc1,
+            dot_a, dot_b, dot_b_load, scale_b_layout, scale_b_load,
+            BLOCK_M, BLOCK_N, CTA_N)
+    snapshot_cluster_wait()
+    a_buf._keep_alive()
+    b_buf._keep_alive()
+    bs_buf._keep_alive()
+    mxfp8_tdm_store_split_n2(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc0, acc1,
+        OUTPUT_CGA_LAYOUT, CTA_M, CTA_N)
+
+
 def build_fp8_mxfp4_layouts(cluster_width=4):
     """Build mixed-format layouts for a square CTA cluster.
 
@@ -3009,6 +3927,86 @@ def build_fp8_mxfp4_layouts(cluster_width=4):
     shared_bs = gl.PaddedSharedLayout.with_identity_for(
         [[256, 8]], [block_n // 128, 1024], [1, 0], cga_b)
     return shared_a, shared_b, shared_bs, wmma
+
+
+def build_fp8_mxfp4_bk512_layouts(cluster_width=4):
+    """Build two-slot mixed-format layouts for a logical BK512 tile."""
+    block_m = 256 * cluster_width
+    block_n = 256 * cluster_width
+    cga = make_cga_layout(
+        [cluster_width, cluster_width], [cluster_width, cluster_width],
+        [0, 1])
+    local_a = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]], [block_m, 512], [1, 0])
+    local_b = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]], [block_n, 256], [1, 0])
+    _, _, local_wmma = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        block_m, block_n, local_a, local_b, 8, [16, 16, 128],
+        a_transposed=False, b_transposed=True, slice_m=256, slice_n=256)
+    wmma = gl.amd.AMDWMMALayout(
+        3, local_wmma.transposed, local_wmma.warp_bases,
+        local_wmma.reg_bases, local_wmma.instr_shape, cga)
+    wmma_packed = gl.amd.AMDWMMALayout(
+        3, wmma.transposed, wmma.warp_bases, wmma.reg_bases,
+        [16, 16, 64], cga)
+    dot_a = gl.DotOperandLayout(0, wmma, 16)
+    dot_b = gl.DotOperandLayout(1, wmma_packed, 16)
+    cga_a = dot_a.cga_layout
+    cga_b = tuple(tuple([basis[1], basis[0]])
+                  for basis in dot_b.cga_layout)
+    padded_a = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]], [block_m, 512], [1, 0], cga_a)
+    padded_b = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]], [block_n, 256], [1, 0], cga_b)
+    shared_a, shared_b, _ = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        256, 256, padded_a, padded_b, 8, [16, 16, 128],
+        a_transposed=False, b_transposed=True, slice_m=256, slice_n=256)
+    shared_bs = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 8]], [block_n // 128, 2048], [1, 0], cga_b)
+    return shared_a, shared_b, shared_bs, wmma
+
+
+def build_fp8_mxfp4_stage8_layouts(cluster_width=4):
+    """Build retained mixed-format LDS layouts with half-N accumulators."""
+    block_m = 256 * cluster_width
+    block_n = 256 * cluster_width
+    packed_n = 128 * cluster_width
+    cga = make_cga_layout(
+        [cluster_width, cluster_width], [cluster_width, cluster_width],
+        [0, 1])
+    output_cga = tuple(tuple(basis) + (0, 0) for basis in cga)
+    local_a = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]], [block_m, 256], [1, 0])
+    local_b = gl.PaddedSharedLayout.with_identity_for(
+        [[128, 16]], [packed_n, 128], [1, 0])
+    _, _, local_wmma = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        block_m, packed_n, local_a, local_b, 8, [16, 16, 128],
+        a_transposed=False, b_transposed=True, slice_m=256, slice_n=128)
+    wmma = gl.amd.AMDWMMALayout(
+        3, local_wmma.transposed, local_wmma.warp_bases,
+        local_wmma.reg_bases, local_wmma.instr_shape, cga)
+    load_wmma = gl.amd.AMDWMMALayout(
+        3, local_wmma.transposed, local_wmma.warp_bases,
+        tuple(local_wmma.reg_bases) + ((0, 8),),
+        local_wmma.instr_shape, cga)
+    load_wmma_packed = gl.amd.AMDWMMALayout(
+        3, load_wmma.transposed, load_wmma.warp_bases,
+        load_wmma.reg_bases, [16, 16, 64], cga)
+    dot_a = gl.DotOperandLayout(0, load_wmma, 16)
+    dot_b = gl.DotOperandLayout(1, load_wmma_packed, 16)
+    cga_a = dot_a.cga_layout
+    cga_b = tuple(tuple([basis[1], basis[0]])
+                  for basis in dot_b.cga_layout)
+    padded_a = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]], [block_m, 256], [1, 0], cga_a)
+    padded_b = gl.PaddedSharedLayout.with_identity_for(
+        [[128, 16]], [block_n, 128], [1, 0], cga_b)
+    shared_a, shared_b, _ = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        256, 256, padded_a, padded_b, 8, [16, 16, 128],
+        a_transposed=False, b_transposed=True, slice_m=256, slice_n=256)
+    shared_bs = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 8]], [block_n // 128, 1024], [1, 0], cga_b)
+    return shared_a, shared_b, shared_bs, wmma, load_wmma, output_cga
 
 
 # ---------------------------------------------------------------------------
@@ -3125,6 +4123,236 @@ def mxfp4_consume_and_refill(
 
 
 @gluon.jit
+def mxfp4_load_k256_split_n(
+        a_buf, b_buf, as_buf, bs_buf, slot,
+        START_K_PACKED: gl.constexpr, START_SCALE_K: gl.constexpr,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        DOT_B_LOAD: gl.constexpr, SCALE_A_LAYOUT: gl.constexpr,
+        SCALE_B_LAYOUT: gl.constexpr, SCALE_B_LOAD: gl.constexpr,
+        CTA_N: gl.constexpr):
+    cta_n: gl.constexpr = 256
+    half_n: gl.constexpr = 128
+    packed_n: gl.constexpr = 512
+    a0 = a_buf.index(slot).slice(0, 1024, 0).slice(
+        START_K_PACKED, 64, 1).load(layout=DOT_A)
+    as0 = mxfp4_load_scale(
+        as_buf, slot, START_SCALE_K, SCALE_A_LAYOUT)
+    b_view = b_buf.index(slot).reshape((CTA_N, cta_n, 256))
+    b0_lo = b_view.slice(0, half_n, 1).slice(
+        START_K_PACKED, 64, 2).permute([2, 0, 1]).reshape(
+            (64, packed_n)).load(layout=DOT_B)
+    b0_hi = b_view.slice(half_n, half_n, 1).slice(
+        START_K_PACKED, 64, 2).permute([2, 0, 1]).reshape(
+            (64, packed_n)).load(layout=DOT_B)
+    bs_view = bs_buf.index(slot).reshape(
+        (8, 4, 32, 4, 4)).permute(
+            (0, 3, 2, 1, 4)).reshape(
+                (1024, 16)).reshape((CTA_N, cta_n, 16))
+    bs0_lo = bs_view.slice(0, half_n, 1).slice(
+        START_SCALE_K, 4, 2).reshape(
+            (packed_n, 4)).load(layout=SCALE_B_LAYOUT)
+    bs0_hi = bs_view.slice(half_n, half_n, 1).slice(
+        START_SCALE_K, 4, 2).reshape(
+            (packed_n, 4)).load(layout=SCALE_B_LAYOUT)
+
+    a1 = a_buf.index(slot).slice(0, 1024, 0).slice(
+        START_K_PACKED + 64, 64, 1).load(layout=DOT_A)
+    as1 = mxfp4_load_scale(
+        as_buf, slot, START_SCALE_K + 4, SCALE_A_LAYOUT)
+    b1_lo = b_view.slice(0, half_n, 1).slice(
+        START_K_PACKED + 64, 64, 2).permute([2, 0, 1]).reshape(
+            (64, packed_n)).load(layout=DOT_B)
+    b1_hi = b_view.slice(half_n, half_n, 1).slice(
+        START_K_PACKED + 64, 64, 2).permute([2, 0, 1]).reshape(
+            (64, packed_n)).load(layout=DOT_B)
+    bs1_lo = bs_view.slice(0, half_n, 1).slice(
+        START_SCALE_K + 4, 4, 2).reshape(
+            (packed_n, 4)).load(layout=SCALE_B_LAYOUT)
+    bs1_hi = bs_view.slice(half_n, half_n, 1).slice(
+        START_SCALE_K + 4, 4, 2).reshape(
+            (packed_n, 4)).load(layout=SCALE_B_LAYOUT)
+    return (a0, as0, b0_lo, bs0_lo, b0_hi, bs0_hi,
+            a1, as1, b1_lo, bs1_lo, b1_hi, bs1_hi)
+
+
+@gluon.jit
+def mxfp4_stage8_consume_and_refill(
+        a_buf, b_buf, as_buf, bs_buf, slot, a_desc, b_desc, as_desc,
+        bs_desc, acc0, acc1, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        DOT_B_LOAD: gl.constexpr, SCALE_A_LAYOUT: gl.constexpr,
+        SCALE_B_LAYOUT: gl.constexpr, SCALE_B_LOAD: gl.constexpr,
+        CTA_N: gl.constexpr, WAITCNT: gl.constexpr):
+    tdm.async_wait(WAITCNT)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage0_load_k0", priority=0, phase_gap=2):
+        (a0, as0, b0_lo, bs0_lo, b0_hi, bs0_hi,
+         a1, as1, b1_lo, bs1_lo, b1_hi, bs1_hi) = (
+            mxfp4_load_k256_split_n(
+                a_buf, b_buf, as_buf, bs_buf, slot, 0, 0, DOT_A, DOT_B,
+                DOT_B_LOAD, SCALE_A_LAYOUT, SCALE_B_LAYOUT, SCALE_B_LOAD,
+                CTA_N))
+    with gl.amd.warp_pipeline_stage("mxfp4_stage1_bubble"):
+        pass
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage2_compute_k0_n0", priority=1):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e2m1", b0_lo, bs0_lo, "e2m1", acc0)
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e2m1", b1_lo, bs1_lo, "e2m1", acc0)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage3_compute_k0_n1", priority=1):
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e2m1", b0_hi, bs0_hi, "e2m1", acc1)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e2m1", b1_hi, bs1_hi, "e2m1", acc1)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage4_load_k1", priority=0):
+        (a2, as2, b2_lo, bs2_lo, b2_hi, bs2_hi,
+         a3, as3, b3_lo, bs3_lo, b3_hi, bs3_hi) = (
+            mxfp4_load_k256_split_n(
+                a_buf, b_buf, as_buf, bs_buf, slot, 128, 8, DOT_A, DOT_B,
+                DOT_B_LOAD, SCALE_A_LAYOUT, SCALE_B_LAYOUT, SCALE_B_LOAD,
+                CTA_N))
+    with gl.amd.warp_pipeline_stage("mxfp4_stage5_bubble"):
+        pass
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage6_compute_k1_n0", priority=1):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a2, as2, "e2m1", b2_lo, bs2_lo, "e2m1", acc0)
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a3, as3, "e2m1", b3_lo, bs3_lo, "e2m1", acc0)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage7_arrive_compute_k1_n1", priority=1):
+        gl.amd.gfx1250.cluster.arrive()
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a2, as2, "e2m1", b2_hi, bs2_hi, "e2m1", acc1)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a3, as3, "e2m1", b3_hi, bs3_hi, "e2m1", acc1)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage8_wait_refill", priority=0):
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc, as_desc, bs_desc = mxfp4_issue_refill(
+            a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, slot)
+    return a_desc, b_desc, as_desc, bs_desc, acc0, acc1
+
+
+@gluon.jit
+def mxfp4_stage8_consume_tail(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc0, acc1,
+        DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        DOT_B_LOAD: gl.constexpr, SCALE_A_LAYOUT: gl.constexpr,
+        SCALE_B_LAYOUT: gl.constexpr, SCALE_B_LOAD: gl.constexpr,
+        CTA_N: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("mxfp4_tail_load_k0", priority=0):
+        values0 = mxfp4_load_k256_split_n(
+            a_buf, b_buf, as_buf, bs_buf, slot, 0, 0, DOT_A, DOT_B,
+            DOT_B_LOAD, SCALE_A_LAYOUT, SCALE_B_LAYOUT, SCALE_B_LOAD, CTA_N)
+    with gl.amd.warp_pipeline_stage("mxfp4_tail_compute_k0", priority=1):
+        (a0, as0, b0_lo, bs0_lo, b0_hi, bs0_hi,
+         a1, as1, b1_lo, bs1_lo, b1_hi, bs1_hi) = values0
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e2m1", b0_lo, bs0_lo, "e2m1", acc0)
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e2m1", b1_lo, bs1_lo, "e2m1", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e2m1", b0_hi, bs0_hi, "e2m1", acc1)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e2m1", b1_hi, bs1_hi, "e2m1", acc1)
+    with gl.amd.warp_pipeline_stage("mxfp4_tail_load_k1", priority=0):
+        values1 = mxfp4_load_k256_split_n(
+            a_buf, b_buf, as_buf, bs_buf, slot, 128, 8, DOT_A, DOT_B,
+            DOT_B_LOAD, SCALE_A_LAYOUT, SCALE_B_LAYOUT, SCALE_B_LOAD, CTA_N)
+    with gl.amd.warp_pipeline_stage("mxfp4_tail_compute_k1", priority=1):
+        (a2, as2, b2_lo, bs2_lo, b2_hi, bs2_hi,
+         a3, as3, b3_lo, bs3_lo, b3_hi, bs3_hi) = values1
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a2, as2, "e2m1", b2_lo, bs2_lo, "e2m1", acc0)
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a3, as3, "e2m1", b3_lo, bs3_lo, "e2m1", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a2, as2, "e2m1", b2_hi, bs2_hi, "e2m1", acc1)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a3, as3, "e2m1", b3_hi, bs3_hi, "e2m1", acc1)
+    return acc0, acc1
+
+
+@gluon.jit
+def mxfp4_stage8_k_split_consume_and_refill(
+        a_buf, b_buf, as_buf, bs_buf, slot, a_desc, b_desc, as_desc,
+        bs_desc, acc, DOT_A: gl.constexpr, DOT_B: gl.constexpr,
+        SCALE_A_LAYOUT: gl.constexpr, SCALE_B_LAYOUT: gl.constexpr,
+        WAITCNT: gl.constexpr, B_LOAD_STAGE1: gl.constexpr):
+    tdm.async_wait(WAITCNT)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage0_load_k0", priority=0, phase_gap=2):
+        a0 = a_buf.index(slot).slice(0, 1024, 0).slice(
+            0, 64, 1).load(layout=DOT_A)
+        as0 = mxfp4_load_scale(as_buf, slot, 0, SCALE_A_LAYOUT)
+        bs0 = mxfp4_load_scale(bs_buf, slot, 0, SCALE_B_LAYOUT)
+        a1 = a_buf.index(slot).slice(0, 1024, 0).slice(
+            64, 64, 1).load(layout=DOT_A)
+        as1 = mxfp4_load_scale(as_buf, slot, 4, SCALE_A_LAYOUT)
+        bs1 = mxfp4_load_scale(bs_buf, slot, 4, SCALE_B_LAYOUT)
+        if not B_LOAD_STAGE1:
+            b0 = b_buf.index(slot).slice(0, 1024, 0).slice(
+                0, 64, 1).permute([1, 0]).load(layout=DOT_B)
+            b1 = b_buf.index(slot).slice(0, 1024, 0).slice(
+                64, 64, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage("mxfp4_stage1_bubble"):
+        if B_LOAD_STAGE1:
+            b0 = b_buf.index(slot).slice(0, 1024, 0).slice(
+                0, 64, 1).permute([1, 0]).load(layout=DOT_B)
+            b1 = b_buf.index(slot).slice(0, 1024, 0).slice(
+                64, 64, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage2_compute_k0", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e2m1", b0, bs0, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage3_compute_k1", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e2m1", b1, bs1, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage4_load_k2", priority=0):
+        a2 = a_buf.index(slot).slice(0, 1024, 0).slice(
+            128, 64, 1).load(layout=DOT_A)
+        as2 = mxfp4_load_scale(as_buf, slot, 8, SCALE_A_LAYOUT)
+        bs2 = mxfp4_load_scale(bs_buf, slot, 8, SCALE_B_LAYOUT)
+        a3 = a_buf.index(slot).slice(0, 1024, 0).slice(
+            192, 64, 1).load(layout=DOT_A)
+        as3 = mxfp4_load_scale(as_buf, slot, 12, SCALE_A_LAYOUT)
+        bs3 = mxfp4_load_scale(bs_buf, slot, 12, SCALE_B_LAYOUT)
+        if not B_LOAD_STAGE1:
+            b2 = b_buf.index(slot).slice(0, 1024, 0).slice(
+                128, 64, 1).permute([1, 0]).load(layout=DOT_B)
+            b3 = b_buf.index(slot).slice(0, 1024, 0).slice(
+                192, 64, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage("mxfp4_stage5_bubble"):
+        if B_LOAD_STAGE1:
+            b2 = b_buf.index(slot).slice(0, 1024, 0).slice(
+                128, 64, 1).permute([1, 0]).load(layout=DOT_B)
+            b3 = b_buf.index(slot).slice(0, 1024, 0).slice(
+                192, 64, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage6_compute_k2", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a2, as2, "e2m1", b2, bs2, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage7_arrive_compute_k3", priority=1):
+        gl.amd.gfx1250.cluster.arrive()
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a3, as3, "e2m1", b3, bs3, "e2m1", acc)
+    with gl.amd.warp_pipeline_stage(
+            "mxfp4_stage8_wait_refill", priority=0):
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc, as_desc, bs_desc = mxfp4_issue_refill(
+            a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, slot)
+    return a_desc, b_desc, as_desc, bs_desc, acc
+
+
+@gluon.jit
 def mxfp4_bk512_warp_pipeline_gfx1250(
         a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
         stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
@@ -3213,6 +4441,84 @@ def mxfp4_bk512_warp_pipeline_gfx1250(
         WMMA_LAYOUT, 1024, 1024, 4)
 
 
+@gluon.jit
+def mxfp4_bk512_stage8_gfx1250(
+        a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, M, N, K,
+        stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+        stride_scale, GRID_MN: gl.constexpr, SHARED_LAYOUT_A: gl.constexpr,
+        SHARED_LAYOUT_B: gl.constexpr, SHARED_SCALE_A: gl.constexpr,
+        SHARED_SCALE_B: gl.constexpr, WMMA_LAYOUT: gl.constexpr,
+        WAITCNT: gl.constexpr, B_LOAD_STAGE1: gl.constexpr):
+    gl.static_assert(gl.num_ctas() == 16)
+    pid_m, pid_n = snapshot_get_xcd_swizzled_pids(
+        M, N, 1024, 1024, GRID_MN, 8, 4)
+    wmma_packed: gl.constexpr = gl.amd.AMDWMMALayout(
+        3, WMMA_LAYOUT.transposed, WMMA_LAYOUT.warp_bases,
+        WMMA_LAYOUT.reg_bases, [32, 16, 64], WMMA_LAYOUT.cga_layout)
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma_packed, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, wmma_packed, 16)
+    scale_a_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_a, [1024, 4])
+    scale_b_layout: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+        dot_b, [1024, 4])
+    a_buf = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [2, 1024, 256], SHARED_LAYOUT_A)
+    b_buf = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [2, 1024, 256], SHARED_LAYOUT_B)
+    as_buf = gl.allocate_shared_memory(
+        a_scale_ptr.type.element_ty, [2, 8, 2048], SHARED_SCALE_A)
+    bs_buf = gl.allocate_shared_memory(
+        b_scale_ptr.type.element_ty, [2, 8, 2048], SHARED_SCALE_B)
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * 1024 * stride_am, shape=(M, K // 2),
+        strides=(stride_am, stride_ak), block_shape=(1024, 256),
+        layout=SHARED_LAYOUT_A)
+    b_desc = tdm.make_tensor_descriptor(
+        base=b_ptr + pid_n * 1024 * stride_bn, shape=(N, K // 2),
+        strides=(stride_bn, stride_bk), block_shape=(1024, 256),
+        layout=SHARED_LAYOUT_B)
+    as_desc = tdm.make_tensor_descriptor(
+        base=a_scale_ptr + (pid_m * 1024) // 128 * stride_scale,
+        shape=(M // 128, K // 32 * 128), strides=(stride_scale, 1),
+        block_shape=(8, 2048), layout=SHARED_SCALE_A)
+    bs_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + (pid_n * 1024) // 128 * stride_scale,
+        shape=(N // 128, K // 32 * 128), strides=(stride_scale, 1),
+        block_shape=(8, 2048), layout=SHARED_SCALE_B)
+    for prefetch_idx in gl.static_range(2):
+        a_desc, b_desc, as_desc, bs_desc = mxfp4_issue_refill(
+            a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, prefetch_idx)
+    acc = gl.zeros((1024, 1024), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, 512)
+    gl.assume(iter_max >= 3)
+    for tile_idx in range(0, iter_max - 2):
+        slot = tile_idx % 2
+        a_desc, b_desc, as_desc, bs_desc, acc = (
+            mxfp4_stage8_k_split_consume_and_refill(
+                a_buf, b_buf, as_buf, bs_buf, slot,
+                a_desc, b_desc, as_desc, bs_desc, acc, dot_a, dot_b,
+                scale_a_layout, scale_b_layout, WAITCNT, B_LOAD_STAGE1))
+    tdm.async_wait(WAITCNT)
+    penultimate_slot = (iter_max - 2) % 2
+    acc = mxfp4_consume_tile(
+        a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc, dot_a, dot_b,
+        scale_a_layout, scale_b_layout)
+    tdm.async_wait(0)
+    last_slot = (iter_max - 1) % 2
+    acc = mxfp4_consume_tile(
+        a_buf, b_buf, as_buf, bs_buf, last_slot, acc, dot_a, dot_b,
+        scale_a_layout, scale_b_layout)
+    snapshot_cluster_wait()
+    a_buf._keep_alive()
+    b_buf._keep_alive()
+    as_buf._keep_alive()
+    bs_buf._keep_alive()
+    snapshot_tdm_store_full_tile(
+        c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+        WMMA_LAYOUT, 1024, 1024, 4)
+
+
 def build_mxfp4_layouts():
     """Build packed-data and scale layouts for the BK512 MXFP4 kernel.
 
@@ -3247,6 +4553,26 @@ def build_mxfp4_layouts():
     shared_bs = gl.PaddedSharedLayout.with_identity_for(
         [[256, 8]], [8, 2048], [1, 0], cga_b)
     return shared_a, shared_b, shared_as, shared_bs, wmma
+
+
+def build_mxfp4_stage8_layouts():
+    """Build retained MXFP4 LDS layouts with 128-column CTA accumulators."""
+    shared_a, shared_b, shared_as, shared_bs, load_wmma = (
+        build_mxfp4_layouts())
+    cga = make_cga_layout([4, 4], [4, 4], [0, 1])
+    output_cga = tuple(tuple(basis) + (0, 0) for basis in cga)
+    local_a = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]], [1024, 256], [1, 0])
+    local_b = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]], [512, 256], [1, 0])
+    _, _, local_wmma = gl.amd.gfx1250.make_partitioned_dot_layouts(
+        1024, 512, local_a, local_b, 8, [32, 16, 128],
+        a_transposed=False, b_transposed=True, slice_m=256, slice_n=128)
+    wmma = gl.amd.AMDWMMALayout(
+        3, local_wmma.transposed, local_wmma.warp_bases,
+        local_wmma.reg_bases, local_wmma.instr_shape, cga)
+    return (shared_a, shared_b, shared_as, shared_bs, wmma, load_wmma,
+            output_cga)
 
 
 # ---------------------------------------------------------------------------
@@ -3291,12 +4617,13 @@ def pack_scale(scale, scale_kwidth):
 
 
 def make_bf16_case(
-        args, eight_stage=False, pid_map=None, l2_prefetch_distance=None):
+        args, eight_stage=False, nine_stage=False, pid_map=None,
+        l2_prefetch_distance=None):
     """Build BF16 launch/check closures while keeping their GPU tensors alive."""
     if l2_prefetch_distance is not None:
         required_m = 256 * args.bf16_l2_prefetch_cluster_shape[0]
         required_n = 256 * args.bf16_l2_prefetch_cluster_shape[1]
-    elif not eight_stage and pid_map is None:
+    elif not eight_stage and not nine_stage and pid_map is None:
         required_m = 256 * args.bf16_cluster_shape[0]
         required_n = 256 * args.bf16_cluster_shape[1]
     else:
@@ -3345,7 +4672,7 @@ def make_bf16_case(
         grid = (
             triton.cdiv(args.M, block_m)
             * triton.cdiv(args.N, block_n), 1)
-    elif not eight_stage and pid_map is None:
+    elif not eight_stage and not nine_stage and pid_map is None:
         cluster_m, cluster_n = args.bf16_cluster_shape
         block_m = 256 * cluster_m
         block_n = 256 * cluster_n
@@ -3357,7 +4684,7 @@ def make_bf16_case(
         cluster_m = cluster_n = 4
         block_m = block_n = 1024
         layouts = (
-            build_bf16_8stage_layouts() if eight_stage
+            build_bf16_8stage_layouts() if (eight_stage or nine_stage)
             else build_bf16_layouts())
         grid = (triton.cdiv(args.M, 1024) * triton.cdiv(args.N, 1024), 1)
 
@@ -3382,6 +4709,17 @@ def make_bf16_case(
                 c.stride(0), c.stride(1), GRID_MN=grid[0],
                 SHARED_LAYOUT_A=shared_a, SHARED_LAYOUT_B=shared_b,
                 WMMA_LAYOUT=wmma, PID_MAP=pid_map,
+                num_warps=8, waves_per_eu=2, num_ctas=16)
+        if nine_stage:
+            shared_a, shared_b, wmma, load_wmma, output_cga = layouts
+            return bf16_bk128_9stage_cluster_4x4_gfx1250[grid](
+                a, b, c, args.M, args.N, args.K,
+                a.stride(0), a.stride(1), b.stride(1), b.stride(0),
+                c.stride(0), c.stride(1), GRID_MN=grid[0],
+                SHARED_LAYOUT_A=shared_a, SHARED_LAYOUT_B=shared_b,
+                WMMA_LAYOUT=wmma, LOAD_WMMA_LAYOUT=load_wmma,
+                OUTPUT_CGA_LAYOUT=output_cga,
+                WAITCNT=args.bf16_9stage_waitcnt,
                 num_warps=8, waves_per_eu=2, num_ctas=16)
         if eight_stage:
             shared_a, shared_b, wmma, load_wmma, output_cga = layouts
@@ -3420,6 +4758,10 @@ def make_bf16_8stage_case(args):
     return make_bf16_case(args, eight_stage=True)
 
 
+def make_bf16_9stage_case(args):
+    return make_bf16_case(args, nine_stage=True)
+
+
 def make_bf16_l2prefetch_case(args):
     return make_bf16_case(
         args, l2_prefetch_distance=args.bf16_l2_prefetch_distance)
@@ -3432,6 +4774,10 @@ def make_bf16_pidmap_case(args):
 
 def make_mxfp8_case(
         args, block_k=256, cta_tile=256, experimental_bk256=False,
+        stage8_refill=False, two_tdm=False, bscale_contiguous=False,
+        ascale_combined=False, desc_update_stage5=False,
+        scale_load_stage1=False, b_load_stage1=False, wait0_merged=False,
+        wait0_merged_unroll4=False,
         single_cta_skinny=False, cta64_bk512_cluster=None,
         cta64_bk1024_cluster=None, cta128x64_bk512_cluster=None,
         cta64x128_bk512_cluster=None, raw_128_bk256=False):
@@ -3478,6 +4824,10 @@ def make_mxfp8_case(
     if args.K // block_k < min_tiles:
         raise ValueError(
             f"MXFP8 BK{block_k} requires at least {min_tiles} tiles")
+    if (wait0_merged_unroll4
+            and ((args.K // block_k) < 4 or (args.K // block_k) % 4)):
+        raise ValueError(
+            "MXFP8 merged unroll-4 requires a multiple of four BK256 tiles")
     raw_scale_layout = (
         cta64_bk512_cluster is not None or
         cta64_bk1024_cluster is not None or
@@ -3510,8 +4860,11 @@ def make_mxfp8_case(
     if raw_scale_layout:
         a_scale = a_scale_obj.data.contiguous()
         b_scale = b_scale_obj.data.contiguous()
-    else:
+    elif bscale_contiguous:
         a_scale = pack_scale(a_scale_obj.data, 4)
+        b_scale = b_scale_obj.data.contiguous()
+    else:
+        a_scale = pack_scale(a_scale_obj.data, 8 if ascale_combined else 4)
         b_scale = pack_scale(b_scale_obj.data, 4)
     a_d = a.contiguous().cuda()
     b_d = b.T.contiguous().cuda()
@@ -3536,7 +4889,11 @@ def make_mxfp8_case(
     elif block_k == 128:
         layouts = build_mxfp8_bk128_layouts(cluster_m, cluster_n)
     elif experimental_bk256:
-        layouts = build_mxfp8_bk256_opt_layouts(cluster_m, cluster_n)
+        if bscale_contiguous:
+            layouts = build_mxfp8_bk256_opt_bscale_contiguous_layouts(
+                cluster_m, cluster_n)
+        else:
+            layouts = build_mxfp8_bk256_opt_layouts(cluster_m, cluster_n)
     elif block_k == 512 and cta_tile == 128:
         layouts = build_mxfp8_bk512_cta128_layouts(cluster_m, cluster_n)
     else:
@@ -3547,6 +4904,7 @@ def make_mxfp8_case(
         "refill-load": 0,
         "post-wmma": 1,
         "arrive-load-wait-refill": 2,
+        "wait0-refill-load": 3,
     }[getattr(args, "mxfp8_bk128_schedule", "refill-load")]
 
     def launch():
@@ -3626,7 +4984,8 @@ def make_mxfp8_case(
             return fp8_scaled_single_cta_512x128x128_kernel_gfx1250[grid](
                 a_d, b_d, c_d, as_d, bs_d, args.M, args.N, args.K,
                 a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
-                c_d.stride(0), c_d.stride(1), bs_d.stride(0),
+                c_d.stride(0), c_d.stride(1),
+                as_d.stride(0), bs_d.stride(0),
                 GRID_MN=grid[0], SHARED_LAYOUT_A=shared_a,
                 SHARED_LAYOUT_B=shared_b, SHARED_SCALE_A=shared_as,
                 SHARED_SCALE_B=shared_bs, WMMA_LAYOUT=wmma,
@@ -3637,7 +4996,8 @@ def make_mxfp8_case(
             return fp8_scaled_cluster_bk512_cta128_kernel_gfx1250[grid](
                 a_d, b_d, c_d, as_d, bs_d, args.M, args.N, args.K,
                 a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
-                c_d.stride(0), c_d.stride(1), bs_d.stride(0),
+                c_d.stride(0), c_d.stride(1),
+                as_d.stride(0), bs_d.stride(0),
                 GRID_MN=grid[0], SHARED_LAYOUT_A=shared_a,
                 SHARED_LAYOUT_B=shared_b, SHARED_SCALE_A=shared_as,
                 SHARED_SCALE_B=shared_bs, WMMA_LAYOUT=wmma,
@@ -3652,13 +5012,21 @@ def make_mxfp8_case(
             return fp8_scaled_cluster_bk256_opt_kernel_gfx1250[grid](
                 a_d, b_d, c_d, as_d, bs_d, args.M, args.N, args.K,
                 a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
-                c_d.stride(0), c_d.stride(1), bs_d.stride(0),
+                c_d.stride(0), c_d.stride(1),
+                as_d.stride(0), bs_d.stride(0),
                 GRID_MN=grid[0], SHARED_LAYOUT_A=shared_a,
                 SHARED_LAYOUT_B=shared_b, SHARED_SCALE_A=shared_as,
                 SHARED_SCALE_B=shared_bs, WMMA_LAYOUT=wmma,
                 LOAD_WMMA_LAYOUT=load_wmma, OUTPUT_CGA_LAYOUT=output_cga,
                 BLOCK_M=block_m, BLOCK_N=block_n,
                 CTA_M=cluster_m, CTA_N=cluster_n,
+                STAGE8_REFILL=stage8_refill,
+                TWO_TDM=two_tdm,
+                B_SCALE_CONTIGUOUS=bscale_contiguous,
+                A_SCALE_COMBINED=ascale_combined,
+                DESC_UPDATE_STAGE5=desc_update_stage5,
+                SCALE_LOAD_STAGE1=scale_load_stage1,
+                B_LOAD_STAGE1=b_load_stage1,
                 num_warps=8, waves_per_eu=2,
                 num_ctas=cluster_m * cluster_n,
                 llvm_fn_attrs=AGPR_ATTRS)
@@ -3681,7 +5049,10 @@ def make_mxfp8_case(
             num_ctas=cluster_m * cluster_n,
             llvm_fn_attrs=AGPR_ATTRS,
             **({"REFILL_SCHEDULE": refill_schedule}
-               if block_k == 128 else {}))
+               if block_k == 128 else {
+                   "WAIT0_MERGED": wait0_merged,
+                   "WAIT0_MERGED_UNROLL4": wait0_merged_unroll4,
+               }))
 
     def check():
         c_d.zero_()
@@ -3698,8 +5069,56 @@ def make_mxfp8_bk128_case(args):
     return make_mxfp8_case(args, block_k=128)
 
 
+def make_mxfp8_wait0_merged_case(args):
+    return make_mxfp8_case(args, wait0_merged=True)
+
+
+def make_mxfp8_wait0_merged_u4_case(args):
+    return make_mxfp8_case(args, wait0_merged_unroll4=True)
+
+
 def make_mxfp8_bk256_opt_case(args):
     return make_mxfp8_case(args, experimental_bk256=True)
+
+
+def make_mxfp8_bk256_stage8_case(args):
+    return make_mxfp8_case(
+        args, experimental_bk256=True, stage8_refill=True)
+
+
+def make_mxfp8_bk256_stage8_b_stage1_case(args):
+    return make_mxfp8_case(
+        args, experimental_bk256=True, stage8_refill=True,
+        b_load_stage1=True)
+
+
+def make_mxfp8_bk256_stage8_desc_stage5_case(args):
+    return make_mxfp8_case(
+        args, experimental_bk256=True, stage8_refill=True,
+        desc_update_stage5=True)
+
+
+def make_mxfp8_bk256_stage8_scale_stage1_case(args):
+    return make_mxfp8_case(
+        args, experimental_bk256=True, stage8_refill=True,
+        scale_load_stage1=True)
+
+
+def make_mxfp8_bk256_stage8_two_tdm_case(args):
+    return make_mxfp8_case(
+        args, experimental_bk256=True, stage8_refill=True, two_tdm=True)
+
+
+def make_mxfp8_bk256_stage8_bscale_contiguous_case(args):
+    return make_mxfp8_case(
+        args, experimental_bk256=True, stage8_refill=True, two_tdm=True,
+        bscale_contiguous=True)
+
+
+def make_mxfp8_bk256_stage8_ascale_combined_case(args):
+    return make_mxfp8_case(
+        args, experimental_bk256=True, stage8_refill=True, two_tdm=True,
+        ascale_combined=True)
 
 
 def make_mxfp8_bk512_cta128_case(args):
@@ -3746,7 +5165,8 @@ def make_mxfp8_128x128x256_cga4x4_case(args):
         args, block_k=256, raw_128_bk256=True)
 
 
-def make_fp8_mxfp4_case(args):
+def make_fp8_mxfp4_case(
+        args, stage8=False, bk512_stage8=False, b_load_stage1=False):
     """Build the configurable E4M3 x packed-E2M1 benchmark case.
 
     Only B is block-scaled. The scaled-WMMA A-scale operand is ``None``, which
@@ -3755,12 +5175,15 @@ def make_fp8_mxfp4_case(args):
     cluster_width = args.fp8_mxfp4_cluster_width
     block_m = 256 * cluster_width
     block_n = 256 * cluster_width
-    if args.M % block_m or args.N % block_n or args.K % 256:
+    required_k = 512 if bk512_stage8 else 256
+    if args.M % block_m or args.N % block_n or args.K % required_k:
         raise ValueError(
-            f"FP8xMXFP4 requires M/N divisible by {block_m} and K by 256")
-    if args.K // 256 < args.fp8_mxfp4_num_buffers:
+            f"FP8xMXFP4 requires M/N divisible by {block_m} "
+            f"and K by {required_k}")
+    min_tiles = 3 if bk512_stage8 else args.fp8_mxfp4_num_buffers
+    if args.K // required_k < min_tiles:
         raise ValueError(
-            "FP8xMXFP4 requires at least one BK256 tile per buffer")
+            "FP8xMXFP4 requires enough K tiles for its pipeline depth")
     if args.M % 128 or args.N % 128 or (args.K // 32) % 4:
         raise ValueError(
             "FP8xMXFP4 dimensions are incompatible with scale packing")
@@ -3798,7 +5221,11 @@ def make_fp8_mxfp4_case(args):
     bs_d = pack_scale(b_scale_obj.data, 4).cuda()
     c_d = torch.empty(
         (args.M, args.N), dtype=torch.bfloat16, device="cuda")
-    layouts = build_fp8_mxfp4_layouts(cluster_width)
+    layouts = (
+        build_fp8_mxfp4_bk512_layouts(cluster_width)
+        if bk512_stage8 else (
+            build_fp8_mxfp4_stage8_layouts(cluster_width) if stage8
+            else build_fp8_mxfp4_layouts(cluster_width)))
     grid = (
         triton.cdiv(args.M, block_m) * triton.cdiv(args.N, block_n), 1)
     group_size = args.fp8_mxfp4_group_size
@@ -3806,6 +5233,41 @@ def make_fp8_mxfp4_case(args):
         group_size = 8 if args.K <= 8192 else 4
 
     def launch():
+        if bk512_stage8:
+            shared_a, shared_b, shared_bs, wmma = layouts
+            return fp8_mxfp4_bk512_stage8_gfx1250[grid](
+                a_d, b_d, c_d, bs_d, args.M, args.N, args.K,
+                a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
+                c_d.stride(0), c_d.stride(1), bs_d.stride(0),
+                GRID_MN=grid[0], SHARED_LAYOUT_A=shared_a,
+                SHARED_LAYOUT_B=shared_b, SHARED_SCALE_B=shared_bs,
+                WMMA_LAYOUT=wmma, BLOCK_M=block_m, BLOCK_N=block_n,
+                CTA_M=cluster_width, CTA_N=cluster_width,
+                REUSE_A=args.fp8_mxfp4_reuse_order == "a",
+                GROUP_SIZE=group_size,
+                WAITCNT=args.fp8_mxfp4_bk512_stage8_waitcnt,
+                num_warps=8, waves_per_eu=2,
+                num_ctas=cluster_width * cluster_width,
+                llvm_fn_attrs=AGPR_ATTRS)
+        if stage8:
+            (shared_a, shared_b, shared_bs, wmma, load_wmma,
+             output_cga) = layouts
+            return fp8_mxfp4_stage8_gfx1250[grid](
+                a_d, b_d, c_d, bs_d, args.M, args.N, args.K,
+                a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
+                c_d.stride(0), c_d.stride(1), bs_d.stride(0),
+                GRID_MN=grid[0], SHARED_LAYOUT_A=shared_a,
+                SHARED_LAYOUT_B=shared_b, SHARED_SCALE_B=shared_bs,
+                WMMA_LAYOUT=wmma, LOAD_WMMA_LAYOUT=load_wmma,
+                OUTPUT_CGA_LAYOUT=output_cga,
+                BLOCK_M=block_m, BLOCK_N=block_n,
+                CTA_M=cluster_width, CTA_N=cluster_width,
+                REUSE_A=args.fp8_mxfp4_reuse_order == "a",
+                GROUP_SIZE=group_size, WAITCNT=args.fp8_mxfp4_stage8_waitcnt,
+                B_LOAD_STAGE1=b_load_stage1,
+                num_warps=8, waves_per_eu=2,
+                num_ctas=cluster_width * cluster_width,
+                llvm_fn_attrs=AGPR_ATTRS)
         shared_a, shared_b, shared_bs, wmma = layouts
         return fp8_mxfp4_cluster_gemm_gfx1250[grid](
             a_d, b_d, c_d, bs_d, args.M, args.N, args.K,
@@ -3835,7 +5297,20 @@ def make_fp8_mxfp4_case(args):
     return launch, check
 
 
-def make_mxfp4_case(args):
+def make_fp8_mxfp4_stage8_case(args):
+    return make_fp8_mxfp4_case(args, stage8=True)
+
+
+def make_fp8_mxfp4_stage8_b_stage1_case(args):
+    return make_fp8_mxfp4_case(
+        args, stage8=True, b_load_stage1=True)
+
+
+def make_fp8_mxfp4_bk512_stage8_case(args):
+    return make_fp8_mxfp4_case(args, bk512_stage8=True)
+
+
+def make_mxfp4_case(args, stage8=False, b_load_stage1=False):
     """Build the fixed packed-E2M1/E8M0 block-32 4x4-cluster case."""
     if args.M % 1024 or args.N % 1024 or args.K % 512:
         raise ValueError("MXFP4 requires M/N divisible by 1024 and K by 512")
@@ -3885,6 +5360,19 @@ def make_mxfp4_case(args):
     grid = (triton.cdiv(args.M, 1024) * triton.cdiv(args.N, 1024), 1)
 
     def launch():
+        if stage8:
+            shared_a, shared_b, shared_as, shared_bs, wmma = layouts
+            return mxfp4_bk512_stage8_gfx1250[grid](
+                a_d, b_d, c_d, as_d, bs_d, args.M, args.N, args.K,
+                a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
+                c_d.stride(0), c_d.stride(1), bs_d.stride(0),
+                GRID_MN=grid[0], SHARED_LAYOUT_A=shared_a,
+                SHARED_LAYOUT_B=shared_b, SHARED_SCALE_A=shared_as,
+                SHARED_SCALE_B=shared_bs, WMMA_LAYOUT=wmma,
+                WAITCNT=args.mxfp4_stage8_waitcnt,
+                B_LOAD_STAGE1=b_load_stage1,
+                num_warps=8, waves_per_eu=2, num_ctas=16,
+                llvm_fn_attrs=AGPR_ATTRS)
         shared_a, shared_b, shared_as, shared_bs, wmma = layouts
         return mxfp4_bk512_warp_pipeline_gfx1250[grid](
             a_d, b_d, c_d, as_d, bs_d, args.M, args.N, args.K,
@@ -3905,6 +5393,14 @@ def make_mxfp4_case(args):
         print("result verified", flush=True)
 
     return launch, check
+
+
+def make_mxfp4_stage8_case(args):
+    return make_mxfp4_case(args, stage8=True)
+
+
+def make_mxfp4_stage8_b_stage1_case(args):
+    return make_mxfp4_case(args, stage8=True, b_load_stage1=True)
 
 
 def event_probe(fn, iters):
@@ -3975,11 +5471,26 @@ def run_one(name, args):
     makers = {
         "bf16": make_bf16_case,
         "bf16_8stage": make_bf16_8stage_case,
+        "bf16_9stage": make_bf16_9stage_case,
         "bf16_l2prefetch": make_bf16_l2prefetch_case,
         "bf16_pidmap": make_bf16_pidmap_case,
         "mxfp8": make_mxfp8_case,
+        "mxfp8_wait0_merged": make_mxfp8_wait0_merged_case,
+        "mxfp8_wait0_merged_u4": make_mxfp8_wait0_merged_u4_case,
         "mxfp8_bk128": make_mxfp8_bk128_case,
         "mxfp8_bk256_opt": make_mxfp8_bk256_opt_case,
+        "mxfp8_bk256_stage8": make_mxfp8_bk256_stage8_case,
+        "mxfp8_bk256_stage8_b_stage1":
+            make_mxfp8_bk256_stage8_b_stage1_case,
+        "mxfp8_bk256_stage8_desc_stage5":
+            make_mxfp8_bk256_stage8_desc_stage5_case,
+        "mxfp8_bk256_stage8_scale_stage1":
+            make_mxfp8_bk256_stage8_scale_stage1_case,
+        "mxfp8_bk256_stage8_two_tdm": make_mxfp8_bk256_stage8_two_tdm_case,
+        "mxfp8_bk256_stage8_bscale_contiguous":
+            make_mxfp8_bk256_stage8_bscale_contiguous_case,
+        "mxfp8_bk256_stage8_ascale_combined":
+            make_mxfp8_bk256_stage8_ascale_combined_case,
         "mxfp8_bk512_128": make_mxfp8_bk512_cta128_case,
         "mxfp8_512x128x128_cga1": make_mxfp8_512x128x128_cga1_case,
         "mxfp8_64x64x512_cga1": make_mxfp8_64x64x512_cga1_case,
@@ -3990,7 +5501,13 @@ def run_one(name, args):
         "mxfp8_64x64x1024_cga2x2": make_mxfp8_64x64x1024_cga2x2_case,
         "mxfp8_128x128x256_cga4x4": make_mxfp8_128x128x256_cga4x4_case,
         "fp8_mxfp4": make_fp8_mxfp4_case,
+        "fp8_mxfp4_stage8": make_fp8_mxfp4_stage8_case,
+        "fp8_mxfp4_stage8_b_stage1":
+            make_fp8_mxfp4_stage8_b_stage1_case,
+        "fp8_mxfp4_bk512_stage8": make_fp8_mxfp4_bk512_stage8_case,
         "mxfp4": make_mxfp4_case,
+        "mxfp4_stage8": make_mxfp4_stage8_case,
+        "mxfp4_stage8_b_stage1": make_mxfp4_stage8_b_stage1_case,
     }
     launch, check = makers[name](args)
     if args.check:
@@ -4034,24 +5551,40 @@ def parse_args():
         choices=(2, 4), default=(4, 4), metavar=("CTA_M", "CTA_N"),
         help="CTA cluster shape for experimental BF16 L2 prefetch")
     parser.add_argument(
+        "--bf16-9stage-waitcnt", type=int, choices=(0, 1, 2), default=2,
+        help="safe tensor wait count for experimental nine-stage BF16")
+    parser.add_argument(
         "--bf16-fp32-output", dest="bf16_output", action="store_false",
         help="Store BF16 kernel results as FP32 instead of the BF16 default")
     parser.set_defaults(bf16_output=True)
     parser.add_argument(
-        "--mxfp8-cluster-width", type=int, choices=(2, 4), default=4,
+        "--mxfp8-cluster-width", type=int, choices=(1, 2, 4), default=4,
         help="square MXFP8 CTA-cluster width")
     parser.add_argument(
-        "--mxfp8-cluster-shape", type=int, nargs=2, choices=(2, 4),
+        "--mxfp8-cluster-shape", type=int, nargs=2, choices=(1, 2, 4),
         metavar=("CTA_M", "CTA_N"),
         help="rectangular MXFP8 CTA-cluster shape; overrides cluster width")
     parser.add_argument(
         "--mxfp8-bk128-schedule",
-        choices=("refill-load", "post-wmma", "arrive-load-wait-refill"),
+        choices=(
+            "refill-load", "post-wmma", "arrive-load-wait-refill",
+            "wait0-refill-load"),
         default="refill-load",
         help="experimental three-slot BK128 refill placement")
     parser.add_argument(
+        "--mxfp4-stage8-waitcnt", type=int, choices=(0, 1, 2), default=2,
+        help="safe tensor wait count for experimental nine-stage MXFP4")
+    parser.add_argument(
         "--fp8-mxfp4-num-buffers", type=int, choices=(2, 3), default=3,
         help="number of FP8xMXFP4 TDM ring slots")
+    parser.add_argument(
+        "--fp8-mxfp4-stage8-waitcnt", type=int, choices=range(0, 5),
+        default=4,
+        help="safe tensor wait count for experimental nine-stage FP8xMXFP4")
+    parser.add_argument(
+        "--fp8-mxfp4-bk512-stage8-waitcnt", type=int,
+        choices=(0, 1, 2), default=2,
+        help="safe tensor wait count for two-slot BK512 FP8xMXFP4")
     parser.add_argument(
         "--fp8-mxfp4-cluster-width", type=int, choices=(1, 2, 4), default=4,
         help="square FP8xMXFP4 CTA-cluster width")
