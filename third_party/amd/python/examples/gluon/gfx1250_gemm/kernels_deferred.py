@@ -1590,16 +1590,15 @@ def mxfp8_bk256_opt_consume_and_refill(
         if not A_SCALE_COMBINED and not SCALE_LOAD_STAGE1:
             as1 = mxfp8_load_scale(
                 as_buf, slot, 4, SCALE_A_LAYOUT, BLOCK_M, 8, 4)
-        if not B_LOAD_STAGE1:
-            b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
-                128, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
-            b1_grid = b1.reshape((128, CTA_N, cta_n))
-            b1_lo = gl.convert_layout(gl.amd.slice(
-                b1_grid, [128, CTA_N, half_n], [0, 0, 0]
-            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
-            b1_hi = gl.convert_layout(gl.amd.slice(
-                b1_grid, [128, CTA_N, half_n], [0, 0, half_n]
-            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+        b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            128, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+        b1_grid = b1.reshape((128, CTA_N, cta_n))
+        b1_lo = gl.convert_layout(gl.amd.slice(
+            b1_grid, [128, CTA_N, half_n], [0, 0, 0]
+        ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
+        b1_hi = gl.convert_layout(gl.amd.slice(
+            b1_grid, [128, CTA_N, half_n], [0, 0, half_n]
+        ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
         if not SCALE_LOAD_STAGE1:
             bs1 = mxfp8_load_b_scale(
                 bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N, B_SCALE_CONTIGUOUS)
@@ -1627,16 +1626,6 @@ def mxfp8_bk256_opt_consume_and_refill(
             bs1_hi = gl.convert_layout(gl.amd.slice(
                 bs1_grid, [CTA_N, half_n, 4], [0, half_n, 0]
             ).reshape((packed_n, 4)), SCALE_B_LAYOUT, assert_trivial=True)
-        if B_LOAD_STAGE1:
-            b1 = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
-                128, 128, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
-            b1_grid = b1.reshape((128, CTA_N, cta_n))
-            b1_lo = gl.convert_layout(gl.amd.slice(
-                b1_grid, [128, CTA_N, half_n], [0, 0, 0]
-            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
-            b1_hi = gl.convert_layout(gl.amd.slice(
-                b1_grid, [128, CTA_N, half_n], [0, 0, half_n]
-            ).reshape((128, packed_n)), DOT_B, assert_trivial=True)
         if DESC_UPDATE_STAGE5:
             next_a_desc = tdm.update_tensor_descriptor(
                 a_desc, add_offsets=[0, 256])
@@ -3518,17 +3507,12 @@ def fp8_mxfp4_stage8_consume_and_refill(
             bs_buf, slot, 4, SCALE_B_LOAD, BLOCK_N)
         bs2, bs3 = fp8_mxfp4_stage8_split_scale(
             bs1_full, SCALE_B_LAYOUT, BLOCK_N, CTA_N)
-        if not B_LOAD_STAGE1:
-            b1_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
-                64, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
-            b2, b3 = bf16_8stage_split_b(
-                b1_full, DOT_B, BLOCK_N, CTA_N)
+        b1_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
+            64, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
+        b2, b3 = bf16_8stage_split_b(
+            b1_full, DOT_B, BLOCK_N, CTA_N)
     with gl.amd.warp_pipeline_stage("fp8mxfp4_stage5_bubble"):
-        if B_LOAD_STAGE1:
-            b1_full = b_buf.index(slot).slice(0, BLOCK_N, 0).slice(
-                64, 64, 1).permute([1, 0]).load(layout=DOT_B_LOAD)
-            b2, b3 = bf16_8stage_split_b(
-                b1_full, DOT_B, BLOCK_N, CTA_N)
+        pass
     with gl.amd.warp_pipeline_stage(
             "fp8mxfp4_stage6_compute_k1_n0", priority=1):
         acc0 = gl.amd.gfx1250.wmma_scaled(
@@ -4323,17 +4307,12 @@ def mxfp4_stage8_k_split_consume_and_refill(
             192, 64, 1).load(layout=DOT_A)
         as3 = mxfp4_load_scale(as_buf, slot, 12, SCALE_A_LAYOUT)
         bs3 = mxfp4_load_scale(bs_buf, slot, 12, SCALE_B_LAYOUT)
-        if not B_LOAD_STAGE1:
-            b2 = b_buf.index(slot).slice(0, 1024, 0).slice(
-                128, 64, 1).permute([1, 0]).load(layout=DOT_B)
-            b3 = b_buf.index(slot).slice(0, 1024, 0).slice(
-                192, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        b2 = b_buf.index(slot).slice(0, 1024, 0).slice(
+            128, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        b3 = b_buf.index(slot).slice(0, 1024, 0).slice(
+            192, 64, 1).permute([1, 0]).load(layout=DOT_B)
     with gl.amd.warp_pipeline_stage("mxfp4_stage5_bubble"):
-        if B_LOAD_STAGE1:
-            b2 = b_buf.index(slot).slice(0, 1024, 0).slice(
-                128, 64, 1).permute([1, 0]).load(layout=DOT_B)
-            b3 = b_buf.index(slot).slice(0, 1024, 0).slice(
-                192, 64, 1).permute([1, 0]).load(layout=DOT_B)
+        pass
     with gl.amd.warp_pipeline_stage(
             "mxfp4_stage6_compute_k2", priority=1):
         acc = gl.amd.gfx1250.wmma_scaled(
