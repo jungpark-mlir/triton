@@ -139,15 +139,24 @@ def snapshot_tdm_store_full_tile(
 def mxfp8_tdm_store_split_n2(
         c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc0, acc1,
         OUTPUT_CGA_LAYOUT: gl.constexpr, CTA_M: gl.constexpr,
-        CTA_N: gl.constexpr):
+        CTA_N: gl.constexpr, OVERLAP_OUTPUT_STORE: gl.constexpr):
     cta_m: gl.constexpr = 256
     cta_n: gl.constexpr = 256
     half_n: gl.constexpr = 128
     shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[half_n, 8]], [CTA_M, CTA_N, cta_m, half_n],
         [3, 2, 1, 0], OUTPUT_CGA_LAYOUT)
-    shared = gl.allocate_shared_memory(
-        c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout)
+    if OVERLAP_OUTPUT_STORE:
+        shared0 = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            [CTA_M, CTA_N, cta_m, half_n], shared_layout)
+        shared1 = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            [CTA_M, CTA_N, cta_m, half_n], shared_layout)
+    else:
+        shared = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            [CTA_M, CTA_N, cta_m, half_n], shared_layout)
     output0 = acc0.reshape(
         (CTA_M, cta_m, CTA_N, half_n)).permute((0, 2, 1, 3))
     output1 = acc1.reshape(
@@ -159,11 +168,17 @@ def mxfp8_tdm_store_split_n2(
         block_shape=(CTA_M, CTA_N, cta_m, half_n), layout=shared_layout)
     base_m = pid_m * CTA_M
     base_n = pid_n * CTA_N
-    shared.store(output0.to(c_ptr.type.element_ty))
-    tdm.async_store(desc, [base_m, base_n, 0, 0], shared)
-    tdm.async_wait(0)
-    shared.store(output1.to(c_ptr.type.element_ty))
-    tdm.async_store(desc, [base_m, base_n, 0, half_n], shared)
+    if OVERLAP_OUTPUT_STORE:
+        shared0.store(output0.to(c_ptr.type.element_ty))
+        tdm.async_store(desc, [base_m, base_n, 0, 0], shared0)
+        shared1.store(output1.to(c_ptr.type.element_ty))
+        tdm.async_store(desc, [base_m, base_n, 0, half_n], shared1)
+    else:
+        shared.store(output0.to(c_ptr.type.element_ty))
+        tdm.async_store(desc, [base_m, base_n, 0, 0], shared)
+        tdm.async_wait(0)
+        shared.store(output1.to(c_ptr.type.element_ty))
+        tdm.async_store(desc, [base_m, base_n, 0, half_n], shared)
     tdm.async_wait(0)
 
 
@@ -752,7 +767,8 @@ def fp8_scaled_cluster_bk256_opt_kernel_gfx1250(
         A_SCALE_COMBINED: gl.constexpr,
         DESC_UPDATE_STAGE5: gl.constexpr,
         SCALE_LOAD_STAGE1: gl.constexpr,
-        B_LOAD_STAGE1: gl.constexpr):
+        B_LOAD_STAGE1: gl.constexpr,
+        OVERLAP_OUTPUT_STORE: gl.constexpr):
     gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
     gl.static_assert(BLOCK_M // CTA_M == 256)
     gl.static_assert(BLOCK_N // CTA_N == 256)
@@ -857,7 +873,7 @@ def fp8_scaled_cluster_bk256_opt_kernel_gfx1250(
     bs_buf._keep_alive()
     mxfp8_tdm_store_split_n2(
         c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc0, acc1,
-        OUTPUT_CGA_LAYOUT, CTA_M, CTA_N)
+        OUTPUT_CGA_LAYOUT, CTA_M, CTA_N, OVERLAP_OUTPUT_STORE)
 
 
 def build_mxfp8_layouts(cluster_m=4, cluster_n=None):
@@ -1101,7 +1117,8 @@ def fp8_mxfp4_stage8_gfx1250(
         BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
         CTA_M: gl.constexpr, CTA_N: gl.constexpr,
         REUSE_A: gl.constexpr, GROUP_SIZE: gl.constexpr,
-        WAITCNT: gl.constexpr, B_LOAD_STAGE1: gl.constexpr):
+        WAITCNT: gl.constexpr, B_LOAD_STAGE1: gl.constexpr,
+        OVERLAP_OUTPUT_STORE: gl.constexpr):
     gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
     if REUSE_A:
         pid_m, pid_n = snapshot_get_xcd_swizzled_pids_reuse_a(
@@ -1177,7 +1194,7 @@ def fp8_mxfp4_stage8_gfx1250(
     bs_buf._keep_alive()
     mxfp8_tdm_store_split_n2(
         c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc0, acc1,
-        OUTPUT_CGA_LAYOUT, CTA_M, CTA_N)
+        OUTPUT_CGA_LAYOUT, CTA_M, CTA_N, OVERLAP_OUTPUT_STORE)
 
 
 def build_fp8_mxfp4_stage8_layouts(cluster_width=4):
@@ -1512,6 +1529,43 @@ def pack_scale(scale, scale_kwidth):
     return scale.view(non_k // 128, k_scale * 128)
 
 
+MAX_ROTATING_LAUNCHES = 200
+
+
+def make_rotating_launcher(args, inputs, launch_with_inputs):
+    """Optionally give each captured launch a distinct GPU input set."""
+    if not (args.benchmark and args.rotate_inputs):
+        return lambda: launch_with_inputs(*inputs)
+    if args.iters_per_graph is None:
+        raise ValueError(
+            "--rotate-inputs requires an explicit --iters-per-graph")
+    if args.replays != 1:
+        raise ValueError(
+            "--rotate-inputs requires --replays 1 so graph pointers "
+            "are not reused")
+    copies = args.iters_per_graph
+    if copies > MAX_ROTATING_LAUNCHES:
+        raise ValueError(
+            f"rotation requests {copies} input sets; maximum is "
+            f"{MAX_ROTATING_LAUNCHES}")
+    bytes_per_set = sum(t.numel() * t.element_size() for t in inputs)
+    pool = [tuple(inputs)]
+    for _ in range(1, copies):
+        pool.append(tuple(t.clone() for t in inputs))
+    torch.cuda.synchronize()
+    print(f"rotating copies   : {copies}")
+    print(f"bytes per copy    : {bytes_per_set}")
+    index = 0
+
+    def launch():
+        nonlocal index
+        current = pool[index]
+        index = (index + 1) % len(pool)
+        return launch_with_inputs(*current)
+
+    return launch
+
+
 def event_probe(fn, iters):
     """Measure a short per-launch GPU-event latency used to size the graph."""
     start = torch.cuda.Event(enable_timing=True)
@@ -1559,8 +1613,8 @@ def run_benchmark(launch, M, N, K, args):
     if n_per_graph <= 0:
         raise ValueError("--iters-per-graph must be positive")
     graph = capture_graph(launch, n_per_graph)
-    total_iters = args.replays * n_per_graph
     torch.cuda.synchronize()
+    total_iters = args.replays * n_per_graph
     start = time.perf_counter()
     for _ in range(args.replays):
         graph.replay()
@@ -1585,8 +1639,12 @@ BEST_KERNELS = {
 }
 
 TILED_CONFIGS = {
+    "128x128x128": (128, 128, 128, False, True),
+    "256x256x128": (256, 256, 128, True, True),
     "64x64x512": (64, 64, 512, False, False),
     "128x128x256": (128, 128, 256, False, True),
+    "256x128x256": (256, 128, 256, False, True),
+    "256x256x256": (256, 256, 256, True, True),
 }
 
 
@@ -1603,13 +1661,13 @@ def tiled_issue_refill(
         (bs_desc, bs_buf.index(slot), 0b00001100),
     ])
     a_desc = tdm.update_tensor_descriptor(
-        a_desc, add_offsets=[0, BLOCK_K])
+        a_desc, add_offsets=[0, BLOCK_K], clamp_bounds=False)
     b_desc = tdm.update_tensor_descriptor(
-        b_desc, add_offsets=[0, BLOCK_K])
+        b_desc, add_offsets=[0, BLOCK_K], clamp_bounds=False)
     as_desc = tdm.update_tensor_descriptor(
-        as_desc, add_offsets=[0, SCALE_STEP])
+        as_desc, add_offsets=[0, SCALE_STEP], clamp_bounds=False)
     bs_desc = tdm.update_tensor_descriptor(
-        bs_desc, add_offsets=[0, SCALE_STEP])
+        bs_desc, add_offsets=[0, SCALE_STEP], clamp_bounds=False)
     return a_desc, b_desc, as_desc, bs_desc
 
 
@@ -1653,6 +1711,112 @@ def tiled_split_n(
 
 
 @gluon.jit
+def tiled_bk128_four_buffer_stage(
+        a_buf, b_buf, as_buf, bs_buf, slot, refill_slot,
+        a_desc, b_desc, as_desc, bs_desc, acc,
+        dot_a: gl.constexpr, dot_b: gl.constexpr,
+        scale_a_layout: gl.constexpr, scale_b_layout: gl.constexpr,
+        block_m: gl.constexpr, block_n: gl.constexpr):
+    # Three tiles remain outstanding. Retire the oldest while leaving two in
+    # flight, then refill the fourth slot that is disjoint from current reads.
+    tdm.async_wait(6)
+    with gl.amd.warp_pipeline_stage("bk128_refill_load", priority=0):
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc, as_desc, bs_desc = tiled_issue_refill(
+            a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, refill_slot, 128, 512)
+        a = a_buf.index(slot).load(layout=dot_a)
+        a_scale = tiled_load_scale_preshuffled(
+            as_buf, slot, 0, scale_a_layout, block_m, 4)
+        b = b_buf.index(slot).permute([1, 0]).load(layout=dot_b)
+        b_scale = tiled_load_scale_preshuffled(
+            bs_buf, slot, 0, scale_b_layout, block_n, 4)
+    with gl.amd.warp_pipeline_stage("bk128_compute", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a, a_scale, "e4m3", b, b_scale, "e4m3", acc)
+    return a_desc, b_desc, as_desc, bs_desc, acc
+
+
+@gluon.jit
+def tiled_bk128_four_buffer_tail(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc,
+        dot_a: gl.constexpr, dot_b: gl.constexpr,
+        scale_a_layout: gl.constexpr, scale_b_layout: gl.constexpr,
+        block_m: gl.constexpr, block_n: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("bk128_tail_load", priority=0):
+        a = a_buf.index(slot).load(layout=dot_a)
+        a_scale = tiled_load_scale_preshuffled(
+            as_buf, slot, 0, scale_a_layout, block_m, 4)
+        b = b_buf.index(slot).permute([1, 0]).load(layout=dot_b)
+        b_scale = tiled_load_scale_preshuffled(
+            bs_buf, slot, 0, scale_b_layout, block_n, 4)
+    with gl.amd.warp_pipeline_stage("bk128_tail_compute", priority=1):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a, a_scale, "e4m3", b, b_scale, "e4m3", acc)
+    return acc
+
+
+@gluon.jit
+def tiled_bk128_split_four_buffer_stage(
+        a_buf, b_buf, as_buf, bs_buf, slot, refill_slot,
+        a_desc, b_desc, as_desc, bs_desc, acc0, acc1,
+        dot_a: gl.constexpr, dot_b: gl.constexpr,
+        dot_b_load: gl.constexpr, scale_a_layout: gl.constexpr,
+        scale_b_layout: gl.constexpr, scale_b_load: gl.constexpr,
+        block_m: gl.constexpr, block_n: gl.constexpr,
+        cta_n_count: gl.constexpr, cta_tile_n: gl.constexpr):
+    tdm.async_wait(6)
+    with gl.amd.warp_pipeline_stage("bk128_split_refill_load", priority=0):
+        gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc, as_desc, bs_desc = tiled_issue_refill(
+            a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, refill_slot, 128, 512)
+        a = a_buf.index(slot).load(layout=dot_a)
+        a_scale = tiled_load_scale_preshuffled(
+            as_buf, slot, 0, scale_a_layout, block_m, 4)
+        b_full = b_buf.index(slot).permute([1, 0]).load(layout=dot_b_load)
+        b_scale_full = tiled_load_scale_preshuffled(
+            bs_buf, slot, 0, scale_b_load, block_n, 4)
+        b0, bs0, b1, bs1 = tiled_split_n(
+            b_full, b_scale_full, dot_b, scale_b_layout,
+            block_n, cta_n_count, cta_tile_n)
+    with gl.amd.warp_pipeline_stage("bk128_split_compute", priority=1):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a, a_scale, "e4m3", b0, bs0, "e4m3", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a, a_scale, "e4m3", b1, bs1, "e4m3", acc1)
+    return a_desc, b_desc, as_desc, bs_desc, acc0, acc1
+
+
+@gluon.jit
+def tiled_bk128_split_four_buffer_tail(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc0, acc1,
+        dot_a: gl.constexpr, dot_b: gl.constexpr,
+        dot_b_load: gl.constexpr, scale_a_layout: gl.constexpr,
+        scale_b_layout: gl.constexpr, scale_b_load: gl.constexpr,
+        block_m: gl.constexpr, block_n: gl.constexpr,
+        cta_n_count: gl.constexpr, cta_tile_n: gl.constexpr):
+    with gl.amd.warp_pipeline_stage("bk128_split_tail_load", priority=0):
+        a = a_buf.index(slot).load(layout=dot_a)
+        a_scale = tiled_load_scale_preshuffled(
+            as_buf, slot, 0, scale_a_layout, block_m, 4)
+        b_full = b_buf.index(slot).permute([1, 0]).load(layout=dot_b_load)
+        b_scale_full = tiled_load_scale_preshuffled(
+            bs_buf, slot, 0, scale_b_load, block_n, 4)
+        b0, bs0, b1, bs1 = tiled_split_n(
+            b_full, b_scale_full, dot_b, scale_b_layout,
+            block_n, cta_n_count, cta_tile_n)
+    with gl.amd.warp_pipeline_stage("bk128_split_tail_compute", priority=1):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a, a_scale, "e4m3", b0, bs0, "e4m3", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a, a_scale, "e4m3", b1, bs1, "e4m3", acc1)
+    return acc0, acc1
+
+
+@gluon.jit
 def tiled_bk256_stage8(
         a_buf, b_buf, as_buf, bs_buf, slot,
         a_desc, b_desc, as_desc, bs_desc, acc0, acc1,
@@ -1660,9 +1824,10 @@ def tiled_bk256_stage8(
         dot_b_load: gl.constexpr, scale_a_layout: gl.constexpr,
         scale_b_layout: gl.constexpr, scale_b_load: gl.constexpr,
         block_m: gl.constexpr, block_n: gl.constexpr,
-        cta_n_count: gl.constexpr, cta_tile_n: gl.constexpr):
+        cta_n_count: gl.constexpr, cta_tile_n: gl.constexpr,
+        wait_count: gl.constexpr):
     scale_k: gl.constexpr = 8
-    tdm.async_wait(3)
+    tdm.async_wait(wait_count)
     with gl.amd.warp_pipeline_stage(
             "tiled_stage0_load_k0", priority=0, phase_gap=2):
         a0 = a_buf.index(slot).slice(0, 128, 1).load(layout=dot_a)
@@ -1762,16 +1927,113 @@ def tiled_bk256_tail(
 
 
 @gluon.jit
+def tiled_bk256_split_four_stage_static(
+        a_buf, b_buf, as_buf, bs_buf, slot, refill_slot,
+        a_desc, b_desc, as_desc, bs_desc, acc0, acc1,
+        dot_a: gl.constexpr, dot_b: gl.constexpr,
+        dot_b_load: gl.constexpr, scale_a_layout: gl.constexpr,
+        scale_b_layout: gl.constexpr, scale_b_load: gl.constexpr,
+        block_m: gl.constexpr, block_n: gl.constexpr,
+        cta_n_count: gl.constexpr, cta_tile_n: gl.constexpr,
+        wait_count: gl.constexpr):
+    scale_k: gl.constexpr = 8
+    tdm.async_wait(wait_count)
+    with gl.amd.warp_pipeline_stage("tiled_static_stage0_load_k0"):
+        a0 = a_buf.index(slot).slice(0, 128, 1).load(layout=dot_a)
+        as0 = tiled_load_scale_preshuffled(
+            as_buf, slot, 0, scale_a_layout, block_m, scale_k)
+        b0_full = b_buf.index(slot).slice(
+            0, 128, 1).permute([1, 0]).load(layout=dot_b_load)
+        bs0_full = tiled_load_scale_preshuffled(
+            bs_buf, slot, 0, scale_b_load, block_n, scale_k)
+        b0, bs0, b1, bs1 = tiled_split_n(
+            b0_full, bs0_full, dot_b, scale_b_layout,
+            block_n, cta_n_count, cta_tile_n)
+    with gl.amd.warp_pipeline_stage("tiled_static_stage1_compute_k0"):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e4m3", b0, bs0, "e4m3", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e4m3", b1, bs1, "e4m3", acc1)
+    with gl.amd.warp_pipeline_stage("tiled_static_stage2_load_k1"):
+        a1 = a_buf.index(slot).slice(128, 128, 1).load(layout=dot_a)
+        as1 = tiled_load_scale_preshuffled(
+            as_buf, slot, 4, scale_a_layout, block_m, scale_k)
+        b1_full = b_buf.index(slot).slice(
+            128, 128, 1).permute([1, 0]).load(layout=dot_b_load)
+        bs1_full = tiled_load_scale_preshuffled(
+            bs_buf, slot, 4, scale_b_load, block_n, scale_k)
+        b2, bs2, b3, bs3 = tiled_split_n(
+            b1_full, bs1_full, dot_b, scale_b_layout,
+            block_n, cta_n_count, cta_tile_n)
+        gl.amd.gfx1250.cluster.arrive()
+    with gl.amd.warp_pipeline_stage("tiled_static_stage3_refill_compute_k1"):
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc, as_desc, bs_desc = tiled_issue_refill(
+            a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, refill_slot, 256, 1024)
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e4m3", b2, bs2, "e4m3", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e4m3", b3, bs3, "e4m3", acc1)
+    return a_desc, b_desc, as_desc, bs_desc, acc0, acc1
+
+
+@gluon.jit
+def tiled_bk256_split_tail_static(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc0, acc1,
+        dot_a: gl.constexpr, dot_b: gl.constexpr,
+        dot_b_load: gl.constexpr, scale_a_layout: gl.constexpr,
+        scale_b_layout: gl.constexpr, scale_b_load: gl.constexpr,
+        block_m: gl.constexpr, block_n: gl.constexpr,
+        cta_n_count: gl.constexpr, cta_tile_n: gl.constexpr):
+    scale_k: gl.constexpr = 8
+    with gl.amd.warp_pipeline_stage("tiled_static_tail_load_k0"):
+        a0 = a_buf.index(slot).slice(0, 128, 1).load(layout=dot_a)
+        as0 = tiled_load_scale_preshuffled(
+            as_buf, slot, 0, scale_a_layout, block_m, scale_k)
+        b0_full = b_buf.index(slot).slice(
+            0, 128, 1).permute([1, 0]).load(layout=dot_b_load)
+        bs0_full = tiled_load_scale_preshuffled(
+            bs_buf, slot, 0, scale_b_load, block_n, scale_k)
+        b0, bs0, b1, bs1 = tiled_split_n(
+            b0_full, bs0_full, dot_b, scale_b_layout,
+            block_n, cta_n_count, cta_tile_n)
+    with gl.amd.warp_pipeline_stage("tiled_static_tail_compute_k0"):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e4m3", b0, bs0, "e4m3", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e4m3", b1, bs1, "e4m3", acc1)
+    with gl.amd.warp_pipeline_stage("tiled_static_tail_load_k1"):
+        a1 = a_buf.index(slot).slice(128, 128, 1).load(layout=dot_a)
+        as1 = tiled_load_scale_preshuffled(
+            as_buf, slot, 4, scale_a_layout, block_m, scale_k)
+        b1_full = b_buf.index(slot).slice(
+            128, 128, 1).permute([1, 0]).load(layout=dot_b_load)
+        bs1_full = tiled_load_scale_preshuffled(
+            bs_buf, slot, 4, scale_b_load, block_n, scale_k)
+        b2, bs2, b3, bs3 = tiled_split_n(
+            b1_full, bs1_full, dot_b, scale_b_layout,
+            block_n, cta_n_count, cta_tile_n)
+    with gl.amd.warp_pipeline_stage("tiled_static_tail_compute_k1"):
+        acc0 = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e4m3", b2, bs2, "e4m3", acc0)
+        acc1 = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e4m3", b3, bs3, "e4m3", acc1)
+    return acc0, acc1
+
+
+@gluon.jit
 def tiled_bk256_single_stage8(
         a_buf, b_buf, as_buf, bs_buf, slot,
         a_desc, b_desc, as_desc, bs_desc, acc,
         dot_a: gl.constexpr, dot_b: gl.constexpr,
         scale_a_layout: gl.constexpr, scale_b_layout: gl.constexpr,
-        block_m: gl.constexpr, block_n: gl.constexpr):
+        block_m: gl.constexpr, block_n: gl.constexpr,
+        wait_count: gl.constexpr, phase_gap: gl.constexpr):
     scale_k: gl.constexpr = 8
-    tdm.async_wait(3)
+    tdm.async_wait(wait_count)
     with gl.amd.warp_pipeline_stage(
-            "tiled_stage0_load_k0", priority=0, phase_gap=2):
+            "tiled_stage0_load_k0", priority=0, phase_gap=phase_gap):
         a0 = a_buf.index(slot).slice(0, 128, 1).load(layout=dot_a)
         as0 = tiled_load_scale_preshuffled(
             as_buf, slot, 0, scale_a_layout, block_m, scale_k)
@@ -1837,13 +2099,76 @@ def tiled_bk256_single_tail(
 
 
 @gluon.jit
+def tiled_bk256_single_four_stage_static(
+        a_buf, b_buf, as_buf, bs_buf, slot, refill_slot,
+        a_desc, b_desc, as_desc, bs_desc, acc,
+        dot_a: gl.constexpr, dot_b: gl.constexpr,
+        scale_a_layout: gl.constexpr, scale_b_layout: gl.constexpr,
+        block_m: gl.constexpr, block_n: gl.constexpr,
+        wait_count: gl.constexpr):
+    scale_k: gl.constexpr = 8
+    tdm.async_wait(wait_count)
+    with gl.amd.warp_pipeline_stage("tiled_static_stage0_load_k0"):
+        a0 = a_buf.index(slot).slice(0, 128, 1).load(layout=dot_a)
+        as0 = tiled_load_scale_preshuffled(
+            as_buf, slot, 0, scale_a_layout, block_m, scale_k)
+        b0 = b_buf.index(slot).slice(
+            0, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs0 = tiled_load_scale_preshuffled(
+            bs_buf, slot, 0, scale_b_layout, block_n, scale_k)
+    with gl.amd.warp_pipeline_stage("tiled_static_stage1_compute_k0"):
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a0, as0, "e4m3", b0, bs0, "e4m3", acc)
+    with gl.amd.warp_pipeline_stage("tiled_static_stage2_load_k1"):
+        a1 = a_buf.index(slot).slice(128, 128, 1).load(layout=dot_a)
+        as1 = tiled_load_scale_preshuffled(
+            as_buf, slot, 4, scale_a_layout, block_m, scale_k)
+        b1 = b_buf.index(slot).slice(
+            128, 128, 1).permute([1, 0]).load(layout=dot_b)
+        bs1 = tiled_load_scale_preshuffled(
+            bs_buf, slot, 4, scale_b_layout, block_n, scale_k)
+        gl.amd.gfx1250.cluster.arrive()
+    with gl.amd.warp_pipeline_stage("tiled_static_stage3_refill_compute_k1"):
+        gl.amd.gfx1250.cluster.wait()
+        a_desc, b_desc, as_desc, bs_desc = tiled_issue_refill(
+            a_desc, b_desc, as_desc, bs_desc,
+            a_buf, b_buf, as_buf, bs_buf, refill_slot, 256, 1024)
+        acc = gl.amd.gfx1250.wmma_scaled(
+            a1, as1, "e4m3", b1, bs1, "e4m3", acc)
+    return a_desc, b_desc, as_desc, bs_desc, acc
+
+
+@gluon.jit
+def tiled_bk256_single_tail_static(
+        a_buf, b_buf, as_buf, bs_buf, slot, acc,
+        dot_a: gl.constexpr, dot_b: gl.constexpr,
+        scale_a_layout: gl.constexpr, scale_b_layout: gl.constexpr,
+        block_m: gl.constexpr, block_n: gl.constexpr):
+    scale_k: gl.constexpr = 8
+    for k in gl.static_range(0, 256, 128):
+        with gl.amd.warp_pipeline_stage("tiled_static_tail_load"):
+            a = a_buf.index(slot).slice(k, 128, 1).load(layout=dot_a)
+            a_scale = tiled_load_scale_preshuffled(
+                as_buf, slot, k // 32, scale_a_layout, block_m, scale_k)
+            b = b_buf.index(slot).slice(
+                k, 128, 1).permute([1, 0]).load(layout=dot_b)
+            b_scale = tiled_load_scale_preshuffled(
+                bs_buf, slot, k // 32, scale_b_layout, block_n, scale_k)
+        with gl.amd.warp_pipeline_stage("tiled_static_tail_compute"):
+            acc = gl.amd.gfx1250.wmma_scaled(
+                a, a_scale, "e4m3", b, b_scale, "e4m3", acc)
+    return acc
+
+
+@gluon.jit
 def tiled_bk512_stage8(
         a_buf, b_buf, as_buf, bs_buf, slot,
         a_desc, b_desc, as_desc, bs_desc, acc,
         dot_a: gl.constexpr, dot_b: gl.constexpr,
         scale_a_layout: gl.constexpr, scale_b_layout: gl.constexpr,
-        block_m: gl.constexpr, block_n: gl.constexpr):
-    tdm.async_wait(3)
+        block_m: gl.constexpr, block_n: gl.constexpr,
+        wait_count: gl.constexpr):
+    tdm.async_wait(wait_count)
     with gl.amd.warp_pipeline_stage(
             "tiled_stage0_load_k0", priority=0, phase_gap=2):
         a0 = a_buf.index(slot).slice(0, 128, 1).load(layout=dot_a)
@@ -1924,15 +2249,23 @@ def tiled_store_split_n2(
         c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc0, acc1,
         output_cga: gl.constexpr, cta_m_count: gl.constexpr,
         cta_n_count: gl.constexpr, cta_tile_m: gl.constexpr,
-        cta_tile_n: gl.constexpr):
+        cta_tile_n: gl.constexpr, overlap_output_store: gl.constexpr):
     half_n: gl.constexpr = cta_tile_n // 2
     shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[half_n, 8]],
         [cta_m_count, cta_n_count, cta_tile_m, half_n],
         [3, 2, 1, 0], output_cga)
-    shared = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        [cta_m_count, cta_n_count, cta_tile_m, half_n], shared_layout)
+    if overlap_output_store:
+        shared0 = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            [cta_m_count, cta_n_count, cta_tile_m, half_n], shared_layout)
+        shared1 = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            [cta_m_count, cta_n_count, cta_tile_m, half_n], shared_layout)
+    else:
+        shared = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            [cta_m_count, cta_n_count, cta_tile_m, half_n], shared_layout)
     desc = tdm.make_tensor_descriptor(
         base=c_ptr,
         shape=(M // cta_tile_m, N // cta_tile_n, cta_tile_m, cta_tile_n),
@@ -1948,11 +2281,17 @@ def tiled_store_split_n2(
     output1 = acc1.reshape(
         (cta_m_count, cta_tile_m, cta_n_count, half_n)
     ).permute((0, 2, 1, 3))
-    shared.store(output0.to(c_ptr.type.element_ty))
-    tdm.async_store(desc, [base_m, base_n, 0, 0], shared)
-    tdm.async_wait(0)
-    shared.store(output1.to(c_ptr.type.element_ty))
-    tdm.async_store(desc, [base_m, base_n, 0, half_n], shared)
+    if overlap_output_store:
+        shared0.store(output0.to(c_ptr.type.element_ty))
+        tdm.async_store(desc, [base_m, base_n, 0, 0], shared0)
+        shared1.store(output1.to(c_ptr.type.element_ty))
+        tdm.async_store(desc, [base_m, base_n, 0, half_n], shared1)
+    else:
+        shared.store(output0.to(c_ptr.type.element_ty))
+        tdm.async_store(desc, [base_m, base_n, 0, 0], shared)
+        tdm.async_wait(0)
+        shared.store(output1.to(c_ptr.type.element_ty))
+        tdm.async_store(desc, [base_m, base_n, 0, half_n], shared)
     tdm.async_wait(0)
 
 
@@ -1968,8 +2307,12 @@ def mxfp8_stage8_tiled_gfx1250(
         block_n: gl.constexpr, block_k: gl.constexpr,
         cta_m_count: gl.constexpr, cta_n_count: gl.constexpr,
         cta_tile_m: gl.constexpr, cta_tile_n: gl.constexpr,
-        split_n: gl.constexpr, preshuffle_scales: gl.constexpr):
+        split_n: gl.constexpr, preshuffle_scales: gl.constexpr,
+        num_slots: gl.constexpr, static_k_tiles: gl.constexpr,
+        pipeline_phase_gap: gl.constexpr,
+        overlap_output_store: gl.constexpr):
     gl.static_assert(gl.num_ctas() == cta_m_count * cta_n_count)
+    gl.static_assert(2 <= num_slots and num_slots <= 4)
     pid_m, pid_n = snapshot_get_xcd_swizzled_pids(
         M, N, block_m, block_n, GRID_MN, 8, 4)
     dot_a: gl.constexpr = gl.DotOperandLayout(0, wmma, 16)
@@ -1983,132 +2326,249 @@ def mxfp8_stage8_tiled_gfx1250(
         scale_b_load: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
             dot_b_load, [block_n, 4])
     a_buf = gl.allocate_shared_memory(
-        a_ptr.type.element_ty, [2, block_m, block_k], shared_a)
+        a_ptr.type.element_ty, [num_slots, block_m, block_k], shared_a)
     b_buf = gl.allocate_shared_memory(
-        b_ptr.type.element_ty, [2, block_n, block_k], shared_b)
+        b_ptr.type.element_ty, [num_slots, block_n, block_k], shared_b)
     scale_k: gl.constexpr = block_k // 32
     scale_step: gl.constexpr = (
         scale_k * 128 if preshuffle_scales else scale_k)
     if preshuffle_scales:
         as_buf = gl.allocate_shared_memory(
             a_scale_ptr.type.element_ty,
-            [2, block_m // 128, scale_step], shared_as)
+            [num_slots, block_m // 128, scale_step], shared_as)
         bs_buf = gl.allocate_shared_memory(
             b_scale_ptr.type.element_ty,
-            [2, block_n // 128, scale_step], shared_bs)
+            [num_slots, block_n // 128, scale_step], shared_bs)
     else:
         as_buf = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty, [2, block_m, scale_k], shared_as)
+            a_scale_ptr.type.element_ty,
+            [num_slots, block_m, scale_k], shared_as)
         bs_buf = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty, [2, block_n, scale_k], shared_bs)
+            b_scale_ptr.type.element_ty,
+            [num_slots, block_n, scale_k], shared_bs)
+    descriptor_k = (
+        static_k_tiles * block_k if static_k_tiles != 0 else K)
     a_desc = tdm.make_tensor_descriptor(
-        base=a_ptr + pid_m * block_m * stride_am, shape=(M, K),
+        base=a_ptr + pid_m * block_m * stride_am, shape=(M, descriptor_k),
         strides=(stride_am, stride_ak), block_shape=(block_m, block_k),
         layout=shared_a)
     b_desc = tdm.make_tensor_descriptor(
-        base=b_ptr + pid_n * block_n * stride_bn, shape=(N, K),
+        base=b_ptr + pid_n * block_n * stride_bn, shape=(N, descriptor_k),
         strides=(stride_bn, stride_bk), block_shape=(block_n, block_k),
         layout=shared_b)
     if preshuffle_scales:
         as_desc = tdm.make_tensor_descriptor(
             base=a_scale_ptr + (pid_m * block_m) // 128 * stride_as,
-            shape=(M // 128, K // 32 * 128), strides=(stride_as, 1),
+            shape=(M // 128, descriptor_k // 32 * 128),
+            strides=(stride_as, 1),
             block_shape=(block_m // 128, scale_step), layout=shared_as)
         bs_desc = tdm.make_tensor_descriptor(
             base=b_scale_ptr + (pid_n * block_n) // 128 * stride_bs,
-            shape=(N // 128, K // 32 * 128), strides=(stride_bs, 1),
+            shape=(N // 128, descriptor_k // 32 * 128),
+            strides=(stride_bs, 1),
             block_shape=(block_n // 128, scale_step), layout=shared_bs)
     else:
         as_desc = tdm.make_tensor_descriptor(
             base=a_scale_ptr + pid_m * block_m * stride_as,
-            shape=(M, K // 32), strides=(stride_as, 1),
+            shape=(M, descriptor_k // 32), strides=(stride_as, 1),
             block_shape=(block_m, scale_k), layout=shared_as)
         bs_desc = tdm.make_tensor_descriptor(
             base=b_scale_ptr + pid_n * block_n * stride_bs,
-            shape=(N, K // 32), strides=(stride_bs, 1),
+            shape=(N, descriptor_k // 32), strides=(stride_bs, 1),
             block_shape=(block_n, scale_k), layout=shared_bs)
-    for slot in gl.static_range(2):
+    prefetch_slots: gl.constexpr = (
+        num_slots - 1
+        if block_k == 128 or (static_k_tiles != 0 and block_k == 256)
+        else num_slots)
+    for prefetch_slot in gl.static_range(prefetch_slots):
         a_desc, b_desc, as_desc, bs_desc = tiled_issue_refill(
             a_desc, b_desc, as_desc, bs_desc,
-            a_buf, b_buf, as_buf, bs_buf, slot, block_k, scale_step)
+            a_buf, b_buf, as_buf, bs_buf, prefetch_slot,
+            block_k, scale_step)
     iter_max = gl.cdiv(K, block_k)
-    gl.assume(iter_max >= 3)
-    if split_n:
+    gl.assume(iter_max >= prefetch_slots)
+    wait_count: gl.constexpr = 3 * (prefetch_slots - 1)
+    if block_k == 128:
+        if split_n:
+            acc0 = gl.zeros(
+                (block_m, block_n // 2), dtype=gl.float32, layout=wmma)
+            acc1 = gl.zeros(
+                (block_m, block_n // 2), dtype=gl.float32, layout=wmma)
+            for tile_idx in range(0, iter_max - prefetch_slots):
+                slot = tile_idx % num_slots
+                refill_slot = (tile_idx + prefetch_slots) % num_slots
+                a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
+                    tiled_bk128_split_four_buffer_stage(
+                        a_buf, b_buf, as_buf, bs_buf, slot, refill_slot,
+                        a_desc, b_desc, as_desc, bs_desc, acc0, acc1,
+                        dot_a, dot_b, dot_b_load, scale_a_layout,
+                        scale_b_layout, scale_b_load, block_m, block_n,
+                        cta_n_count, cta_tile_n))
+            for drain_idx in gl.static_range(prefetch_slots):
+                tdm.async_wait(3 * (prefetch_slots - 1 - drain_idx))
+                tail_slot = (
+                    iter_max - prefetch_slots + drain_idx) % num_slots
+                acc0, acc1 = tiled_bk128_split_four_buffer_tail(
+                    a_buf, b_buf, as_buf, bs_buf, tail_slot, acc0, acc1,
+                    dot_a, dot_b, dot_b_load, scale_a_layout,
+                    scale_b_layout, scale_b_load, block_m, block_n,
+                    cta_n_count, cta_tile_n)
+            a_buf._keep_alive()
+            b_buf._keep_alive()
+            as_buf._keep_alive()
+            bs_buf._keep_alive()
+            tiled_store_split_n2(
+                c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc0, acc1,
+                output_cga, cta_m_count, cta_n_count,
+                cta_tile_m, cta_tile_n, overlap_output_store)
+        else:
+            acc = gl.zeros((block_m, block_n), dtype=gl.float32, layout=wmma)
+            if static_k_tiles != 0:
+                for tile_idx in gl.static_range(
+                        static_k_tiles - prefetch_slots):
+                    a_desc, b_desc, as_desc, bs_desc, acc = (
+                        tiled_bk128_four_buffer_stage(
+                            a_buf, b_buf, as_buf, bs_buf,
+                            tile_idx % num_slots,
+                            (tile_idx + prefetch_slots) % num_slots,
+                            a_desc, b_desc, as_desc, bs_desc, acc,
+                            dot_a, dot_b, scale_a_layout, scale_b_layout,
+                            block_m, block_n))
+                for drain_idx in gl.static_range(prefetch_slots):
+                    tdm.async_wait(3 * (prefetch_slots - 1 - drain_idx))
+                    acc = tiled_bk128_four_buffer_tail(
+                        a_buf, b_buf, as_buf, bs_buf,
+                        (static_k_tiles - prefetch_slots
+                         + drain_idx) % num_slots, acc,
+                        dot_a, dot_b, scale_a_layout, scale_b_layout,
+                        block_m, block_n)
+            else:
+                for tile_idx in range(0, iter_max - prefetch_slots):
+                    slot = tile_idx % num_slots
+                    refill_slot = (tile_idx + prefetch_slots) % num_slots
+                    a_desc, b_desc, as_desc, bs_desc, acc = (
+                        tiled_bk128_four_buffer_stage(
+                            a_buf, b_buf, as_buf, bs_buf, slot, refill_slot,
+                            a_desc, b_desc, as_desc, bs_desc, acc,
+                            dot_a, dot_b, scale_a_layout, scale_b_layout,
+                            block_m, block_n))
+                for drain_idx in gl.static_range(prefetch_slots):
+                    tdm.async_wait(3 * (prefetch_slots - 1 - drain_idx))
+                    tail_slot = (
+                        iter_max - prefetch_slots + drain_idx) % num_slots
+                    acc = tiled_bk128_four_buffer_tail(
+                        a_buf, b_buf, as_buf, bs_buf, tail_slot, acc,
+                        dot_a, dot_b, scale_a_layout, scale_b_layout,
+                        block_m, block_n)
+            a_buf._keep_alive()
+            b_buf._keep_alive()
+            as_buf._keep_alive()
+            bs_buf._keep_alive()
+            snapshot_tdm_store_full_tile(
+                c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc,
+                wmma, block_m, block_n, cta_n_count)
+    elif split_n:
         acc0 = gl.zeros(
             (block_m, block_n // 2), dtype=gl.float32, layout=wmma)
         acc1 = gl.zeros(
             (block_m, block_n // 2), dtype=gl.float32, layout=wmma)
-        for tile_idx in range(0, iter_max - 2):
-            split_slot = tile_idx % 2
-            a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
-                tiled_bk256_stage8(
-                    a_buf, b_buf, as_buf, bs_buf, split_slot,
-                    a_desc, b_desc, as_desc, bs_desc, acc0, acc1,
-                    dot_a, dot_b, dot_b_load, scale_a_layout,
-                    scale_b_layout, scale_b_load, block_m, block_n,
-                    cta_n_count, cta_tile_n))
-        tdm.async_wait(3)
-        penultimate_slot = (iter_max - 2) % 2
-        acc0, acc1 = tiled_bk256_tail(
-            a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc0, acc1,
-            dot_a, dot_b, dot_b_load, scale_a_layout, scale_b_layout,
-            scale_b_load, block_m, block_n, cta_n_count, cta_tile_n)
-        tdm.async_wait(0)
-        last_slot = (iter_max - 1) % 2
-        acc0, acc1 = tiled_bk256_tail(
-            a_buf, b_buf, as_buf, bs_buf, last_slot, acc0, acc1,
-            dot_a, dot_b, dot_b_load, scale_a_layout, scale_b_layout,
-            scale_b_load, block_m, block_n, cta_n_count, cta_tile_n)
-        snapshot_cluster_wait()
+        if static_k_tiles != 0:
+            for tile_idx in gl.static_range(
+                    static_k_tiles - prefetch_slots):
+                a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
+                    tiled_bk256_split_four_stage_static(
+                        a_buf, b_buf, as_buf, bs_buf,
+                        tile_idx % num_slots,
+                        (tile_idx + prefetch_slots) % num_slots,
+                        a_desc, b_desc, as_desc, bs_desc, acc0, acc1,
+                        dot_a, dot_b, dot_b_load, scale_a_layout,
+                        scale_b_layout, scale_b_load, block_m, block_n,
+                        cta_n_count, cta_tile_n, wait_count))
+            for drain_idx in gl.static_range(prefetch_slots):
+                tdm.async_wait(3 * (prefetch_slots - 1 - drain_idx))
+                acc0, acc1 = tiled_bk256_split_tail_static(
+                    a_buf, b_buf, as_buf, bs_buf,
+                    (static_k_tiles - prefetch_slots
+                     + drain_idx) % num_slots,
+                    acc0, acc1, dot_a, dot_b, dot_b_load,
+                    scale_a_layout, scale_b_layout, scale_b_load,
+                    block_m, block_n, cta_n_count, cta_tile_n)
+        else:
+            for tile_idx in range(0, iter_max - num_slots):
+                split_slot = tile_idx % num_slots
+                a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
+                    tiled_bk256_stage8(
+                        a_buf, b_buf, as_buf, bs_buf, split_slot,
+                        a_desc, b_desc, as_desc, bs_desc, acc0, acc1,
+                        dot_a, dot_b, dot_b_load, scale_a_layout,
+                        scale_b_layout, scale_b_load, block_m, block_n,
+                        cta_n_count, cta_tile_n, wait_count))
+            for drain_idx in gl.static_range(num_slots):
+                tdm.async_wait(3 * (num_slots - 1 - drain_idx))
+                tail_slot = (iter_max - num_slots + drain_idx) % num_slots
+                acc0, acc1 = tiled_bk256_tail(
+                    a_buf, b_buf, as_buf, bs_buf, tail_slot, acc0, acc1,
+                    dot_a, dot_b, dot_b_load, scale_a_layout, scale_b_layout,
+                    scale_b_load, block_m, block_n,
+                    cta_n_count, cta_tile_n)
         a_buf._keep_alive()
         b_buf._keep_alive()
         as_buf._keep_alive()
         bs_buf._keep_alive()
         tiled_store_split_n2(
             c_ptr, pid_m, pid_n, stride_cm, stride_cn, M, N, acc0, acc1,
-            output_cga, cta_m_count, cta_n_count, cta_tile_m, cta_tile_n)
+            output_cga, cta_m_count, cta_n_count, cta_tile_m, cta_tile_n,
+            overlap_output_store)
     else:
         acc = gl.zeros((block_m, block_n), dtype=gl.float32, layout=wmma)
-        for tile_idx in range(0, iter_max - 2):
-            full_slot = tile_idx % 2
-            if block_k == 256:
+        if static_k_tiles != 0:
+            for tile_idx in gl.static_range(
+                    static_k_tiles - prefetch_slots):
                 a_desc, b_desc, as_desc, bs_desc, acc = (
-                    tiled_bk256_single_stage8(
+                    tiled_bk256_single_four_stage_static(
+                        a_buf, b_buf, as_buf, bs_buf,
+                        tile_idx % num_slots,
+                        (tile_idx + prefetch_slots) % num_slots,
+                        a_desc, b_desc, as_desc, bs_desc, acc,
+                        dot_a, dot_b, scale_a_layout, scale_b_layout,
+                        block_m, block_n, wait_count))
+            for drain_idx in gl.static_range(prefetch_slots):
+                tdm.async_wait(3 * (prefetch_slots - 1 - drain_idx))
+                acc = tiled_bk256_single_tail_static(
+                    a_buf, b_buf, as_buf, bs_buf,
+                    (static_k_tiles - prefetch_slots
+                     + drain_idx) % num_slots,
+                    acc, dot_a, dot_b, scale_a_layout, scale_b_layout,
+                    block_m, block_n)
+        else:
+            for tile_idx in range(0, iter_max - num_slots):
+                full_slot = tile_idx % num_slots
+                if block_k == 256:
+                    a_desc, b_desc, as_desc, bs_desc, acc = (
+                        tiled_bk256_single_stage8(
+                            a_buf, b_buf, as_buf, bs_buf, full_slot,
+                            a_desc, b_desc, as_desc, bs_desc, acc,
+                            dot_a, dot_b, scale_a_layout, scale_b_layout,
+                            block_m, block_n, wait_count, pipeline_phase_gap))
+                else:
+                    a_desc, b_desc, as_desc, bs_desc, acc = tiled_bk512_stage8(
                         a_buf, b_buf, as_buf, bs_buf, full_slot,
                         a_desc, b_desc, as_desc, bs_desc, acc,
                         dot_a, dot_b, scale_a_layout, scale_b_layout,
-                        block_m, block_n))
-            else:
-                a_desc, b_desc, as_desc, bs_desc, acc = tiled_bk512_stage8(
-                    a_buf, b_buf, as_buf, bs_buf, full_slot,
-                    a_desc, b_desc, as_desc, bs_desc, acc,
-                    dot_a, dot_b, scale_a_layout, scale_b_layout,
-                    block_m, block_n)
-        tdm.async_wait(3)
-        penultimate_slot = (iter_max - 2) % 2
-        if block_k == 256:
-            acc = tiled_bk256_single_tail(
-                a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc,
-                dot_a, dot_b, scale_a_layout, scale_b_layout,
-                block_m, block_n)
-        else:
-            acc = tiled_consume_tail(
-                a_buf, b_buf, as_buf, bs_buf, penultimate_slot, acc,
-                dot_a, dot_b, scale_a_layout, scale_b_layout,
-                block_m, block_n, block_k)
-        tdm.async_wait(0)
-        last_slot = (iter_max - 1) % 2
-        if block_k == 256:
-            acc = tiled_bk256_single_tail(
-                a_buf, b_buf, as_buf, bs_buf, last_slot, acc,
-                dot_a, dot_b, scale_a_layout, scale_b_layout,
-                block_m, block_n)
-        else:
-            acc = tiled_consume_tail(
-                a_buf, b_buf, as_buf, bs_buf, last_slot, acc,
-                dot_a, dot_b, scale_a_layout, scale_b_layout,
-                block_m, block_n, block_k)
-        snapshot_cluster_wait()
+                        block_m, block_n, wait_count)
+            for drain_idx in gl.static_range(num_slots):
+                tdm.async_wait(3 * (num_slots - 1 - drain_idx))
+                tail_slot = (iter_max - num_slots + drain_idx) % num_slots
+                if block_k == 256:
+                    acc = tiled_bk256_single_tail(
+                        a_buf, b_buf, as_buf, bs_buf, tail_slot, acc,
+                        dot_a, dot_b, scale_a_layout, scale_b_layout,
+                        block_m, block_n)
+                else:
+                    acc = tiled_consume_tail(
+                        a_buf, b_buf, as_buf, bs_buf, tail_slot, acc,
+                        dot_a, dot_b, scale_a_layout, scale_b_layout,
+                        block_m, block_n, block_k)
         a_buf._keep_alive()
         b_buf._keep_alive()
         as_buf._keep_alive()
@@ -2118,12 +2578,13 @@ def mxfp8_stage8_tiled_gfx1250(
             wmma, block_m, block_n, cta_n_count)
 
 
-def build_tiled_layouts(config, cluster_width):
+def build_tiled_layouts(config, cluster_m, cluster_n, force_split_n=False):
     cta_m, cta_n, block_k, split_n, preshuffle = TILED_CONFIGS[config]
-    block_m = cta_m * cluster_width
-    block_n = cta_n * cluster_width
+    split_n = split_n or force_split_n
+    block_m = cta_m * cluster_m
+    block_n = cta_n * cluster_n
     cga = make_cga_layout(
-        [cluster_width, cluster_width], [cluster_width, cluster_width],
+        [cluster_m, cluster_n], [cluster_m, cluster_n],
         [0, 1])
     output_cga = tuple(tuple(basis) + (0, 0) for basis in cga)
     local_a = gl.PaddedSharedLayout.with_identity_for(
@@ -2177,13 +2638,37 @@ def build_tiled_layouts(config, cluster_width):
 def make_tiled_case(args):
     cta_m, cta_n, block_k, split_n, preshuffle = (
         TILED_CONFIGS[args.tiled_config])
-    cluster = args.tiled_cluster_width
-    block_m = cta_m * cluster
-    block_n = cta_n * cluster
+    cluster_shape = getattr(args, "tiled_cluster_shape", None)
+    if cluster_shape is None:
+        cluster_m = cluster_n = args.tiled_cluster_width
+    else:
+        cluster_m, cluster_n = cluster_shape
+    num_slots = args.tiled_buffers
+    use_static_k = getattr(args, "tiled_static_k", False)
+    force_split_n = (
+        use_static_k and block_k == 256 and args.tiled_static_split_n)
+    split_n = split_n or force_split_n
+    static_k_tiles = args.K // block_k if use_static_k else 0
+    pipeline_phase_gap = (
+        1 if use_static_k else getattr(args, "tiled_phase_gap", 2))
+    block_m = cta_m * cluster_m
+    block_n = cta_n * cluster_n
     if args.M % block_m or args.N % block_n or args.K % block_k:
         raise ValueError("shape is not divisible by the selected tiled kernel")
-    if args.K // block_k < 3:
-        raise ValueError("tiled kernel requires at least three K tiles")
+    if block_k == 128 and num_slots != 4:
+        raise ValueError("128x128x128 requires four buffers")
+    if use_static_k and args.tiled_config not in (
+            "128x128x128", "128x128x256"):
+        raise ValueError(
+            "static K requires a 128x128 BK128 or BK256 tile")
+    if (block_k != 128 and num_slots > 2
+            and args.tiled_config not in (
+                "128x128x256", "256x128x256", "64x64x512")):
+        raise ValueError(
+            "this tile does not support more than two buffers")
+    if args.K // block_k < num_slots:
+        raise ValueError(
+            f"tiled kernel requires at least {num_slots} K tiles")
     torch.manual_seed(args.seed)
     if args.input_mode == "trig":
         a = make_trig_tensor(
@@ -2213,25 +2698,37 @@ def make_tiled_case(args):
         bs_d = b_scale_obj.data.contiguous().cuda()
     c_d = torch.empty(
         (args.M, args.N), dtype=torch.bfloat16, device="cuda")
-    layouts = build_tiled_layouts(args.tiled_config, cluster)
+    layouts = build_tiled_layouts(
+        args.tiled_config, cluster_m, cluster_n,
+        force_split_n=force_split_n)
     grid = (
         triton.cdiv(args.M, block_m) * triton.cdiv(args.N, block_n), 1)
 
-    def launch():
+    def launch_with_inputs(a_input, b_input, as_input, bs_input):
         shared_a, shared_b, shared_as, shared_bs, wmma, load_wmma, cga = layouts
         return mxfp8_stage8_tiled_gfx1250[grid](
-            a_d, b_d, c_d, as_d, bs_d, args.M, args.N, args.K,
-            a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
-            c_d.stride(0), c_d.stride(1), as_d.stride(0), bs_d.stride(0),
+            a_input, b_input, c_d, as_input, bs_input,
+            args.M, args.N, args.K,
+            a_input.stride(0), a_input.stride(1),
+            b_input.stride(1), b_input.stride(0),
+            c_d.stride(0), c_d.stride(1),
+            as_input.stride(0), bs_input.stride(0),
             GRID_MN=grid[0], shared_a=shared_a, shared_b=shared_b,
             shared_as=shared_as, shared_bs=shared_bs, wmma=wmma,
             load_wmma=load_wmma, output_cga=cga,
             block_m=block_m, block_n=block_n, block_k=block_k,
-            cta_m_count=cluster, cta_n_count=cluster,
+            cta_m_count=cluster_m, cta_n_count=cluster_n,
             cta_tile_m=cta_m, cta_tile_n=cta_n, split_n=split_n,
-            preshuffle_scales=preshuffle,
-            num_warps=8, waves_per_eu=2, num_ctas=cluster * cluster,
+            preshuffle_scales=preshuffle, num_slots=num_slots,
+            static_k_tiles=static_k_tiles,
+            pipeline_phase_gap=pipeline_phase_gap,
+            overlap_output_store=args.overlap_output_store,
+            num_warps=8, waves_per_eu=2,
+            num_ctas=cluster_m * cluster_n,
             llvm_fn_attrs=AGPR_ATTRS)
+
+    launch = make_rotating_launcher(
+        args, (a_d, b_d, as_d, bs_d), launch_with_inputs)
 
     def check():
         c_d.zero_()
@@ -2332,12 +2829,15 @@ def make_best_mxfp8_case(args):
     grid = (
         triton.cdiv(args.M, block_m) * triton.cdiv(args.N, block_n), 1)
 
-    def launch():
+    def launch_with_inputs(a_input, b_input, as_input, bs_input):
         shared_a, shared_b, shared_as, shared_bs, wmma, load_wmma, cga = layouts
         return fp8_scaled_cluster_bk256_opt_kernel_gfx1250[grid](
-            a_d, b_d, c_d, as_d, bs_d, args.M, args.N, args.K,
-            a_d.stride(0), a_d.stride(1), b_d.stride(1), b_d.stride(0),
-            c_d.stride(0), c_d.stride(1), as_d.stride(0), bs_d.stride(0),
+            a_input, b_input, c_d, as_input, bs_input,
+            args.M, args.N, args.K,
+            a_input.stride(0), a_input.stride(1),
+            b_input.stride(1), b_input.stride(0),
+            c_d.stride(0), c_d.stride(1),
+            as_input.stride(0), bs_input.stride(0),
             GRID_MN=grid[0], SHARED_LAYOUT_A=shared_a,
             SHARED_LAYOUT_B=shared_b, SHARED_SCALE_A=shared_as,
             SHARED_SCALE_B=shared_bs, WMMA_LAYOUT=wmma,
@@ -2346,8 +2846,13 @@ def make_best_mxfp8_case(args):
             STAGE8_REFILL=True, TWO_TDM=False,
             B_SCALE_CONTIGUOUS=False, A_SCALE_COMBINED=False,
             DESC_UPDATE_STAGE5=False, SCALE_LOAD_STAGE1=False,
-            B_LOAD_STAGE1=True, num_warps=8, waves_per_eu=2, num_ctas=16,
+            B_LOAD_STAGE1=True,
+            OVERLAP_OUTPUT_STORE=args.overlap_output_store,
+            num_warps=8, waves_per_eu=2, num_ctas=16,
             llvm_fn_attrs=AGPR_ATTRS)
+
+    launch = make_rotating_launcher(
+        args, (a_d, b_d, as_d, bs_d), launch_with_inputs)
 
     def check():
         c_d.zero_()
@@ -2414,7 +2919,9 @@ def make_best_fp8_mxfp4_case(args):
             WMMA_LAYOUT=wmma, LOAD_WMMA_LAYOUT=load_wmma,
             OUTPUT_CGA_LAYOUT=cga, BLOCK_M=block_m, BLOCK_N=block_n,
             CTA_M=4, CTA_N=4, REUSE_A=True, GROUP_SIZE=group_size,
-            WAITCNT=4, B_LOAD_STAGE1=True, num_warps=8, waves_per_eu=2,
+            WAITCNT=4, B_LOAD_STAGE1=True,
+            OVERLAP_OUTPUT_STORE=args.overlap_output_store,
+            num_warps=8, waves_per_eu=2,
             num_ctas=16, llvm_fn_attrs=AGPR_ATTRS)
 
     def check():
@@ -2530,6 +3037,21 @@ def main():
         default="128x128x256")
     parser.add_argument(
         "--tiled-cluster-width", type=int, choices=(2, 4), default=4)
+    parser.add_argument(
+        "--tiled-cluster-shape", type=int, nargs=2, metavar=("M", "N"),
+        help="rectangular tiled cluster shape; overrides cluster width")
+    parser.add_argument(
+        "--tiled-buffers", type=int, choices=(2, 3, 4), default=2)
+    parser.add_argument(
+        "--tiled-static-k", action="store_true",
+        help="specialize and unroll a supported tiled K loop")
+    parser.add_argument(
+        "--tiled-static-split-n",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="use split-N accumulators for static BK256")
+    parser.add_argument(
+        "--tiled-phase-gap", type=int, choices=(1, 2), default=2,
+        help="dynamic BK256 warp-pipeline phase gap")
     parser.add_argument("-M", type=int, default=4096)
     parser.add_argument("-N", type=int, default=4096)
     parser.add_argument("-K", type=int, default=65536)
@@ -2538,6 +3060,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument(
+        "--rotate-inputs", action=argparse.BooleanOptionalAction, default=False,
+        help="use a distinct deep-copied MXFP8 input set for every launch")
+    parser.add_argument(
+        "--overlap-output-store",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="use separate LDS buffers for overlapping split-N output stores")
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--probe-iters", type=int, default=20)
     parser.add_argument("--graph-ms", type=float, default=100.0)
@@ -2546,6 +3075,8 @@ def main():
     args = parser.parse_args()
     if not args.check and not args.benchmark:
         parser.error("select --check and/or --benchmark")
+    if args.replays <= 0 or args.warmup < 0:
+        parser.error("benchmark iteration counts must be positive")
     populate_best_defaults(args)
     builders = {**BEST_CASE_BUILDERS, "mxfp8_tiled": make_tiled_case}
     launch, check = builders[args.kernel](args)
