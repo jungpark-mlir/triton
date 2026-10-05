@@ -14,11 +14,7 @@ DEFAULT_PROFILE_NAME = "proton"
 
 def _select_backend() -> str:
     backend = triton.runtime.driver.active.get_current_target().backend
-    if backend == "cuda":
-        return "cupti"
-    if backend == "hip":
-        return "rocprofiler"
-    raise ValueError("No backend is available for the current target.")
+    return libproton.select_profiler_from_triton_backend(backend)
 
 
 def _get_mode_str(backend: str, mode: Optional[Union[str, BaseMode]]) -> str:
@@ -92,7 +88,7 @@ def start(
                                                Can be a string or an instance of BaseMode (or any subclass thereof).
                                                Defaults to None.
                                                For "cupti", available options are [None, "pcsampling", "periodic_flushing"].
-                                               For "rocprofiler", available options are [None, "periodic_flushing"].
+                                               For "rocprofiler", available options are [None, "pcsampling", "periodic_flushing"].
                                                For "roctracer", available options are [None, "periodic_flushing"].
                                                For "instrumentation", available options are [None].
                                                Each mode has a set of control knobs following with the mode name.

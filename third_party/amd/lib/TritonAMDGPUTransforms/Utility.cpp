@@ -2,6 +2,7 @@
 
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
@@ -148,7 +149,7 @@ int deduceMinCountOnDefChain(Value defValue, Operation *consumerOp,
 // pad,  r1, r5,  r9, r13, r17, r21, r25
 // r29, pad, r2,  r6, r10, r14, r18, r22
 // r26, r30, pad, r3 ....
-static ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
+ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
     ttg::DotOperandEncodingAttr dotOpEnc, ttg::TensorOrMemDesc srcTy,
     ArrayRef<unsigned> sharedOrder, bool useAsyncCopy, unsigned warpSize) {
   auto *ctx = srcTy.getContext();
@@ -237,7 +238,9 @@ static ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
     padding = elemsPer8Bytes;
   }
 
-  unsigned contigLanes = contigDim / vecSize;
+  // Clamped to [1, warpSize]: a row wider than a warp still counts as one row
+  // per warp below, and a row narrower than a vector cannot make it zero.
+  unsigned contigLanes = std::clamp(contigDim / vecSize, 1u, warpSize);
   unsigned wrap = std::min(contigDim, elemPerBankRow) / padding;
   // wrap == 0 means padding > contigDim, which is not a valid configuration
   if (wrap == 0) {
@@ -528,4 +531,13 @@ composePaddedLayout(const TargetFeatures &targetFeatures, int opIdx,
   }
 
   return {};
+}
+
+Value createUpdateTDMDescriptorOp(OpBuilder &builder, Location loc, Value desc,
+                                  ValueRange addOffsets, Value pred) {
+  auto updateOp = mlir::triton::amdgpu::UpdateTensorDescriptorOp::create(
+      builder, loc, desc.getType(), desc, addOffsets,
+      /*set_bounds=*/ValueRange{}, pred);
+  updateOp.setClampBounds(true);
+  return updateOp.getResult();
 }

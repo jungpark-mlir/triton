@@ -6,6 +6,7 @@ from typing import Tuple, List, Dict, Callable, TypeVar, Optional
 
 import math
 import numpy as np
+import time
 
 import triton
 import triton.language as tl
@@ -60,13 +61,14 @@ class TensorHandle:
 class TensorDescHandle:
 
     def __init__(self, base: TensorHandle, shape: List[TensorHandle], strides: List[TensorHandle],
-                 block_shape: List[int], padding):
+                 block_shape: List[int], padding, round_f32_to_tf32: bool = False):
         self.base = base
         self.ndim = len(shape)
         self.shape = shape
         self.strides = strides
         self.block_shape = block_shape
         self.padding = padding
+        self.round_f32_to_tf32 = round_f32_to_tf32
 
     def validate(self):
         assert self.base.data.item() % 16 == 0, "base must be 16-byte aligned"
@@ -97,7 +99,7 @@ class TensorDescHandle:
             masks = masks & (0 <= off) & (off < self.shape[dim].data)
         assert ptrs_data.dtype == np.uint64
         ptrs_handle = TensorHandle(ptrs_data, self.base.dtype.scalar)
-        return ptrs_handle, masks
+        return ptrs_handle, TensorHandle(masks, tl.int1)
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,16 @@ def _get_signed_np_dtype(dtype):
     return dtype
 
 
+def _round_f32_to_tf32(data):
+    # TMA loads through a TFLOAT32 tensor map round to nearest even at 10 mantissa bits, with
+    # Inf and NaN left as they are; RewriteTensorDescriptorToPointer emits the same arithmetic.
+    bits = np.asarray(data, dtype=np.float32).view(np.uint32)
+    special = (bits & np.uint32(0x7F800000)) == np.uint32(0x7F800000)
+    round_bias = ((bits >> np.uint32(13)) & np.uint32(1)) + np.uint32(0x00000FFF)
+    rounded = (bits + round_bias) & np.uint32(0xFFFFE000)
+    return np.where(special, bits, rounded).view(np.float32)
+
+
 def _get_np_dtype(tt_dtype):
     if isinstance(tt_dtype, tl.pointer_type):
         return np.dtype(np.uint64)
@@ -177,21 +189,22 @@ def _get_np_dtype(tt_dtype):
 def _convert_float(input, input_dtype, output_dtype, rounding_mode):
     input_uint_dtype = getattr(np, f"uint{input_dtype.primitive_bitwidth}")
     output_unint_dtype = getattr(np, f"uint{output_dtype.primitive_bitwidth}")
-    input_bin = np.frombuffer(input.tobytes(), dtype=input_uint_dtype)
+    input_bin = np.frombuffer(input.tobytes(), dtype=input_uint_dtype).astype(np.int64)
     sign = (input_bin >> (input_dtype.primitive_bitwidth - 1)) & 0x01
     input_exponent_width = input_dtype.primitive_bitwidth - input_dtype.fp_mantissa_width - 1
     output_exponent_width = output_dtype.primitive_bitwidth - output_dtype.fp_mantissa_width - 1
     significand = input_bin & ((1 << input_dtype.fp_mantissa_width) - 1)
     bias_input = input_dtype.exponent_bias
     bias_output = output_dtype.exponent_bias
-    exponent = ((input_bin >> input_dtype.fp_mantissa_width) & ((1 << input_exponent_width) - 1)).astype(np.int32)
+    input_exponent = (input_bin >> input_dtype.fp_mantissa_width) & ((1 << input_exponent_width) - 1)
+    exponent = input_exponent.copy()
     subnormal_index = exponent == 0
     if np.any(subnormal_index):
         # Credit to Phil: phil@openai.com
         # subnormal repr: ((-1.0)**sign) * (2.0**(1 - exp_bias)) * (2^(m0) + 2^(m1) + ... + 2^(mn))
         # where m0, m1, ..., mn are the 1-bit of the mantissa
         # convert it to normal repr: ((-1.0)**sign) * (2.0**(1 + m0 - exp_bias)) * (1 + 2^(m1 - m0) + ... + 2^(mn - m0))
-        bit_pos = np.zeros_like(input_bin, dtype=np.int32)
+        bit_pos = np.zeros_like(input_bin)
         # Find the most significant bit of the mantissa in the significand
         for i in range(input_dtype.fp_mantissa_width):
             bit_index = ((significand >> i) & 0x01)
@@ -203,39 +216,50 @@ def _convert_float(input, input_dtype, output_dtype, rounding_mode):
         exponent[zero_significand_index & subnormal_index] = bias_input - bias_output
         significand[subnormal_index] = (significand[subnormal_index] << bit_pos[subnormal_index]) & (
             (1 << input_dtype.fp_mantissa_width) - 1)
-    # Prevent overflow and underflow
-    exponent_output = np.maximum(0, np.minimum((exponent - bias_input + bias_output), (1 << output_exponent_width) - 1))
-    exponent_output = exponent_output.astype(output_unint_dtype)
-    sign_output = sign.astype(output_unint_dtype)
-    if input_dtype.primitive_bitwidth > output_dtype.primitive_bitwidth:  # Downcast
-        significand_output = (significand >> (input_dtype.fp_mantissa_width - output_dtype.fp_mantissa_width)) & (
-            (1 << output_dtype.fp_mantissa_width) - 1)
-        if rounding_mode == _ir.ROUNDING_MODE.RTNE:  # Round to nearst even
-            # find the cut-off bit
-            cut_off = significand & (1 << (input_dtype.fp_mantissa_width - output_dtype.fp_mantissa_width - 1))
-            significand_output = significand_output + (cut_off > 0)
-        significand_output = significand_output.astype(output_unint_dtype)
-    else:  # Upcast
-        significand_output = (significand.astype(output_unint_dtype) <<
-                              (output_dtype.fp_mantissa_width - input_dtype.fp_mantissa_width)) & (
-                                  (1 << output_dtype.fp_mantissa_width) - 1)
-    subnormal_index = exponent_output == 0
-    if np.any(subnormal_index):  # underflow
-        # normal repr: ((-1.0)**sign) * (2.0**(exp - exp_bias_input)) * (1 + 2^(m0) + 2^(m1) + ... + 2^(mn))
-        # where m0, m1, ..., mn are the 1-bit of the mantissa
-        # shift = (1 - exp_bias_output) - (exp - exp_bias_input)
-        # convert it to subnormal repr: ((-1.0)**sign) * (2.0**(1 - exp_bias_output)) * (2^(-shift) + 2^(m0 - shift) + 2^(m1 - shift) + ... + 2^(mn - shift))
-        exponent = ((input_bin >> input_dtype.fp_mantissa_width) & ((1 << input_exponent_width) - 1)).astype(np.int32)
-        non_zero_exponent_index = exponent != 0
-        # If the original exponent is not zero, we still need to shift the significand and consider the 1.0 part in mantissa
-        subnormal_index = subnormal_index & non_zero_exponent_index
-        shift = np.zeros_like(input_bin, dtype=np.int32)
-        shift[subnormal_index] = (1 - bias_output) - (exponent[subnormal_index] - bias_input)
-        significand_output[subnormal_index] = (significand_output[subnormal_index] >> shift[subnormal_index]) | (
-            1 << (output_dtype.fp_mantissa_width - shift[subnormal_index]))
+    sign_output = sign
+    # Include the leading bit and align subnormal results before rounding.
+    full_significand = significand | (1 << input_dtype.fp_mantissa_width)
+    full_significand[(input_bin & ((1 << (input_dtype.primitive_bitwidth - 1)) - 1)) == 0] = 0
+    output_exponent = exponent - bias_input + bias_output
+    shift = input_dtype.fp_mantissa_width - output_dtype.fp_mantissa_width + np.maximum(1 - output_exponent, 0)
+    # Larger right shifts necessarily round to zero; widening shifts left instead.
+    right_shift = np.clip(shift, 0, input_dtype.fp_mantissa_width + 2)
+    left_shift = np.maximum(-shift, 0)
+    retained = (full_significand >> right_shift) << left_shift
+    if rounding_mode == _ir.ROUNDING_MODE.RTNE:
+        discarded = full_significand & ((1 << right_shift) - 1)
+        halfway = 1 << (np.maximum(right_shift, 1) - 1)
+        retained += (right_shift > 0) & ((discarded > halfway) | ((discarded == halfway) & ((retained & 1) != 0)))
+    carry = retained >= (1 << (output_dtype.fp_mantissa_width + 1))
+    retained >>= carry
+    output_exponent = np.maximum(output_exponent, 1) + carry
+    max_exponent = (1 << output_exponent_width) - 1
+    exponent_output = np.minimum(output_exponent, max_exponent)
+    exponent_output[retained < (1 << output_dtype.fp_mantissa_width)] = 0
+    significand_output = retained & ((1 << output_dtype.fp_mantissa_width) - 1)
+    if not input_dtype.is_fp8() and not output_dtype.is_fp8():
+        # Reserved source exponents represent infinities/NaNs, not finite exponents.
+        nonfinite = input_exponent == (1 << input_exponent_width) - 1
+        input_nan = nonfinite & ((input_bin & ((1 << input_dtype.fp_mantissa_width) - 1)) != 0)
+        overflow = (output_exponent >= max_exponent) & ~nonfinite
+        if rounding_mode == _ir.ROUNDING_MODE.RTNE:
+            exponent_output[overflow] = max_exponent
+            significand_output[overflow] = 0
+            significand_output[input_nan] = 1 << (output_dtype.fp_mantissa_width - 1)
+        else:
+            exponent_output[overflow] = max_exponent - 1
+            significand_output[overflow] = (1 << output_dtype.fp_mantissa_width) - 1
+        exponent_output[nonfinite] = max_exponent
+        significand_output[nonfinite & ~input_nan] = 0
+    if output_dtype in (tl.float8e4b8, tl.float8e5b16):
+        # FNUZ formats have only unsigned zero; the sign bit alone encodes NaN.
+        zero_output = (exponent_output == 0) & (significand_output == 0)
+        if input_dtype in (tl.float8e4b8, tl.float8e5b16):
+            zero_output &= input_bin != 0x80
+        sign_output[zero_output] = 0
     output = (sign_output << (output_dtype.primitive_bitwidth - 1)) | (
         exponent_output << output_dtype.fp_mantissa_width) | significand_output
-    return output.reshape(input.shape)
+    return output.astype(output_unint_dtype).reshape(input.shape)
 
 
 def _erf(x):
@@ -246,15 +270,21 @@ def _erf(x):
 def _umulhi_64(a, b):
     # Numpy does not support 128-bit multiplication
     # So we have to implement it manually
-    return (int(a) * int(b)) >> 64
+    mask = (1 << 64) - 1
+    return ((int(a) & mask) * (int(b) & mask)) >> 64
 
 
-def _e8m0_to_f32(scale):
+def _dot_scaled_scale_to_f32(scale_handle, compute_type):
+    scale = scale_handle.data
     assert scale.dtype in (np.uint8, np.int8)
-    scale = scale.astype(np.uint8)
-    scale = scale.astype(np.int32)
-    scale = scale << 23
-    scale = scale.view(np.float32)
+    bits = scale.view(np.uint8).astype(np.int32) << 23
+    if compute_type == tl.bfloat16 and scale_handle.dtype.is_int():
+        # E8M0 byte zero is 2^-127, which rounds to zero in FP16.
+        bits = np.maximum(bits, 0x00400000)
+    scale = bits.view(np.float32)
+    if scale_handle.dtype.is_int():
+        # FMA turns byte 255's infinity into NaN while preserving finite scales.
+        scale = _interpreter.fma_fp32(scale, np.zeros_like(scale), scale)
     return scale
 
 
@@ -316,7 +346,7 @@ def _unpack_e2m1(data, axis):
     return np.moveaxis(unpacked, -1, axis)
 
 
-def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack, is_rhs):
+def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack, compute_type, is_rhs):
     if format_enum == _ir.ScaleDotElemTypeTY.E2M1:
         if is_rhs:
             unpack_axis = -2 if k_pack else -1
@@ -329,14 +359,13 @@ def _prepare_dot_scaled_operand(value_handle, scale_handle, format_enum, k_pack,
     if scale_handle is None:
         return value
 
-    scale = _e8m0_to_f32(scale_handle.data)
+    scale_factor = value.shape[-2 if is_rhs else -1] // scale_handle.data.shape[-1]
+    scale = _dot_scaled_scale_to_f32(scale_handle, compute_type)
+    scale = np.repeat(scale, scale_factor, axis=-1)
 
     if is_rhs:
         # rhs is in [K, N] layout, but rhs_scale is supplied as [N, K / group].
-        scale = np.repeat(scale, value.shape[-2] // scale.shape[-1], axis=-1)
         scale = np.swapaxes(scale, -1, -2)
-    else:
-        scale = np.repeat(scale, value.shape[-1] // scale.shape[-1], axis=-1)
 
     return value * scale
 
@@ -485,6 +514,9 @@ class InterpreterBuilder:
     def get_fp16(self, value):
         return TensorHandle(np.array([value], dtype=np.float16), tl.float16)
 
+    def get_bf16(self, value):
+        return self.create_fp_trunc(self.get_fp32(value), tl.bfloat16)
+
     def get_fp32(self, value):
         return TensorHandle(np.array([value], dtype=np.float32), tl.float32)
 
@@ -504,16 +536,19 @@ class InterpreterBuilder:
         return TensorHandle(np.array([self.grid_dim[axis]], dtype=np.int32), tl.int32)
 
     # memory ops
-    def create_load(self, ptr, _0, _1, is_volatile):
+    def get_cache_policy(self, cache_modifier, eviction_policy):
+        return None
+
+    def create_load(self, ptr, cache_policy, is_volatile):
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
         other = None
-        return self.create_masked_load(ptr, mask, other, _0, _1, is_volatile)
+        return self.create_masked_load(ptr, mask, other, cache_policy, is_volatile)
 
-    def create_store(self, ptr, val, _0, _1):
+    def create_store(self, ptr, val, cache_policy):
         mask = TensorHandle(np.ones_like(ptr.data, dtype=bool), tl.int1)
-        return self.create_masked_store(ptr, val, mask, None, None)
+        return self.create_masked_store(ptr, val, mask, cache_policy)
 
-    def create_masked_load(self, ptrs, mask, other, cache_modifier, eviction_policy, is_volatile):
+    def create_masked_load(self, ptrs, mask, other, cache_policy, is_volatile):
         dtype_tt = ptrs.get_element_ty()
         dtype_np = _get_np_dtype(dtype_tt)
         if other is None:
@@ -521,16 +556,17 @@ class InterpreterBuilder:
         ret = _interpreter.load(ptrs.data, mask.data, other.data, dtype_np)
         return TensorHandle(ret, dtype_tt)
 
-    def create_masked_store(self, ptrs, value, mask, cache_modifier, eviction_policy):
+    def create_masked_store(self, ptrs, value, mask, cache_policy):
         return _interpreter.store(ptrs.data, value.data, mask.data)
 
     # casting ops
-    def cast_impl(self, src, dst_type):
+    def cast_impl(self, src, dst_type, rounding_mode=None):
         src_element_type = src.dtype.scalar
         dst_element_type = dst_type.scalar
         if (src_element_type == tl.bfloat16 and dst_element_type == tl.float32) or \
            (src_element_type == tl.float32 and dst_element_type == tl.bfloat16):
-            data = _convert_float(src.data, src_element_type, dst_element_type, None).view(_get_np_dtype(dst_type))
+            data = _convert_float(src.data, src_element_type, dst_element_type,
+                                  rounding_mode).view(_get_np_dtype(dst_type))
             return TensorHandle(data, dst_type.scalar)
         else:
             return TensorHandle(src.data.astype(_get_np_dtype(dst_type)), dst_type.scalar)
@@ -540,7 +576,7 @@ class InterpreterBuilder:
     create_fp_to_si = lambda self, src, dst_type: self.cast_impl(src, dst_type)
     create_fp_to_ui = lambda self, src, dst_type: self.cast_impl(src, dst_type)
     create_fp_ext = lambda self, src, dst_type: self.cast_impl(src, dst_type)
-    create_fp_trunc = lambda self, src, dst_type: self.cast_impl(src, dst_type)
+    create_fp_trunc = lambda self, src, dst_type: self.cast_impl(src, dst_type, _ir.ROUNDING_MODE.RTNE)
     create_int_cast = lambda self, src, dst_type, is_signed: self.cast_impl(src, dst_type)
 
     def create_fp_to_fp(self, src, dst_type, rounding_mode):
@@ -554,8 +590,17 @@ class InterpreterBuilder:
 
     # binary operators
     def binary_op(self, lhs, rhs, op):
-        output = op(lhs.data, rhs.data)
         tl_dtype = lhs.dtype.scalar
+
+        if lhs.data.dtype == np.bool_ and rhs.data.dtype == np.bool_:
+            # numpy uses logical/saturating semantics for bool arithmetic
+            # (True + True == True) and rejects bool subtraction outright, but
+            # Triton treats int1 as a 1-bit integer that wraps around like any
+            # other integer type. Compute in a wider integer domain and
+            # truncate back to one bit to match the GPU backend (issue #10919).
+            output = (op(lhs.data.astype(np.int8), rhs.data.astype(np.int8)) & 1).astype(np.bool_)
+        else:
+            output = op(lhs.data, rhs.data)
 
         if not _validate_np_data_size(output, tl_dtype):
             output = output.astype(_get_np_dtype(tl_dtype))
@@ -570,6 +615,7 @@ class InterpreterBuilder:
     create_fneg = lambda self, input: self.unary_op(input, np.negative)
     create_mul = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.multiply)
     create_precise_divf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.divide)
+    create_approx_divf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.divide)
     create_sdiv = lambda self, lhs, rhs: self.create_idiv(lhs, rhs)
     create_udiv = lambda self, lhs, rhs: self.create_idiv(lhs, rhs)
     # LLVM has 'numpy.fmod', not 'numpy.remainder', semantics on integer remainders.
@@ -582,11 +628,11 @@ class InterpreterBuilder:
     create_minsi = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.minimum)
     create_minui = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.minimum)
     create_minimumf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.minimum)
-    create_minnumf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.minimum)
+    create_minnumf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.fmin)
     create_maxsi = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.maximum)
     create_maxui = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.maximum)
     create_maximumf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.maximum)
-    create_maxnumf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.maximum)
+    create_maxnumf = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.fmax)
     create_icmpSLE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less_equal)
     create_icmpSLT = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.less)
     create_icmpSGE = lambda self, lhs, rhs: self.binary_op(lhs, rhs, np.greater_equal)
@@ -625,20 +671,27 @@ class InterpreterBuilder:
         # Triton's rshift operator depends on the signedness of the left operand
         lhs_dtype = _get_signed_np_dtype(lhs.data.dtype)
         rhs_dtype = _get_signed_np_dtype(rhs.data.dtype)
-        lhs.data = lhs.data.astype(lhs_dtype)
-        rhs.data = rhs.data.astype(rhs_dtype)
+        lhs_data = lhs.data.astype(lhs_dtype)
+        rhs_data = rhs.data.astype(rhs_dtype)
+        lhs = TensorHandle(lhs_data, lhs.dtype)
+        rhs = TensorHandle(rhs_data, rhs.dtype)
         return self.binary_op(lhs, rhs, np.right_shift)
 
     def create_umulhi(self, lhs, rhs):
+        # umulhi multiplies the operands as unsigned integers, so signed inputs
+        # take part through their bit pattern: reinterpret them at their own
+        # width before widening, and reinterpret the high half back at the end.
         dtype = lhs.data.dtype
+        unsigned_dtype = getattr(np, f"uint{dtype.itemsize * 8}")
         if dtype == np.int64 or dtype == np.uint64:
-            return TensorHandle(np_umulhi_u64(lhs.data, rhs.data), lhs.dtype.scalar)
+            ret_data = np_umulhi_u64(lhs.data, rhs.data)
         else:
             compute_dtype = getattr(np, f"uint{dtype.itemsize * 8 * 2}")
-            lhs_data = lhs.data.astype(compute_dtype)
-            rhs_data = rhs.data.astype(compute_dtype)
+            lhs_data = lhs.data.view(unsigned_dtype).astype(compute_dtype)
+            rhs_data = rhs.data.view(unsigned_dtype).astype(compute_dtype)
             ret_data = np.multiply(lhs_data, rhs_data) >> (dtype.itemsize * 8)
-            return TensorHandle(ret_data.astype(dtype), lhs.dtype.scalar)
+            ret_data = ret_data.astype(unsigned_dtype)
+        return TensorHandle(ret_data.view(dtype), lhs.dtype.scalar)
 
     # ternary functions
     def ternary_op(self, lhs, rhs, other, op):
@@ -650,11 +703,26 @@ class InterpreterBuilder:
 
         return TensorHandle(output, tl_dtype)
 
-    create_clampf = lambda self, arg, lo, hi, propagate_nans: self.ternary_op(arg, lo, hi, np.clip)
+    def create_clampf(self, arg, lo, hi, propagate_nans):
+        if propagate_nans == _ir.PROPAGATE_NAN.NONE:
+            return self.binary_op(self.binary_op(arg, lo, np.fmax), hi, np.fmin)
+        else:
+            return self.ternary_op(arg, lo, hi, np.clip)
+
     create_select = lambda self, cond, lhs, rhs: self.ternary_op(cond, lhs, rhs, np.where)
 
     def create_fma(self, x, y, z):
-        return TensorHandle(x.data * y.data + z.data, z.dtype.scalar)
+        # An fma rounds once, but multiplying and then adding rounds twice.
+        # float64 intermediate rounding is safe for float16, but not float32.
+        dtype = z.data.dtype
+        if dtype == np.float64:
+            ret = _interpreter.fma_fp64(*np.broadcast_arrays(x.data, y.data, z.data))
+        elif dtype == np.float32:
+            ret = _interpreter.fma_fp32(*np.broadcast_arrays(x.data, y.data, z.data))
+        else:
+            product = np.multiply(x.data, y.data, dtype=np.float64)
+            ret = np.add(product, z.data, dtype=np.float64).astype(dtype)
+        return TensorHandle(ret, z.dtype.scalar)
 
     # unary functions
     def unary_op(self, arg, op):
@@ -716,13 +784,18 @@ class InterpreterBuilder:
         # This is fix for interpreter cases where for example int32 tensor is being passed
         # But unexpectedly int64 values are being returned causing
         # tl.store to write 8 bytes instead of 4 bytes which lead to silent data corruption
-        dummy_weights = np.ones_like(data.data, dtype=data.data.dtype)
+        dummy_weights = np.ones_like(data.data, dtype=np.int32)
+
+        # np.histogram's last bin is a closed interval [bins - 1, bins], so a
+        # value equal to `bins` would be counted there. The GPU drops every
+        # out-of-range value, so exclude such elements like masked ones.
+        valid = np.logical_and(mask.data, data.data < bins)
 
         # force all masked elements to zero
-        data = np.where(mask.data, data.data, np.zeros_like(data.data))
+        data = np.where(valid, data.data, np.zeros_like(data.data))
         histogram = np.histogram(data, bins=bins, range=(0, bins), weights=dummy_weights)[0]
         # remove overcounted elements
-        histogram[0] -= np.logical_not(mask.data).sum()
+        histogram[0] -= np.logical_not(valid).sum()
         return TensorHandle(histogram, tl.int32)
 
     def create_gather(self, src, indices, axis):
@@ -742,9 +815,6 @@ class InterpreterBuilder:
 
     def create_broadcast(self, arg, shape):
         return TensorHandle(np.broadcast_to(arg.data, shape), arg.dtype.scalar)
-
-    def create_cat(self, lhs, rhs):
-        return TensorHandle(np.concatenate([lhs.data, rhs.data]), lhs.dtype.scalar)
 
     def create_join(self, lhs, rhs):
         # Triton only supports joining two original tensors into a new one along the last axis
@@ -770,6 +840,26 @@ class InterpreterBuilder:
         sem = self.ir_sem_to_interpreter_sem[sem]
         return TensorHandle(_interpreter.atomic_cas(ptr.data, cmp.data, val.data, sem), cmp.dtype.scalar)
 
+    def create_atomic_load(self, ptr, mask, sem, scope):
+        return self.create_masked_load(ptr, mask, None, None, True)
+
+    def create_atomic_store(self, ptr, val, mask, sem, scope):
+        return self.create_masked_store(ptr, val, mask, None)
+
+    def create_atomic_poll(self, ptr, expected, timeout_ns, sem, scope):
+        matched = np.zeros(ptr.data.shape, dtype=np.bool_)
+        start_ns = time.perf_counter_ns() if timeout_ns is not None else None
+        for index in np.ndindex(ptr.data.shape):
+            element_ptr = TensorHandle(np.asarray(ptr.data[index]), ptr.dtype)
+            while True:
+                value = self.create_load(element_ptr, None, True)
+                if value.data.item() == expected.data[index]:
+                    matched[index] = True
+                    break
+                if timeout_ns is not None and time.perf_counter_ns() - start_ns >= timeout_ns.data.item():
+                    break
+        return TensorHandle(matched, tl.int1)
+
     def create_atomic_rmw(self, rmwOp, ptr, val, mask, sem, scope):
         if rmwOp not in self.ir_rmw_op_to_interpreter_rmw_op:
             raise ValueError(f"unsupported rmwOp {rmwOp}")
@@ -794,7 +884,14 @@ class InterpreterBuilder:
         if prefix:
             msg += f" {prefix}"
         if hex:
-            np.set_printoptions(formatter={'all': lambda x: f"0x{x:02x}"})
+
+            def _to_hex(x):
+                if isinstance(x, np.floating):
+                    return float(x).hex()
+                width = x.dtype.itemsize * 2
+                return f"0x{int(x):0{width}x}"
+
+            np.set_printoptions(formatter={'all': _to_hex})
         for value in values:
             print(msg + f" {value.data}")
         if hex:
@@ -817,9 +914,7 @@ class InterpreterBuilder:
         desc.validate()
         return desc
 
-    def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_modifier,
-                               eviction_policy):
-        assert isinstance(desc, TensorDescHandle)
+    def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_policy):
         ptrs, mask = desc.materialize_pointers(indices)
         dtype_tt = ptrs.get_element_ty()
         dtype_np = _get_np_dtype(dtype_tt)
@@ -830,22 +925,23 @@ class InterpreterBuilder:
             other = TensorHandle(np.full_like(ptrs.data, float('nan'), dtype=dtype_np), dtype_tt)
         else:
             raise ValueError(f"unsupported padding {padding}")
-        return self.create_masked_load(ptrs, mask, other, cache_modifier=cache_modifier,
-                                       eviction_policy=eviction_policy, is_volatile=False)
+        result = self.create_masked_load(ptrs, mask, other, cache_policy=cache_policy, is_volatile=False)
+        if desc.round_f32_to_tf32 and dtype_tt == tl.float32:
+            result = TensorHandle(_round_f32_to_tf32(result.data), dtype_tt)
+        return result
 
     def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle]):
         ptrs, mask = desc.materialize_pointers(indices)
-        return self.create_masked_store(ptrs, value, mask, None, None)
+        return self.create_masked_store(ptrs, value, mask, None)
 
     def create_descriptor_gather(self, desc: TensorDescHandle, x_offsets: TensorHandle, y_offset: TensorHandle, type):
         dtype = desc.base.dtype.element_ty
         np_dtype = _get_np_dtype(dtype)
         result = np.zeros([x_offsets.data.shape[0], desc.block_shape[-1]], dtype=np_dtype)
-        cache_modifier = None
-        eviction_policy = None
+        cache_policy = None
         for i, x_offset in enumerate(x_offsets.data):
             indices = [TensorHandle(x_offset, tl.int32), y_offset]
-            result[i, :] = self.create_descriptor_load(desc, indices, cache_modifier, eviction_policy).data
+            result[i, :] = self.create_descriptor_load(desc, indices, cache_policy).data
         return TensorHandle(result, dtype)
 
     def create_descriptor_scatter(self, desc: TensorDescHandle, value: TensorHandle, x_offsets: TensorHandle,
@@ -857,7 +953,9 @@ class InterpreterBuilder:
 
     def get_all_ones_value(self, type):
         np_type = _get_np_dtype(type)
-        if "int" in np_type.name:
+        if np.issubdtype(np_type, np.unsignedinteger):
+            return TensorHandle(np.full(1, np.iinfo(np_type).max, dtype=np_type), type.scalar)
+        elif np.issubdtype(np_type, np.signedinteger):
             return TensorHandle(np.full(1, -1, dtype=np_type), type.scalar)
         elif np_type == np.bool_:
             return TensorHandle(np.full(1, True, dtype=np_type), type.scalar)
@@ -869,8 +967,11 @@ class InterpreterBuilder:
                           rhs_scale_handle: Optional[TensorHandle], rhs_format_enum: _ir.ScaleDotElemTypeTY,
                           fast_math: bool, lhs_k_pack: bool, rhs_k_pack: bool,
                           acc_handle: TensorHandle) -> TensorHandle:
-        lhs_data = _prepare_dot_scaled_operand(lhs, lhs_scale_handle, lhs_format_enum, lhs_k_pack, is_rhs=False)
-        rhs_data = _prepare_dot_scaled_operand(rhs, rhs_scale_handle, rhs_format_enum, rhs_k_pack, is_rhs=True)
+        compute_type = tl.float16 if _ir.ScaleDotElemTypeTY.FP16 in (lhs_format_enum, rhs_format_enum) else tl.bfloat16
+        lhs_data = _prepare_dot_scaled_operand(lhs, lhs_scale_handle, lhs_format_enum, lhs_k_pack, compute_type,
+                                               is_rhs=False)
+        rhs_data = _prepare_dot_scaled_operand(rhs, rhs_scale_handle, rhs_format_enum, rhs_k_pack, compute_type,
+                                               is_rhs=True)
 
         result = np.matmul(lhs_data, rhs_data) + acc_handle.data
         return TensorHandle(result, tl.float32)
@@ -925,7 +1026,6 @@ def _patch_lang_tensor(tensor, scope: _LangPatchScope):
 
     def _get_transpose(self):
         handle = TensorHandle(np.transpose(self.handle.data), self.handle.dtype)
-        assert self.type.is_block()
         block_shape = list(self.type.shape)
         block_shape[-1], block_shape[-2] = block_shape[-2], block_shape[-1]
         res_ty = tl.core.block_type(self.dtype, block_shape)
@@ -960,7 +1060,9 @@ class ReduceScanOpInterface:
             ret = ret.astype(np_dtype)
             ret_type = tl.block_type(dtype, list(ret.shape))
         else:
-            ret = np.array([ret], dtype=np_dtype)
+            # Match the shaped path above. NumPy 2 rejects out-of-range Python
+            # integers in array(..., dtype=...), while astype narrows instead.
+            ret = np.array([ret]).astype(np_dtype)
             ret_type = dtype
         return tl.core.tensor(TensorHandle(ret, dtype.scalar), ret_type)
 
@@ -1056,15 +1158,21 @@ class ReduceOps(ReduceScanOpInterface):
         return self.to_tensor(np.sum(input.handle.data, axis=self.axis, keepdims=self.keep_dims), input.dtype)
 
     def apply_impl(self, input):
-        if self.combine_fn == tl.standard._argmin_combine_tie_break_left:
+        # Note: np.nanargmin/np.nanargmax always return the leftmost index
+        # for equal values, whereas tie_break_fast on hardware returns an
+        # arbitrary index. This is a known remaining divergence between the
+        # interpreter and JIT for inputs with equal non-NaN elements.
+        if (self.combine_fn is tl.standard._argmin_combine_tie_break_left
+                or self.combine_fn is tl.standard._argmin_combine_tie_break_fast):
             return self.min_max(input[0], val_reduce_op=np.nanmin, idx_reduce_op=np.nanargmin)
-        elif self.combine_fn == tl.standard._argmax_combine_tie_break_left:
+        elif (self.combine_fn is tl.standard._argmax_combine_tie_break_left
+              or self.combine_fn is tl.standard._argmax_combine_tie_break_fast):
             return self.min_max(input[0], val_reduce_op=np.nanmax, idx_reduce_op=np.nanargmax)
-        elif self.combine_fn == tl.standard._elementwise_max:
+        elif self.combine_fn is tl.standard._elementwise_max:
             return self.min_max(input[0], val_reduce_op=np.nanmax, idx_reduce_op=None)
-        elif self.combine_fn == tl.standard._elementwise_min:
+        elif self.combine_fn is tl.standard._elementwise_min:
             return self.min_max(input[0], val_reduce_op=np.nanmin, idx_reduce_op=None)
-        elif self.combine_fn == tl.standard._sum_combine:
+        elif self.combine_fn is tl.standard._sum_combine:
             return self.sum(input[0])
         else:
             # Fall back to the slow mode
@@ -1117,7 +1225,8 @@ class ScanOps(ReduceScanOpInterface):
         new_input = []
         if self.reverse:
             for arg in input:
-                new_input.append(self.to_tensor(np.flip(arg.handle.data, axis=self.axis), arg.dtype))
+                new_input.append(
+                    self.to_tensor(np.ascontiguousarray(np.flip(arg.handle.data, axis=self.axis)), arg.dtype))
         else:
             new_input = input
         if self.combine_fn == tl.standard._sum_combine:
@@ -1129,7 +1238,7 @@ class ScanOps(ReduceScanOpInterface):
             ret = self.generic_scan(new_input)
         if self.reverse:
             for arg in ret:
-                arg.handle.data = np.flip(arg.handle.data, axis=self.axis)
+                arg.handle.data = np.ascontiguousarray(np.flip(arg.handle.data, axis=self.axis))
         return ret
 
 
@@ -1221,6 +1330,7 @@ def _patch_lang_core(lang, scope: _LangPatchScope):
 
     scope.set_attr(lang, "range", _new_range)
     scope.set_attr(lang, "static_range", _new_range)
+    scope.set_attr(lang.condition, "__bool__", lambda self: bool(self.condition))
     scope.set_attr(lang, "static_assert", _new_static_assert)
     scope.set_attr(lang, "static_print", print)
     scope.set_attr(lang.dtype, "to_ir", _new_to_ir)
@@ -1276,10 +1386,12 @@ def _implicit_cvt(arg):
         strides = [_implicit_cvt(s) for s in arg.strides]
         assert arg.strides[-1] == 1
         strides[-1] = tl.constexpr(1)
-        return interpreter_semantic.make_tensor_descriptor(base=_implicit_cvt(arg.base),
+        desc = interpreter_semantic.make_tensor_descriptor(base=_implicit_cvt(arg.base),
                                                            shape=[_implicit_cvt(s) for s in arg.shape], strides=strides,
                                                            block_shape=[tl.constexpr(b) for b in arg.block_shape],
                                                            padding_option=arg.padding)
+        desc.handle.round_f32_to_tf32 = arg.round_f32_to_tf32
+        return desc
     return arg
 
 
@@ -1304,7 +1416,7 @@ class GridExecutor:
         self.arg_names = arg_names
         self.grid = grid
         self.pre_run_hooks = pre_run_hooks
-        __annotations__ = {name: _normalize_ty(ty) for name, ty in fn.__annotations__.items()}
+        __annotations__ = {name: _normalize_ty(ty) for name, ty in inspect.get_annotations(fn).items()}
         self.constexprs = [name for name in arg_names if __annotations__.get(name) == "constexpr"]
 
     def _init_args_hst(self, args_dev, kwargs):
@@ -1371,10 +1483,10 @@ class GridExecutor:
 
     def __call__(self, *args_dev, **kwargs):
         # Removes not used reserved keywords from kwargs
-        # Triton doesn't support keyword-only, variable positional or variable keyword arguments
-        # It's safe to inspect only positional or keyword arguments (i.e., argspec.args)
+        # Triton doesn't support variable positional or variable keyword arguments
+        # Keep both positional-or-keyword and keyword-only arguments.
         argspec = inspect.getfullargspec(self.fn)
-        kwargs = {k: v for k, v in kwargs.items() if k in argspec.args}
+        kwargs = {k: v for k, v in kwargs.items() if k in argspec.args or k in argspec.kwonlyargs}
         # copy arguments to the host
         args_hst, kwargs_hst = self._init_args_hst(args_dev, kwargs)
         # run pre-run hooks
@@ -1408,7 +1520,62 @@ class GridExecutor:
         self._restore_args_dev(args_dev, args_hst, kwargs, kwargs_hst)
 
 
+class _InterpreterComparison:
+    """Adapt native Python comparison chaining to Triton's tensor semantics."""
+
+    def __init__(self, value, comparison=None):
+        self.value = value
+        self.comparison = comparison
+        self.result = None
+        self.tensor_results = []
+
+    def __lt__(self, rhs):
+        # Python reuses the right operand for the next comparison. Carry the
+        # accumulated results with it, delegating to the original operator.
+        rhs.result = rhs.comparison(self.value, rhs.value)
+        rhs.tensor_results = self.tensor_results
+        if isinstance(rhs.result, tl.tensor):
+            rhs.tensor_results.append(rhs.result)
+        return rhs
+
+    def __bool__(self):
+        # Only compile-time false comparisons short-circuit the native chain.
+        return isinstance(self.result, tl.tensor) or bool(self.result)
+
+    def get_result(self):
+        if not self or not self.tensor_results:
+            return self.result
+        result = self.tensor_results[-1]
+        for value in reversed(self.tensor_results[:-1]):
+            result = value.logical_and(result)
+        return result
+
+
 class ASTTransformer(ast.NodeTransformer):
+
+    def visit_Compare(self, node):
+        node = self.generic_visit(node)
+        if len(node.ops) == 1:
+            return node
+
+        def wrap_operand(value, op=None):
+            args = [value]
+            if op is not None:
+                parameters = ast.arguments(posonlyargs=[], args=[ast.arg(arg="lhs"),
+                                                                 ast.arg(arg="rhs")], kwonlyargs=[], kw_defaults=[],
+                                           defaults=[])
+                comparison = ast.Compare(left=ast.Name(id="lhs", ctx=ast.Load()), ops=[op],
+                                         comparators=[ast.Name(id="rhs", ctx=ast.Load())])
+                args.append(ast.Lambda(args=parameters, body=comparison))
+            return ast.Call(func=ast.Name(id="_InterpreterComparison", ctx=ast.Load()), args=args, keywords=[])
+
+        # Keep operand expressions in their original scope so assignment
+        # expressions still bind there. Python's native chain evaluates each
+        # operand once and uses the wrappers' truthiness to short-circuit.
+        chain = ast.Compare(left=wrap_operand(node.left), ops=[ast.Lt() for _ in node.ops],
+                            comparators=[wrap_operand(value, op) for op, value in zip(node.ops, node.comparators)])
+        return ast.copy_location(
+            ast.Call(func=ast.Attribute(value=chain, attr="get_result", ctx=ast.Load()), args=[], keywords=[]), node)
 
     def visit_Assign(self, node):
         names = []
@@ -1420,7 +1587,8 @@ class ASTTransformer(ast.NodeTransformer):
         # interpreter_semantic.to_tensor(value, False)
         node.value = ast.Call(
             func=ast.Attribute(value=ast.Name(id="interpreter_semantic", ctx=ast.Load()), attr="to_tensor",
-                               ctx=ast.Load()), args=[node.value, ast.Constant(value=False)], keywords=[])
+                               ctx=ast.Load()), args=[self.visit(node.value),
+                                                      ast.Constant(value=False)], keywords=[])
         return node
 
 

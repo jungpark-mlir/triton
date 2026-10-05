@@ -20,11 +20,19 @@ void populateMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
 void populateDotOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                  RewritePatternSet &patterns,
                                  ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                 const TargetInfo &targetInfo,
                                  PatternBenefit benefit);
 void populateElementwiseOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns, bool ftz,
     ModuleAxisInfoAnalysis &axisInfoAnalysis, ModuleAllocation &allocation,
     const TargetInfo &targetInfo, PatternBenefit benefit);
+
+void populateFpCastOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
+                                    RewritePatternSet &patterns, bool ftz,
+                                    ModuleAxisInfoAnalysis &axisInfoAnalysis,
+                                    ModuleAllocation &allocation,
+                                    const TargetInfo &targetInfo,
+                                    PatternBenefit benefit);
 
 // Manipulates with execution mode register which is per-wavefront one.
 // The register controls execution of instructions - e.g., rounding modes,

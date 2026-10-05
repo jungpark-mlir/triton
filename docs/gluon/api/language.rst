@@ -99,6 +99,7 @@ Atomic Ops
     atomic_max
     atomic_min
     atomic_or
+    atomic_poll
     atomic_xchg
     atomic_xor
 
@@ -181,6 +182,8 @@ Scan Ops
     :nosignatures:
 
     associative_scan
+    cumprod
+    cumsum
     histogram
 
 
@@ -221,6 +224,7 @@ Inline Assembly
     :toctree: generated
     :nosignatures:
 
+    inline_asm
     inline_asm_elementwise
 
 

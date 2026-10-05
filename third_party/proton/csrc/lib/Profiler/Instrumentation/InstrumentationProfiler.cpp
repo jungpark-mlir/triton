@@ -1,4 +1,7 @@
 #include "Profiler/Instrumentation/InstrumentationProfiler.h"
+#include "Backend/Backend.h"
+#include "Device.h"
+#include "Runtime/Runtime.h"
 #include "TraceDataIO/CircularLayoutParser.h"
 
 #include "Runtime/CudaRuntime.h"
@@ -8,10 +11,12 @@
 #include "Utility/String.h"
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace proton {
@@ -52,15 +57,22 @@ void InstrumentationProfiler::doSetMode(
   if (modeAndOptions.empty()) {
     throw makeInvalidArgument("Mode cannot be empty");
   }
-  if (proton::toLower(modeAndOptions[0]) ==
-      proton::toLower(DeviceTraits<DeviceType::CUDA>::name)) {
-    runtime = &CudaRuntime::instance();
-  } else if (proton::toLower(modeAndOptions[0]) ==
-             proton::toLower(DeviceTraits<DeviceType::HIP>::name)) {
-    runtime = &HipRuntime::instance();
-  } else {
-    throw makeInvalidArgument("Unknown device type: " + modeAndOptions[0]);
+
+  const auto requestedDeviceName = proton::toLower(modeAndOptions[0]);
+  const auto runtimes = getRuntimeRegistrations();
+  auto runtimeIt =
+      std::find_if(runtimes.begin(), runtimes.end(),
+                   [&](const RuntimeRegistration &registration) {
+                     return requestedDeviceName ==
+                            proton::toLower(registration.getDeviceName());
+                   });
+  if (runtimeIt == runtimes.end()) {
+    throw makeInvalidArgument(
+        "Unknown or unsupported device type for instrumentation backend: " +
+        modeAndOptions[0]);
   }
+  runtime = runtimeIt->getInstance()();
+
   for (size_t i = 1; i < modeAndOptions.size(); ++i) {
     auto delimiterPos = modeAndOptions[i].find('=');
     if (delimiterPos != std::string::npos) {
@@ -78,7 +90,7 @@ std::vector<uint32_t>
 getUnitIdVector(const std::map<std::string, std::string> &modeOptions,
                 size_t totalUnits) {
   std::vector<uint32_t> unitIdVector;
-  if (modeOptions.count("sampling_options") != 0) {
+  if (modeOptions.contains("sampling_options")) {
     auto &samplingOption = modeOptions.at("sampling_options");
     auto unitIds = proton::split(samplingOption, ",");
     for (auto uintId : unitIds) {
@@ -106,8 +118,8 @@ InstrumentationProfiler::getParserConfig(uint64_t functionId,
   auto config = std::make_shared<CircularLayoutParserConfig>();
   config->scratchMemSize =
       functionMetadata.at(functionId).getScratchMemorySize();
-  if (!(modeOptions.count("granularity") == 0 ||
-        modeOptions.at("granularity") == "GRANULARITY.WARP")) {
+  if (modeOptions.contains("granularity") &&
+      modeOptions.at("granularity") != "GRANULARITY.WARP") {
     throw makeInvalidArgument("Only warp granularity is supported for now");
   }
   config->totalUnits = functionMetadata.at(functionId).getNumWarps();
@@ -134,7 +146,7 @@ void InstrumentationProfiler::initFunctionMetadata(
     const std::vector<std::pair<size_t, std::string>> &scopeIdPairs,
     const std::vector<std::pair<size_t, size_t>> &scopeIdParentPairs,
     const std::string &metadataPath) {
-  if (functionScopeIdNames.count(functionId)) {
+  if (functionScopeIdNames.contains(functionId)) {
     throw makeInvalidArgument(
         "Duplicate function id: " + std::to_string(functionId) +
         " for function " + functionName);
@@ -143,7 +155,7 @@ void InstrumentationProfiler::initFunctionMetadata(
   for (auto &pair : scopeIdPairs) {
     auto scopeId = pair.first;
     auto scopeName = pair.second;
-    if (functionScopeIdNames[functionId].count(scopeId)) {
+    if (functionScopeIdNames[functionId].contains(scopeId)) {
       throw makeInvalidArgument(
           "Duplicate scope id: " + std::to_string(scopeId) + " for function " +
           functionName);
@@ -161,7 +173,7 @@ void InstrumentationProfiler::initFunctionMetadata(
     std::vector<Context> reversedContexts;
     reversedContexts.emplace_back(name);
     auto currentId = scopeId;
-    while (scopeIdParentMap.count(currentId) > 0) {
+    while (scopeIdParentMap.contains(currentId)) {
       auto parentId = scopeIdParentMap[currentId];
       auto parentName = functionScopeIdNames[functionId].at(parentId);
       reversedContexts.emplace_back(parentName);
@@ -227,7 +239,7 @@ void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
   }
 
   int64_t timeShiftCost = 0;
-  if (modeOptions.count("optimizations")) {
+  if (modeOptions.contains("optimizations")) {
     auto optimizations = proton::split(modeOptions.at("optimizations"), ",");
     if (std::find(optimizations.begin(), optimizations.end(), "time_shift") !=
         optimizations.end())
@@ -262,6 +274,27 @@ void InstrumentationProfiler::exitInstrumentedOp(uint64_t streamId,
                     timeShiftCost, blockTrace.initTime, blockTrace.preFinalTime,
                     blockTrace.postFinalTime));
               }
+            }
+          }
+          for (auto &link : blockTrace.asyncLinks) {
+            auto &start = link.first;
+            auto &end = link.second;
+            auto &contexts = scopeIdContexts[start.entry->scopeId];
+            auto duration = end.entry->cycle - start.entry->cycle;
+            auto normalizedDuration = static_cast<double>(duration) /
+                                      (circularLayoutConfig->totalUnits *
+                                       circularLayoutConfig->numBlocks);
+            for (const auto &[data, baseEntry] : dataToEntryMap) {
+              auto kernelId = baseEntry.id;
+              auto entry = data->addOp(baseEntry.phase, kernelId, contexts);
+              entry.upsertMetric(std::make_unique<CycleMetric>(
+                  start.entry->cycle, end.entry->cycle, duration,
+                  normalizedDuration, kernelId, functionName,
+                  blockTrace.blockId, blockTrace.procId, start.uid,
+                  static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device)),
+                  static_cast<uint64_t>(runtime->getDeviceType()),
+                  timeShiftCost, blockTrace.initTime, blockTrace.preFinalTime,
+                  blockTrace.postFinalTime, /*isAsync=*/true, end.uid));
             }
           }
         }

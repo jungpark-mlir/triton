@@ -96,7 +96,7 @@ tt.func @tma_scatter(%arg0: !tt.tensordesc<1x128xbf16, #nvmma_128>, %arg1: tenso
   // CHECK-NEXT: [[SRC:%.*]] = ttg.local_alloc %arg3
   // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
   // CHECK-NEXT: ttng.async_tma_scatter %arg0[%arg1, %arg2] [[SRC]]
-  // CHECK-NEXT: ttng.async_tma_store_wait
+  // CHECK-NEXT: ttng.async_tma_store_wait {pendings = 0 : i32}
   tt.descriptor_scatter %arg0[%arg1, %arg2], %arg3 : !tt.tensordesc<1x128xbf16, #nvmma_128>, tensor<32xi32, #offsets>, i32, tensor<32x128xbf16, #blocked1>
   tt.return
 }
@@ -158,10 +158,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c64_i32 = arith.constant 64 : i32
     // CHECK: %[[A:.+]] = ttg.local_alloc : () -> !ttg.memdesc<64x32xf32
     %0 = tt.descriptor_load %arg0[%c64_i32, %c32_i32] : !tt.tensordesc<64x32xf32, #shared> -> tensor<64x32xf32, #blocked>
-    // CHECK: %[[B:.+]] = ttg.local_load %[[A]]
-    // CHECK: %[[C:.+]] = ttg.local_alloc %[[B]]
     %1 = ttg.local_alloc %0 : (tensor<64x32xf32, #blocked>) -> !ttg.memdesc<64x32xf32, #shared1, #smem>
-    // CHECK: %[[D:.+]] = ttg.memdesc_trans %[[C]]
+    // CHECK: %[[D:.+]] = ttg.memdesc_trans %[[A]]
     %2 = ttg.memdesc_trans %1 {order = array<i32: 1, 0>} : !ttg.memdesc<64x32xf32, #shared1, #smem> -> !ttg.memdesc<32x64xf32, #shared2, #smem>
     %3 = ttg.local_alloc %0 : (tensor<64x32xf32, #blocked>) -> !ttg.memdesc<64x32xf32, #shared, #smem>
     // CHECK: %[[E:.+]] = ttg.local_load %[[D]]
@@ -176,5 +174,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %8 = ttng.warp_group_dot %3, %7, %cst_0 {isAsync = true} : !ttg.memdesc<64x32xf32, #shared, #smem> * !ttg.memdesc<32x32xf32, #shared, #smem> -> tensor<64x32xf32, #mma1>
     %9:3 = ttng.warp_group_dot_wait %8, %3, %7 {pendings = 0 : i32} : tensor<64x32xf32, #mma1>, !ttg.memdesc<64x32xf32, #shared, #smem>, !ttg.memdesc<32x32xf32, #shared, #smem>
     tt.return %9 : tensor<64x32xf32, #mma1>
+  }
+}
+
+// -----
+
+#tma_cache_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tma_cache_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+!tma_cache_desc = !tt.tensordesc<16x64xf16, #tma_cache_shared>
+!tma_cache_dst = !ttg.memdesc<16x64xf16, #tma_cache_shared, #ttg.shared_memory, mutable>
+!tma_cache_mbar = !ttg.memdesc<1xi64, #tma_cache_bar, #ttg.shared_memory, mutable>
+
+#cache_blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  // CHECK-LABEL: @tma_cache_legacy
+  // CHECK: ttng.async_tma_copy_global_to_local {{.*}} {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_first>}
+  tt.func @tma_cache_legacy(%desc: !tma_cache_desc, %coord: i32) -> tensor<16x64xf16, #cache_blocked> {
+    %v = tt.descriptor_load %desc[%coord, %coord] {cachePolicy = #tt.cache_policy<cache_modifier = none, eviction_policy = evict_first>} : !tma_cache_desc -> tensor<16x64xf16, #cache_blocked>
+    tt.return %v : tensor<16x64xf16, #cache_blocked>
+  }
+}
+
+// -----
+
+#tma_cache_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#tma_cache_bar = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+!tma_cache_desc = !tt.tensordesc<16x64xf16, #tma_cache_shared>
+!tma_cache_dst = !ttg.memdesc<16x64xf16, #tma_cache_shared, #ttg.shared_memory, mutable>
+!tma_cache_mbar = !ttg.memdesc<1xi64, #tma_cache_bar, #ttg.shared_memory, mutable>
+
+#cache_blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
+  // CHECK-LABEL: @tma_cache_fractional
+  // CHECK: ttng.async_tma_copy_global_to_local {{.*}} {cachePolicy = #ttng.cache_policy<l2_primary = evict_last, l2_secondary = evict_first, l2_fraction = 5.000000e-01 : f32>}
+  tt.func @tma_cache_fractional(%desc: !tma_cache_desc, %coord: i32) -> tensor<16x64xf16, #cache_blocked> {
+    %v = tt.descriptor_load %desc[%coord, %coord] {cachePolicy = #ttng.cache_policy<l2_primary = evict_last, l2_secondary = evict_first, l2_fraction = 5.000000e-01 : f32>} : !tma_cache_desc -> tensor<16x64xf16, #cache_blocked>
+    tt.return %v : tensor<16x64xf16, #cache_blocked>
   }
 }

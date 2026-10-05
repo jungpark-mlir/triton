@@ -3,6 +3,18 @@
 
 include "mlir/Pass/PassBase.td"
 
+def TritonAMDGPUMembar : Pass<"triton-amdgpu-membar", "mlir::ModuleOp"> {
+    let summary = "Insert AMD shared-memory synchronization before lowering";
+
+    let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                             "mlir::triton::amdgpu::TritonAMDGPUDialect"];
+
+    let options = [
+        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
+               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
+    ];
+}
+
 def AllocateAMDGPUSharedMemory : Pass<"allocate-amdgpu-shared-memory", "mlir::ModuleOp"> {
   let summary = "Add metadata for shared memory allocation";
   let constructor = "mlir::triton::createAllocateAMDGPUSharedMemoryPass(\"\")";
@@ -52,35 +64,6 @@ def ConvertBuiltinFuncToLLVM : Pass<"convert-builtin-func-to-llvm", "mlir::Modul
                "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
         Option<"ftz", "ftz", "bool", /*default*/"true",
                "flush denorms for math functions">,
-    ];
-}
-
-def TritonAMDGPUInsertInstructionSchedHints : Pass<"triton-amdgpu-insert-instruction-sched-hints", "mlir::ModuleOp"> {
-    let summary = "Insert instruction scheduling hints after the dot ops in the main loop";
-    let constructor = "mlir::triton::createTritonAMDGPUInsertInstructionSchedHintsPass(/*variant=*/\"\")";
-
-    let dependentDialects = ["mlir::LLVM::LLVMDialect",
-                             "mlir::triton::amdgpu::TritonAMDGPUDialect"];
-
-    let options = [
-        Option<"variant", "variant", "std::string", /*default*/"\"none\"",
-               "instruction scheduling variant">,
-    ];
-}
-
-def TritonAMDGPULowerInstructionSchedHints : Pass<"triton-amdgpu-lower-insert-instruction-sched-hints", "mlir::ModuleOp"> {
-    let summary = "Lower instruction scheduling hints to LLVM intrinsics";
-    let constructor = "mlir::triton::createTritonAMDGPULowerInstructionSchedHintsPass(/*gfxArch=*/\"\",/*numStages=*/2)";
-
-    let dependentDialects = ["mlir::LLVM::LLVMDialect",
-                             "mlir::ROCDL::ROCDLDialect",
-                             "mlir::triton::amdgpu::TritonAMDGPUDialect"];
-
-    let options = [
-        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
-               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
-        Option<"numStages", "num_stages", "int32_t", /*default*/"2",
-                "number of pipeline stages">,
     ];
 }
 
