@@ -1,3 +1,5 @@
+// RUN: triton-opt %s -split-input-file --convert-scf-to-cf --allocate-shared-memory --triton-amdgpu-membar='gfx-arch=gfx942' | FileCheck %s --check-prefix=CDNA3
+// RUN: triton-opt %s -split-input-file --convert-scf-to-cf --allocate-shared-memory --triton-amdgpu-membar='gfx-arch=gfx950' | FileCheck %s --check-prefix=CDNA4
 // RUN: triton-opt %s -split-input-file --convert-scf-to-cf --allocate-shared-memory --triton-amdgpu-membar='gfx-arch=gfx942' | FileCheck %s
 
 #AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -739,6 +741,120 @@ tt.func @no_barrier_tdm_mbarrier_in_loop(
     // CHECK-NOT: ttg.barrier local
   }
   // CHECK: tt.return
+  tt.return
+}
+}
+
+// -----
+#layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// CDNA3-LABEL: @deferral_direct
+// CDNA3: ttg.async_wait
+// CDNA3-NEXT: arith.addf
+// CDNA3-NEXT: ttg.barrier local
+// CDNA4-LABEL: @deferral_direct
+// CDNA4: ttg.async_wait
+// CDNA4-NEXT: ttg.barrier local
+// CDNA4-NEXT: arith.addf
+// CDNA4-NOT: ttg.barrier local
+// CDNA4: tt.return
+tt.func @deferral_direct(%ptr: !tt.ptr<f32>) {
+  %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #layout>
+  %data = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #layout>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable>
+  %copy = ttg.async_copy_global_to_local %ptrs, %alloc : tensor<128x!tt.ptr<f32>, #layout> -> !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable>
+  %wait = ttg.async_wait %copy {num = 0 : i32}
+  %sum = arith.addf %data, %data : tensor<128xf32, #layout>
+  %read = ttg.local_load %alloc token %wait : !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable> -> tensor<128xf32, #layout>
+  tt.return
+}
+}
+
+// -----
+#layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// CDNA4-LABEL: @deferral_block_arg
+// CDNA4: ttg.async_wait
+// CDNA4-NEXT: ttg.barrier local
+// CDNA4-NEXT: arith.addf
+// CDNA4-NOT: ttg.barrier local
+// CDNA4: tt.return
+tt.func @deferral_block_arg(%ptr: !tt.ptr<f32>) {
+  %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #layout>
+  %data = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #layout>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable>
+  %copy = ttg.async_copy_global_to_local %ptrs, %alloc : tensor<128x!tt.ptr<f32>, #layout> -> !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable>
+  cf.br ^use(%data : tensor<128xf32, #layout>)
+^use(%arg: tensor<128xf32, #layout>):
+  %wait = ttg.async_wait %copy {num = 0 : i32}
+  %sum = arith.addf %arg, %arg : tensor<128xf32, #layout>
+  %read = ttg.local_load %alloc token %wait : !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable> -> tensor<128xf32, #layout>
+  tt.return
+}
+}
+// -----
+#layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// The branch itself is a potential register-copy use; do not wait until the
+// successor's arithmetic use to rendezvous.
+// CDNA4-LABEL: @deferral_branch_transfer
+// CDNA4: ttg.async_wait
+// CDNA4-NEXT: ttg.barrier local
+// CDNA4-NOT: ttg.barrier local
+// CDNA4: tt.return
+tt.func @deferral_branch_transfer(%ptr: !tt.ptr<f32>) {
+  %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #layout>
+  %data = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #layout>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable>
+  %copy = ttg.async_copy_global_to_local %ptrs, %alloc : tensor<128x!tt.ptr<f32>, #layout> -> !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable>
+  %wait = ttg.async_wait %copy {num = 0 : i32}
+  cf.br ^use(%data : tensor<128xf32, #layout>)
+^use(%arg: tensor<128xf32, #layout>):
+  %sum = arith.addf %arg, %arg : tensor<128xf32, #layout>
+  %read = ttg.local_load %alloc token %wait : !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable> -> tensor<128xf32, #layout>
+  tt.return
+}
+}
+// -----
+#layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// Issuing an independent global load is allowed before the rendezvous.
+// CDNA4-LABEL: @deferral_independent_load
+// CDNA4: ttg.async_wait
+// CDNA4-NEXT: tt.load
+// CDNA4-NEXT: ttg.barrier local
+// CDNA4-NOT: ttg.barrier local
+// CDNA4: tt.return
+tt.func @deferral_independent_load(%ptr: !tt.ptr<f32>) {
+  %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #layout>
+  %data = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #layout>
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable>
+  %copy = ttg.async_copy_global_to_local %ptrs, %alloc : tensor<128x!tt.ptr<f32>, #layout> -> !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable>
+  %wait = ttg.async_wait %copy {num = 0 : i32}
+  %independent = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #layout>
+  %read = ttg.local_load %alloc token %wait : !ttg.memdesc<128xf32, #shared, #ttg.shared_memory, mutable> -> tensor<128xf32, #layout>
+  tt.return
+}
+}
+
+// -----
+#layout = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
+// No completion means the performance policy must not create a barrier.
+// CDNA4-LABEL: @deferral_without_completion
+// CDNA4-NOT: ttg.barrier
+// CDNA4: arith.addf
+// CDNA4-NOT: ttg.barrier
+// CDNA4: tt.return
+tt.func @deferral_without_completion(%ptr: !tt.ptr<f32>) {
+  %ptrs = tt.splat %ptr : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #layout>
+  %data = tt.load %ptrs : tensor<128x!tt.ptr<f32>, #layout>
+  %sum = arith.addf %data, %data : tensor<128xf32, #layout>
   tt.return
 }
 }

@@ -522,6 +522,16 @@ void MembarAnalysis::update(Operation *op, MembarInfo *membarInfo,
     membarInfo->syncWarps();
     return;
   }
+  // Branch operands may become register copies. Check the target policy before
+  // control-flow handling, even when this operation has no memory effects.
+  // Analysis-only runs model existing barriers rather than hypothetical ones.
+  if (builder && deferralStopPolicy &&
+      membarInfo->pending.threadSync.completion == CompletionSync::Shared &&
+      deferralStopPolicy(op)) {
+    builder->setInsertionPoint(op);
+    insertBarrier(op, builder);
+    membarInfo->sync();
+  }
   auto sync = getThreadSyncInfo(op);
   // Region control flow is visited by the dataflow engine. Its children
   // contribute their own effects; implicit scratch belongs to this op.

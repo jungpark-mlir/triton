@@ -39,6 +39,12 @@ namespace mlir::triton::AMD {
 bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
                   bool op2IsRead, Allocation *allocation,
                   const AllocationSlice &, const AllocationSlice &);
+// Performance heuristic, separate from the conflict exemptions above. Checks
+// direct global-load results and one step through incoming block arguments.
+// Branch operands count as uses because their transfers may require register
+// copies. This predicts possible waits, not physical memory completion.
+bool stopMembarDeferral(Operation *op);
+
 } // namespace mlir::triton::AMD
 
 #endif
