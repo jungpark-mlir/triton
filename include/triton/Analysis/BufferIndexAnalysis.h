@@ -30,7 +30,7 @@ struct BufferIndexExpr;
 ///
 /// Recognized index shapes:
 ///   1. integer constants,
-///   2. `arith.addi` with one constant operand,
+///   2. `arith.addi` with one constant operand and `nsw`,
 ///   3. `arith.remsi` with a positive constant modulus,
 ///   4. the pipeliner's select/cmpi one-step wrap:
 ///        select(cmpi sge(base + 1, N), 0, base + 1)
@@ -46,6 +46,8 @@ struct BufferIndexExpr;
 /// Buffer-index reasoning is disabled for functions with irreducible control
 /// flow because not every cyclic edge is a dominance backedge in such CFGs.
 ///
+/// Additions without `nsw` remain opaque, except in the bounded one-step wrap.
+/// Offset accumulation is checked for overflow.
 /// Unknown arithmetic, dynamic or non-positive moduli, nested moduli, different
 /// SSA bases, and slices carried across cf-form backedges all fail the
 /// disjointness proof and fall back to normal membar aliasing.

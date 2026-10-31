@@ -11,7 +11,8 @@
 namespace mlir {
 
 static int64_t normalizeModuloOffset(int64_t offset, int64_t modulus) {
-  return ((offset % modulus) + modulus) % modulus;
+  int64_t remainder = offset % modulus;
+  return remainder < 0 ? remainder + modulus : remainder;
 }
 
 /// A buffer index decomposed as `baseValue + constantOffset`, optionally
@@ -77,7 +78,7 @@ bool isReducibleCFG(FunctionOpInterface funcOp, DominanceInfo &dominanceInfo,
 
 std::optional<int64_t> getConstantIntValue(Value v) {
   APInt val;
-  if (matchPattern(v, m_ConstantInt(&val)))
+  if (matchPattern(v, m_ConstantInt(&val)) && val.isSignedIntN(64))
     return val.getSExtValue();
   return std::nullopt;
 }
@@ -196,18 +197,22 @@ std::optional<BufferIndexExpr> matchModuloPattern(arith::SelectOp selectOp) {
   // general; keep the full select as the expression root.
   if (baseExpr.modulus)
     return std::nullopt;
-  BufferIndexExpr result{baseExpr.baseValue, baseExpr.constantOffset + *c};
+  int64_t offset;
+  if (__builtin_add_overflow(baseExpr.constantOffset, *c, &offset))
+    return std::nullopt;
+  BufferIndexExpr result{baseExpr.baseValue, offset};
   result.modulus = *mod;
   return result;
 }
 
-// Slot indices are assumed not to overflow signed integer arithmetic; use a
-// wider index type if the pipeline counter can reach the integer range.
+// Preserve fixed-width arithmetic unless a no-signed-wrap flag permits
+// decomposition. The bounded select/cmpi pattern proves its own add safe.
 BufferIndexExpr analyzeBufferIndex(Value indexValue) {
   if (auto c = getConstantIntValue(indexValue))
     return BufferIndexExpr{nullptr, *c};
 
-  if (auto addOp = indexValue.getDefiningOp<arith::AddIOp>()) {
+  if (auto addOp = indexValue.getDefiningOp<arith::AddIOp>();
+      addOp && addOp.hasNoSignedWrap()) {
     auto composeWithConstant = [&](Value nonConst,
                                    int64_t constant) -> BufferIndexExpr {
       auto baseExpr = analyzeBufferIndex(nonConst);
@@ -215,7 +220,10 @@ BufferIndexExpr analyzeBufferIndex(Value indexValue) {
       // full addi as the expression root.
       if (baseExpr.modulus)
         return BufferIndexExpr{indexValue, 0};
-      return {baseExpr.baseValue, baseExpr.constantOffset + constant};
+      int64_t offset;
+      if (__builtin_add_overflow(baseExpr.constantOffset, constant, &offset))
+        return BufferIndexExpr{indexValue, 0};
+      return {baseExpr.baseValue, offset};
     };
     if (auto offset = getConstantIntValue(addOp.getRhs()))
       return composeWithConstant(addOp.getLhs(), *offset);

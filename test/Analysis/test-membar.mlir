@@ -1733,12 +1733,13 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 // CHECK-LABEL: disjoint_remsi
 // Write at (phase + 2) % 3, read at phase % 3: provably disjoint within
 // an iteration; no barrier required.
+// nsw makes the same-iteration offset proof valid without integer wrap.
 tt.func @disjoint_remsi(%cst: tensor<128x128xf16>, %phase: i32) {
   %c2_i32 = arith.constant 2 : i32
   %c3_i32 = arith.constant 3 : i32
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable>
 
-  %w_off = arith.addi %phase, %c2_i32 : i32
+  %w_off = arith.addi %phase, %c2_i32 overflow<nsw> : i32
   %w_idx = arith.remsi %w_off, %c3_i32 : i32
   %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
   %r_idx = arith.remsi %phase, %c3_i32 : i32
@@ -1758,6 +1759,7 @@ tt.func @disjoint_remsi(%cst: tensor<128x128xf16>, %phase: i32) {
 // entries from dispatch. Because bb1 does not dominate bb2, that cycle is
 // irreducible. Buffer-index reasoning is disabled for the whole function, so
 // the otherwise-disjoint accesses require a barrier.
+// nsw makes the same-iteration offset proof valid without integer wrap.
 tt.func @must_barrier_irreducible_cfg(%cst: tensor<128x128xf16>, %phase: i32,
                                       %repeat_natural: i1, %enter_bb1: i1,
                                       %continue: i1) {
@@ -1776,7 +1778,7 @@ tt.func @must_barrier_irreducible_cfg(%cst: tensor<128x128xf16>, %phase: i32,
   cf.cond_br %enter_bb1, ^bb1, ^bb2
 
 ^bb1:
-  %w_off = arith.addi %phase, %c2_i32 : i32
+  %w_off = arith.addi %phase, %c2_i32 overflow<nsw> : i32
   %w_idx = arith.remsi %w_off, %c3_i32 : i32
   %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
   // CHECK: ttg.local_store
@@ -1800,13 +1802,14 @@ tt.func @must_barrier_irreducible_cfg(%cst: tensor<128x128xf16>, %phase: i32,
 // lookup must walk through MemDescViewTrait producers (here: memdesc_trans)
 // to reach the underlying memdesc_index; otherwise the reader's index is
 // lost and the writer/reader pair falls back to conservative aliasing.
+// nsw makes the same-iteration offset proof valid without integer wrap.
 tt.func @disjoint_remsi_through_memdesc_trans(%cst: tensor<128x128xf16>,
                                               %phase: i32) {
   %c2_i32 = arith.constant 2 : i32
   %c3_i32 = arith.constant 3 : i32
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable>
 
-  %w_off = arith.addi %phase, %c2_i32 : i32
+  %w_off = arith.addi %phase, %c2_i32 overflow<nsw> : i32
   %w_idx = arith.remsi %w_off, %c3_i32 : i32
   %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
@@ -2238,6 +2241,7 @@ tt.func @shared_dynamic_overlapping_stage_groups(%input: tensor<128xi32, #writer
 // The preceding iteration writes the slot read by this iteration. The
 // same-source indices are disjoint only within one dynamic iteration.
 // CHECK-LABEL: @shared_buffer_index_structured_backedge
+// nsw makes the same-iteration offset proof valid without integer wrap.
 tt.func @shared_buffer_index_structured_backedge(%input: tensor<128xi32, #writer>, %ub: i32) {
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
@@ -2245,7 +2249,7 @@ tt.func @shared_buffer_index_structured_backedge(%input: tensor<128xi32, #writer
   %allocation = ttg.local_alloc : () -> !ttg.memdesc<2x128xi32, #shared, #smem, mutable>
   // CHECK: cf.cond_br
   scf.for %i = %c0 to %ub step %c1 : i32 {
-    %next = arith.addi %i, %c1 : i32
+    %next = arith.addi %i, %c1 overflow<nsw> : i32
     %read_index = arith.remsi %i, %c2 : i32
     %write_index = arith.remsi %next, %c2 : i32
     // CHECK: ttg.memdesc_index
@@ -2508,4 +2512,58 @@ tt.func @equal_large_footprints(%cond: i1) {
   }
   %value = ttg.local_load %view : !ttg.memdesc<32768xi8, #shared, #smem, mutable> -> tensor<32768xi8>
   tt.return
+}
+
+// -----
+
+// At x = 2147483646, i32(x + 4) % 3 and x % 3 both select slot 0.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#read = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+// CHECK-LABEL: @buffer_index_add_may_overflow
+// CHECK: ttg.local_store
+// CHECK: ttg.barrier local
+// CHECK-NEXT: {{.*}} = ttg.local_load
+tt.func @buffer_index_add_may_overflow(%x: i32, %input: tensor<128xi32, #blocked>) -> tensor<128xi32, #read> {
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  %read_idx = arith.remsi %x, %c3 : i32
+  %next = arith.addi %x, %c4 : i32
+  %write_idx = arith.remsi %next, %c3 : i32
+  %ring = ttg.local_alloc : () -> !ttg.memdesc<3x128xi32, #shared, #smem, mutable>
+  %dst = ttg.memdesc_index %ring[%write_idx] : !ttg.memdesc<3x128xi32, #shared, #smem, mutable> -> !ttg.memdesc<128xi32, #shared, #smem, mutable>
+  ttg.local_store %input, %dst : tensor<128xi32, #blocked> -> !ttg.memdesc<128xi32, #shared, #smem, mutable>
+  %src = ttg.memdesc_index %ring[%read_idx] : !ttg.memdesc<3x128xi32, #shared, #smem, mutable> -> !ttg.memdesc<128xi32, #shared, #smem, mutable>
+  %v = ttg.local_load %src : !ttg.memdesc<128xi32, #shared, #smem, mutable> -> tensor<128xi32, #read>
+  tt.return %v : tensor<128xi32, #read>
+}
+}
+
+// -----
+
+// With nsw, the offset proof is valid for every defined execution.
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#read = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [8], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+// CHECK-LABEL: @buffer_index_add_nsw
+// CHECK: ttg.local_store
+// CHECK-NOT: ttg.barrier local
+// CHECK: {{.*}} = ttg.local_load
+tt.func @buffer_index_add_nsw(%x: i32, %input: tensor<128xi32, #blocked>) -> tensor<128xi32, #read> {
+  %c3 = arith.constant 3 : i32
+  %c4 = arith.constant 4 : i32
+  %read_idx = arith.remsi %x, %c3 : i32
+  %next = arith.addi %x, %c4 overflow<nsw> : i32
+  %write_idx = arith.remsi %next, %c3 : i32
+  %ring = ttg.local_alloc : () -> !ttg.memdesc<3x128xi32, #shared, #smem, mutable>
+  %dst = ttg.memdesc_index %ring[%write_idx] : !ttg.memdesc<3x128xi32, #shared, #smem, mutable> -> !ttg.memdesc<128xi32, #shared, #smem, mutable>
+  ttg.local_store %input, %dst : tensor<128xi32, #blocked> -> !ttg.memdesc<128xi32, #shared, #smem, mutable>
+  %src = ttg.memdesc_index %ring[%read_idx] : !ttg.memdesc<3x128xi32, #shared, #smem, mutable> -> !ttg.memdesc<128xi32, #shared, #smem, mutable>
+  %v = ttg.local_load %src : !ttg.memdesc<128xi32, #shared, #smem, mutable> -> tensor<128xi32, #read>
+  tt.return %v : tensor<128xi32, #read>
+}
 }

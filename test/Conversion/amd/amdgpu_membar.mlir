@@ -338,6 +338,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 // CHECK-LABEL: disjoint_tdm_copy_remsi
 // Test that TDM copy and local_load with provably disjoint dynamic indices
 // using arith.remsi (gluon/canonical modular wrap) do not require a barrier.
+// nsw makes the same-iteration offset proof valid without integer wrap.
 tt.func @disjoint_tdm_copy_remsi(%desc: !tt.tensordesc<128x128xf16, #shared>, %phase: i32) {
   %c0_i32 = arith.constant 0 : i32
   %c2_i32 = arith.constant 2 : i32
@@ -346,7 +347,7 @@ tt.func @disjoint_tdm_copy_remsi(%desc: !tt.tensordesc<128x128xf16, #shared>, %p
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable>
 
   // Write index: (phase + 2) % 3
-  %write_phase = arith.addi %phase, %c2_i32 : i32
+  %write_phase = arith.addi %phase, %c2_i32 overflow<nsw> : i32
   %write_idx = arith.remsi %write_phase, %c3_i32 : i32
   %write_view = ttg.memdesc_index %alloc[%write_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
@@ -403,6 +404,7 @@ tt.func @disjoint_select_cmpi_iter_arg_cf(%cst: tensor<128x128xf16, #AL>, %ub: i
 //   phase_{i+1} = phase_i + 1
 // Dynamic index comparisons are disabled across the cf backedge, so the
 // carried write cannot be proven disjoint from read_{i+1}.
+// nsw makes the same-iteration offset proof valid without integer wrap.
 tt.func @disjoint_remsi_loop_carried_cf(%cst: tensor<128x128xf16, #AL>, %ub: i32) {
   %c0_i32 = arith.constant 0 : i32
   %c1_i32 = arith.constant 1 : i32
@@ -417,7 +419,7 @@ tt.func @disjoint_remsi_loop_carried_cf(%cst: tensor<128x128xf16, #AL>, %ub: i32
     // CHECK-NEXT: ttg.local_load
     %load = ttg.local_load %r_view : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #AL>
 
-    %w_sum = arith.addi %phase, %c1_i32 : i32
+    %w_sum = arith.addi %phase, %c1_i32 overflow<nsw> : i32
     %w_idx = arith.remsi %w_sum, %c3_i32 : i32
     %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<3x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK-NOT: ttg.barrier local
@@ -434,6 +436,7 @@ tt.func @disjoint_remsi_loop_carried_cf(%cst: tensor<128x128xf16, #AL>, %ub: i32
 // Future-precision case after scf-to-cf lowering. The current analysis
 // invalidates dynamic indices across the cf backedge, so it still requires a
 // conservative barrier before the read.
+// nsw makes the same-iteration offset proof valid without integer wrap.
 tt.func @must_barrier_remsi_loop_carried_future_disjoint_cf(%cst: tensor<128x128xf16, #AL>, %ub: i32) {
   %c0_i32 = arith.constant 0 : i32
   %c1_i32 = arith.constant 1 : i32
@@ -449,7 +452,7 @@ tt.func @must_barrier_remsi_loop_carried_future_disjoint_cf(%cst: tensor<128x128
     // CHECK-NEXT: ttg.local_load
     %load = ttg.local_load %r_view : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> tensor<128x128xf16, #AL>
 
-    %w_sum = arith.addi %phase, %c1_i32 : i32
+    %w_sum = arith.addi %phase, %c1_i32 overflow<nsw> : i32
     %w_idx = arith.remsi %w_sum, %c4_i32 : i32
     %w_view = ttg.memdesc_index %alloc[%w_idx] : !ttg.memdesc<4x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK-NOT: ttg.barrier local
