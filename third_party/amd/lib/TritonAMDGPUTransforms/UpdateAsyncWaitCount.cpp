@@ -4,6 +4,8 @@
 #include "amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -39,7 +41,7 @@
 // - On CDNA5 the number of (multicast) async_load and async_stores. On
 //   CDNA5 those are out of order with register loads so we will not get
 //   conservative waits.
-// For amdg.tdm_async_wait we only count TDM ops, then translate each op to the
+// For amdg.async_tdm_wait we only count TDM ops, then translate each op to the
 // number of TDM intrinsics emitted by lowering.
 
 namespace tt = triton;
@@ -52,6 +54,118 @@ namespace mlir {
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
 namespace {
+
+static bool hasAsyncToken(TypeRange types) {
+  return llvm::any_of(types,
+                      [](Type type) { return isa<ttg::AsyncTokenType>(type); });
+}
+
+static bool isAsyncWait(Operation *op) {
+  return isa<ttg::AsyncWaitOp, amdgpu::AsyncWaitOp, amdgpu::AsyncTDMWait,
+             amdgpu::AsyncTDMIntrinsicWait>(op);
+}
+
+// Opaque effects may hide queue work; known synchronous memory effects do not.
+// Inspect only this op's effects: the walk visits nested ops separately.
+static bool hasOpaqueEffects(Operation *op) {
+  auto interface = dyn_cast<MemoryEffectOpInterface>(op);
+  if (!interface)
+    return !op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+  SmallVector<MemoryEffects::EffectInstance> effects;
+  interface.getEffects(effects);
+  return llvm::any_of(effects, [](const auto &effect) {
+    return isa<SideEffects::DefaultResource>(effect.getResource());
+  });
+}
+
+struct AsyncCompletionSummary {
+  // Ordered so loads cannot narrow a queue already containing global writes.
+  enum Scope { Unseen, SharedOnly, All };
+  Scope copy = Unseen;
+  Scope tdm = Unseen;
+
+  bool isAll() const { return copy == All && tdm == All; }
+  void setAll() { copy = tdm = All; }
+
+  // Waits are collected separately; classify the remaining token operations.
+  void classifyAsyncOp(Operation *op) {
+    llvm::TypeSwitch<Operation *>(op)
+        .Case<ttg::AsyncCommitGroupOp>([](auto) {
+          // Commits do not add queue work.
+        })
+        .Case<BranchOpInterface, RegionBranchOpInterface,
+              RegionBranchTerminatorOpInterface>([&](auto op) {
+          // Control flow forwards tokens; the walk visits nested producers.
+          if (hasOpaqueEffects(op))
+            setAll();
+        })
+        .Case<ttg::AsyncCopyGlobalToLocalOp, amdgpu::BufferLoadToLocalOp>(
+            [&](auto) { copy = std::max(copy, SharedOnly); })
+        .Case<amdgpu::AsyncCopyLocalToGlobalOp>([&](auto) { copy = All; })
+        .Case<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+              amdgpu::AsyncTDMFusedCopyGlobalToLocalOp,
+              amdgpu::AsyncTDMGatherOp>(
+            [&](auto) { tdm = std::max(tdm, SharedOnly); })
+        .Case<amdgpu::TDMOpInterface>([&](auto) {
+          // Stores, scatters, and any future unsupported TDM operation.
+          tdm = All;
+        })
+        .Default([&](Operation *) { setAll(); });
+  }
+};
+
+// Summarize each function and annotate its waits together. Explicit tokens do
+// not exclude older work in a queue, so include all branches and loop
+// iterations.
+static void annotateAsyncCompletionScopes(ModuleOp module) {
+  // A callee can wait on work issued by its caller. Without call summaries,
+  // keep all-memory scope throughout modules containing calls.
+  bool hasCalls =
+      module.walk([](CallOpInterface) { return WalkResult::interrupt(); })
+          .wasInterrupted();
+  auto *ctx = module.getContext();
+  auto attrName = StringAttr::get(ctx, amdgpu::kAsyncCompletionScopeAttrName);
+  auto sharedScope = StringAttr::get(ctx, "shared");
+  auto allScope = StringAttr::get(ctx, "all");
+  module.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    auto function = dyn_cast<FunctionOpInterface>(op);
+    if (!function) {
+      // Waits outside a function have no local producer summary.
+      if (isAsyncWait(op))
+        op->setAttr(attrName, allScope);
+      return WalkResult::advance();
+    }
+
+    AsyncCompletionSummary summary;
+    // Incoming tokens may refer to work outside the function.
+    if (hasCalls || hasAsyncToken(function.getArgumentTypes()))
+      summary.setAll();
+    SmallVector<std::pair<Operation *, bool>> waits;
+    function.walk([&](Operation *nested) {
+      if (isAsyncWait(nested)) {
+        bool isTDM =
+            isa<amdgpu::AsyncTDMWait, amdgpu::AsyncTDMIntrinsicWait>(nested);
+        waits.emplace_back(nested, isTDM);
+        return;
+      }
+      // Keep collecting waits after the summary stops changing.
+      if (summary.isAll() || nested == op)
+        return;
+      if (hasAsyncToken(nested->getResultTypes()) ||
+          isa<amdgpu::TDMOpInterface>(nested))
+        summary.classifyAsyncOp(nested);
+      else if (hasOpaqueEffects(nested))
+        summary.setAll();
+    });
+    for (auto [wait, isTDM] : waits) {
+      auto scope = isTDM ? summary.tdm : summary.copy;
+      wait->setAttr(attrName, scope == AsyncCompletionSummary::SharedOnly
+                                  ? sharedScope
+                                  : allScope);
+    }
+    return WalkResult::skip();
+  });
+}
 
 // Returns the number of async copy instructions for global↔shared transfers.
 // Works for both load (global→shared) and store (shared→global) operations.
@@ -510,6 +624,11 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
       IRRewriter builder(waitOp->getContext());
       updateWaitCount(waitOp, countTDMInstructions, builder);
     }
+
+    // Annotate the final waits, including retained async-mark waits and waits
+    // already expressed in instruction counts. A function-wide proof remains
+    // valid even if count inference falls back to draining the entire queue.
+    annotateAsyncCompletionScopes(m);
   }
 };
 

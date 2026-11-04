@@ -8,6 +8,7 @@
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Utility.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_TRITONAMDGPUMEMBAR
@@ -16,6 +17,26 @@ namespace mlir::triton {
 
 namespace mlir::triton {
 namespace {
+
+class AMDMembarAnalysis : public MembarAnalysis {
+public:
+  using MembarAnalysis::MembarAnalysis;
+
+protected:
+  // Consume the earlier wait-count pass's scope proof before merging state.
+  CompletionSync getCompletionSync(Operation *op) override {
+    if (isa<gpu::AsyncWaitOp, amdgpu::AsyncWaitOp, amdgpu::AsyncTDMWait,
+            amdgpu::AsyncTDMIntrinsicWait>(op)) {
+      if (auto scope = op->getAttrOfType<StringAttr>(
+              amdgpu::kAsyncCompletionScopeAttrName))
+        return scope.getValue() == "shared" ? CompletionSync::Shared
+                                            : CompletionSync::All;
+    }
+    // Preserve the default classification for IR that has not gone through
+    // UpdateAsyncWaitCount, including standalone Membar analysis tests.
+    return MembarAnalysis::getCompletionSync(op);
+  }
+};
 
 struct TritonAMDGPUMembar
     : public impl::TritonAMDGPUMembarBase<TritonAMDGPUMembar> {
@@ -39,8 +60,17 @@ struct TritonAMDGPUMembar
     if (targetInfo.requiresAliasInfoForAsyncOps())
       AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
 
-    ModuleMembarAnalysis membarPass(allocation, AMD::membarFilter);
-    membarPass.run();
+    auto solver = createDataFlowSolver();
+    auto *regions = solver->load<BufferRegionAnalysis>(
+        BufferRegionAnalysis::Mode::AllMemory, &allocation);
+    if (failed(solver->initializeAndRun(mod))) {
+      signalPassFailure();
+      return;
+    }
+    AMDMembarAnalysis::runModule(mod, [&](FunctionOpInterface function) {
+      return AMDMembarAnalysis(*allocation.getFuncData(function),
+                               AMD::membarFilter, *regions);
+    });
     // Reschedule local rendezvous while waits and memory effects are explicit,
     // before ConSan and LLVM lowering.
     AMD::scheduleMembarBarriers(mod);
