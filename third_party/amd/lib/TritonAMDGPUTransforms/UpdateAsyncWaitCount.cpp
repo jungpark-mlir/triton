@@ -4,6 +4,8 @@
 #include "amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -39,7 +41,7 @@
 // - On CDNA5 the number of (multicast) async_load and async_stores. On
 //   CDNA5 those are out of order with register loads so we will not get
 //   conservative waits.
-// For amdg.tdm_async_wait we only count TDM ops, then translate each op to the
+// For amdg.async_tdm_wait we only count TDM ops, then translate each op to the
 // number of TDM intrinsics emitted by lowering.
 
 namespace tt = triton;
@@ -52,6 +54,90 @@ namespace mlir {
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
 namespace {
+
+// Query per wait so a future queue-history analysis can refine individual
+// waits without changing the annotation or its consumer. For now inspect all
+// producers in the function, including branches and every loop iteration.
+// Explicit tokens do not exclude older operations in the same hardware queue.
+class AsyncCompletionScopeAnalysis {
+public:
+  explicit AsyncCompletionScopeAnalysis(ModuleOp module) {
+    // A callee can wait on work issued by its caller. Without call summaries,
+    // keep all-memory scope throughout modules containing calls.
+    module.walk([&](CallOpInterface) { hasCalls = true; });
+  }
+
+  StringRef getCompletionScope(Operation *wait) {
+    auto function = wait->getParentOfType<FunctionOpInterface>();
+    if (hasCalls || !function)
+      return "all";
+    auto [it, inserted] = summaries.try_emplace(function.getOperation());
+    if (inserted)
+      it->second = analyze(function);
+    const auto &summary = it->second;
+    bool isTDM = isa<amdgpu::AsyncTDMWait, amdgpu::AsyncTDMIntrinsicWait>(wait);
+    bool shared = isTDM ? summary.tdmSeen && summary.tdmSharedOnly
+                        : summary.copySeen && summary.copySharedOnly;
+    return shared && !summary.unknown ? "shared" : "all";
+  }
+
+private:
+  struct Summary {
+    bool copySeen = false;
+    bool tdmSeen = false;
+    bool copySharedOnly = true;
+    bool tdmSharedOnly = true;
+    bool unknown = false;
+  };
+
+  static Summary analyze(FunctionOpInterface function) {
+    Summary summary;
+    // An incoming token may refer to work outside the function even without
+    // an explicit call in this module.
+    summary.unknown = llvm::any_of(function.getArgumentTypes(), [](Type type) {
+      return isa<ttg::AsyncTokenType>(type);
+    });
+    function.walk([&](Operation *op) {
+      if (isa<ttg::AsyncCopyGlobalToLocalOp, amdgpu::BufferLoadToLocalOp>(op)) {
+        summary.copySeen = true;
+      } else if (isa<amdgpu::AsyncCopyLocalToGlobalOp>(op)) {
+        summary.copySeen = true;
+        summary.copySharedOnly = false;
+      } else if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+                     amdgpu::AsyncTDMFusedCopyGlobalToLocalOp,
+                     amdgpu::AsyncTDMGatherOp>(op)) {
+        summary.tdmSeen = true;
+      } else if (isa<amdgpu::TDMOpInterface>(op)) {
+        // Stores, scatters, and any future unsupported TDM operation.
+        summary.tdmSeen = true;
+        summary.tdmSharedOnly = false;
+      } else if (op == function.getOperation() ||
+                 isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp,
+                     amdgpu::AsyncWaitOp, amdgpu::AsyncTDMWait,
+                     amdgpu::AsyncTDMIntrinsicWait, BranchOpInterface,
+                     RegionBranchOpInterface,
+                     RegionBranchTerminatorOpInterface>(op)) {
+        // Waits and token/control-flow operations do not add queue work.
+        // The walk visits nested producers separately.
+      } else {
+        summary.unknown |= llvm::any_of(op->getResultTypes(), [](Type type) {
+          return isa<ttg::AsyncTokenType>(type);
+        });
+        // Unknown effects (including impure inline assembly) may hide queue
+        // producers. Known synchronous shared/global effects do not add work
+        // to these async queues.
+        auto effects = getEffectsRecursively(op);
+        summary.unknown |= !effects || llvm::any_of(*effects, [](auto &effect) {
+          return isa<SideEffects::DefaultResource>(effect.getResource());
+        });
+      }
+    });
+    return summary;
+  }
+
+  bool hasCalls = false;
+  DenseMap<Operation *, Summary> summaries;
+};
 
 // Returns the number of async copy instructions for global↔shared transfers.
 // Works for both load (global→shared) and store (shared→global) operations.
@@ -510,6 +596,18 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
       IRRewriter builder(waitOp->getContext());
       updateWaitCount(waitOp, countTDMInstructions, builder);
     }
+
+    // Annotate the final waits, including retained async-mark waits and waits
+    // already expressed in instruction counts. A function-wide proof remains
+    // valid even if count inference falls back to draining the entire queue.
+    AsyncCompletionScopeAnalysis completionScopes(m);
+    m.walk([&](Operation *op) {
+      if (isa<ttg::AsyncWaitOp, amdgpu::AsyncWaitOp, amdgpu::AsyncTDMWait,
+              amdgpu::AsyncTDMIntrinsicWait>(op))
+        op->setAttr(amdgpu::kAsyncCompletionScopeAttrName,
+                    StringAttr::get(m.getContext(),
+                                    completionScopes.getCompletionScope(op)));
+    });
   }
 };
 

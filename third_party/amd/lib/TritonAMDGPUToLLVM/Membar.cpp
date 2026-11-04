@@ -1,12 +1,22 @@
 #include "TritonAMDGPUToLLVM/Passes.h"
 
 #include "AsyncUtility.h"
+#include "TDMUtility.h"
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
 #include "third_party/amd/include/Analysis/AMDGPUAllocation.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Analysis/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Tools/LayoutUtils.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <memory>
+#include <optional>
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_TRITONAMDGPUMEMBAR
@@ -15,6 +25,312 @@ namespace mlir::triton {
 
 namespace mlir::triton {
 namespace {
+
+bool isOrdinarySharedAccess(Operation *op) {
+  if (isa<gpu::LocalLoadOp, gpu::LocalStoreOp>(op))
+    return true;
+  auto alloc = dyn_cast<gpu::LocalAllocOp>(op);
+  return alloc && alloc.getSrc();
+}
+
+// Shared-memory counterpart of TMemWarpOwnership. Both slice hazards and
+// completion rendezvous use this proof and these caches.
+class SharedWarpOwnership {
+public:
+  explicit SharedWarpOwnership(BufferRegionAnalysis &regions)
+      : regions(regions) {}
+
+  bool isSameWarp(Operation *lhsOp, Operation *rhsOp, Allocation *allocation) {
+    auto function = cast<FunctionOpInterface>(allocation->getOperation());
+    if (lhsOp->getParentRegion() != rhsOp->getParentRegion() ||
+        lhsOp->getParentOfType<FunctionOpInterface>() != function ||
+        rhsOp->getParentOfType<FunctionOpInterface>() != function)
+      return false;
+    auto [it, inserted] = sameWarps.try_emplace({lhsOp, rhsOp}, false);
+    if (!inserted)
+      return it->second;
+    const AccessList *lhs = getAccesses(lhsOp);
+    const AccessList *rhs = getAccesses(rhsOp);
+    if (!lhs || !rhs)
+      return false;
+    // A fused op is several accesses, each with its own destination and hint.
+    // Unknown ownership only blocks the proof when that member may overlap.
+    for (const Access &a : *lhs)
+      for (const Access &b : *rhs)
+        if (!a.hasSameWarp(b))
+          return false;
+    return it->second = true;
+  }
+
+  bool hasKnownOwnership(Operation *op) {
+    const auto *accesses = getAccesses(op);
+    return accesses && llvm::all_of(*accesses, [](const Access &access) {
+             return access.warps.has_value();
+           });
+  }
+
+private:
+  struct Access {
+    // LDS element offset -> warp. Footprints themselves are in bytes.
+    std::optional<LinearLayout> warps;
+    unsigned elementBytes;
+    const BufferRegionFootprint *footprint;
+
+    bool hasSameWarp(const Access &other) const {
+      if (!mayOverlap(footprint, other.footprint))
+        return true;
+      if (!warps || !other.warps || !footprint || !other.footprint)
+        return false;
+      for (const auto &a : footprint->regionInfo.views)
+        for (const auto &b : other.footprint->regionInfo.views) {
+          if (!a.allocationFrame || a.allocationFrame != b.allocationFrame)
+            return false;
+          if (a.region.baseOffset == b.region.baseOffset &&
+              elementBytes == other.elementBytes && warps == other.warps)
+            continue;
+          for (const auto &[cta, addresses] : a.region.ctaAddresses)
+            for (const auto &[otherCTA, otherAddresses] :
+                 b.region.ctaAddresses) {
+              if (cta != otherCTA)
+                continue;
+              // Storage bases use integer addition, not layout XOR.
+              // Compare bytes across different ranks and element widths.
+              for (uint32_t address : addresses.intersection(otherAddresses)) {
+                auto warp = getWarp(address - a.region.baseOffset);
+                auto otherWarp = other.getWarp(address - b.region.baseOffset);
+                if (!warp || !otherWarp || warp != otherWarp)
+                  return false;
+              }
+            }
+        }
+      return true;
+    }
+
+    std::optional<uint32_t> getWarp(uint32_t byteOffset) const {
+      auto offset = *warps->getInDimNames().begin();
+      uint32_t element = byteOffset / elementBytes;
+      if (element >= warps->getInDimSize(offset))
+        return std::nullopt;
+      return warps->apply({{offset, int32_t(element)}}).front().second;
+    }
+  };
+  using AccessList = SmallVector<Access>;
+
+  bool hasSupportedOrigin(Value mem) {
+    auto found = origins.find(mem);
+    if (found != origins.end())
+      return found->second;
+    bool supported = false;
+    if (mem.getDefiningOp<gpu::LocalAllocOp>())
+      supported = true;
+    else if (auto index = mem.getDefiningOp<gpu::MemDescIndexOp>())
+      supported = hasSupportedOrigin(index.getSrc());
+    else if (auto reshape = mem.getDefiningOp<gpu::MemDescReshapeOp>())
+      supported = hasSupportedOrigin(reshape.getSrc());
+    else if (auto trans = mem.getDefiningOp<gpu::MemDescTransOp>())
+      supported = hasSupportedOrigin(trans.getSrc());
+    else if (auto select = mem.getDefiningOp<arith::SelectOp>())
+      supported = hasSupportedOrigin(select.getTrueValue()) &&
+                  hasSupportedOrigin(select.getFalseValue());
+    // Subslice offsets compose by XOR; keep them (and unknown/block argument
+    // origins) conservative, even when hidden behind other views.
+    origins[mem] = supported;
+    return supported;
+  }
+
+  Access computeAccess(Operation *op, Value mem,
+                       std::optional<LinearLayout> layout) {
+    auto memTy = cast<gpu::MemDescType>(mem.getType());
+    auto function = op->getParentOfType<FunctionOpInterface>();
+    auto *footprint = regions.getFootprint(mem, function);
+    Access result{std::nullopt, memTy.getElementTypeBitWidth() / 8, footprint};
+    if (!layout || memTy.getElementTypeBitWidth() < 8 ||
+        gpu::isPaddedEncoding(memTy.getEncoding()) ||
+        isa<gpu::PartitionedSharedEncodingAttr>(memTy.getEncoding()) ||
+        !hasSupportedOrigin(mem) || !footprint ||
+        footprint->regionInfo.views.empty())
+      return result;
+    for (const auto &view : footprint->regionInfo.views)
+      if (view.affineOffset || view.affinePartitionOffset ||
+          view.affineCTAOffset || !view.partitionBases.empty())
+        return result;
+
+    auto *ctx = op->getContext();
+    auto warp = StringAttr::get(ctx, "warp");
+    auto offset = StringAttr::get(ctx, "offset");
+    auto block = StringAttr::get(ctx, "block");
+    auto padding = StringAttr::get(ctx, "padding");
+    // A zero warp basis permits another warp to access the same elements.
+    // Predication of inactive TDM warps is not modeled here.
+    if (!layout->hasInDim(warp) || layout->getFreeVariableMasks().lookup(warp))
+      return result;
+    auto shared = gpu::toLinearLayoutIgnoringPadding(memTy);
+    auto accesses = invertAndComposeLocal(shared, *layout, {block});
+    // Complete the image after the real inputs so the inverse prefers them.
+    auto completion =
+        LinearLayout::identity1D(accesses.getOutDimSize(offset), padding,
+                                 offset) *
+        LinearLayout::identity1D(accesses.getOutDimSize(block), padding, block);
+    auto warps = accesses.concatIns(completion)
+                     .pseudoinvert()
+                     .sublayout({offset}, {warp});
+    // As in TMEM, a non-surjective inverse hides other owning warps.
+    if (warps.isSurjective())
+      result.warps = std::move(warps);
+    return result;
+  }
+
+  std::optional<LinearLayout> getTDMLayout(Operation *op, Value mem,
+                                           std::optional<uint32_t> hint) {
+    auto ty = cast<gpu::MemDescType>(mem.getType());
+    int numWarps = gpu::lookupNumWarps(op);
+    // Full hints have the same mapping as an unhinted copy. Proper subsets
+    // require a proof of consumer participation, which is not modeled here.
+    if ((hint && llvm::popcount(*hint) != numWarps) ||
+        gpu::isPaddedEncoding(ty.getEncoding()) ||
+        isa<gpu::PartitionedSharedEncodingAttr>(ty.getEncoding()))
+      return std::nullopt;
+    auto [warpsPerCTA, numInstructions] =
+        LLVM::AMD::distributeTDMWarpsAlignToPartition(ty.getShape(), numWarps,
+                                                      ty.getEncoding());
+    unsigned distributedWarps = 1;
+    for (unsigned count : warpsPerCTA)
+      distributedWarps *= count;
+    if (numInstructions != 1 || distributedWarps != numWarps)
+      return std::nullopt;
+    auto cga = gpu::getCGALayout(ty.getEncoding()).getLinearLayout();
+    return gpu::getTDMLinearLayout(ty.getShape(), warpsPerCTA, cga, numWarps,
+                                   hint);
+  }
+
+  const AccessList *getAccesses(Operation *op) {
+    auto [it, inserted] = accessesByOp.try_emplace(op);
+    if (!inserted)
+      return it->second.get();
+    if (gpu::lookupNumCTAs(op) != 1)
+      return nullptr;
+    auto accesses = std::make_unique<AccessList>();
+    auto addOrdinary = [&](Value mem, RankedTensorType regTy) {
+      std::optional<LinearLayout> layout;
+      if (regTy.getEncoding())
+        layout = gpu::toLinearLayout(regTy);
+      accesses->push_back(computeAccess(op, mem, std::move(layout)));
+    };
+    if (auto load = dyn_cast<gpu::LocalLoadOp>(op))
+      addOrdinary(load.getSrc(), load.getType());
+    else if (auto store = dyn_cast<gpu::LocalStoreOp>(op))
+      addOrdinary(store.getDst(), store.getSrc().getType());
+    else if (auto alloc = dyn_cast<gpu::LocalAllocOp>(op)) {
+      if (!alloc.getSrc())
+        return nullptr;
+      addOrdinary(alloc.getResult(), alloc.getSrc().getType());
+    } else if (auto copy = dyn_cast<gpu::AsyncCopyGlobalToLocalOp>(op))
+      addOrdinary(copy.getResult(), copy.getSrc().getType());
+    else if (auto copy = dyn_cast<amdgpu::BufferLoadToLocalOp>(op))
+      addOrdinary(copy.getDest(),
+                  cast<RankedTensorType>(copy.getOffsets().getType()));
+    else if (auto copy = dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
+      if (copy.getBarrier())
+        return nullptr;
+      accesses->push_back(computeAccess(
+          op, copy.getResult(),
+          getTDMLayout(op, copy.getResult(), copy.getWarpUsedHint())));
+    } else if (auto fused =
+                   dyn_cast<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(op)) {
+      for (auto [mem, hint] :
+           llvm::zip_equal(fused.getDests(), fused.getWarpUsedHints()))
+        accesses->push_back(
+            computeAccess(op, mem, getTDMLayout(op, mem, uint32_t(hint))));
+    } else
+      return nullptr;
+    it->second = std::move(accesses);
+    return it->second.get();
+  }
+
+  BufferRegionAnalysis &regions;
+  DenseMap<Value, bool> origins;
+  DenseMap<Operation *, std::unique_ptr<AccessList>> accessesByOp;
+  DenseMap<std::pair<Operation *, Operation *>, bool> sameWarps;
+};
+
+class AMDMembarAnalysis : public MembarAnalysis {
+public:
+  AMDMembarAnalysis(Allocation &allocation, MembarFilterFn filter,
+                    BufferRegionAnalysis &regions,
+                    SharedWarpOwnership &ownership, bool enableWarpLocal)
+      : MembarAnalysis(allocation, std::move(filter), regions),
+        ownership(ownership), enableWarpLocal(enableWarpLocal) {
+    if (!enableWarpLocal)
+      return;
+    auto function = cast<FunctionOpInterface>(allocation.getOperation());
+    function.walk([&](Operation *op) {
+      hasCalls |= isa<CallOpInterface>(op);
+      if (!op->hasTrait<OpTrait::GlobalToLocalCopyTrait>())
+        return;
+      bool foundWrite = false;
+      for (const auto &access : getMemoryAccesses(op)) {
+        if (!access.isShared() || !access.isWrite)
+          continue;
+        writers.push_back({op, regions.getFootprint(access.value, function)});
+        foundWrite = true;
+      }
+      if (!foundWrite)
+        writers.push_back({op, nullptr});
+    });
+  }
+
+protected:
+  CompletionSync getCompletionSync(Operation *op) override {
+    if (isa<gpu::AsyncWaitOp, amdgpu::AsyncWaitOp, amdgpu::AsyncTDMWait,
+            amdgpu::AsyncTDMIntrinsicWait>(op)) {
+      if (auto scope = op->getAttrOfType<StringAttr>(
+              amdgpu::kAsyncCompletionScopeAttrName))
+        return scope.getValue() == "shared" ? CompletionSync::Shared
+                                            : CompletionSync::All;
+    }
+    // Preserve the default classification for IR that has not gone through
+    // UpdateAsyncWaitCount, including standalone Membar analysis tests.
+    return MembarAnalysis::getCompletionSync(op);
+  }
+
+  bool requiresThreadSync(const BlockInfo &pending,
+                          const BlockInfo &effects) override {
+    if (!MembarAnalysis::requiresThreadSync(pending, effects))
+      return false;
+    if (!enableWarpLocal ||
+        pending.threadSync.completion != CompletionSync::Shared || hasCalls)
+      return true;
+    BlockInfo withoutCompletion = pending;
+    withoutCompletion.threadSync.completion = CompletionSync::None;
+    if (MembarAnalysis::requiresThreadSync(withoutCompletion, effects) ||
+        (effects.syncReadSlices.empty() && effects.syncWriteSlices.empty()))
+      return true;
+    for (auto *slices : {&effects.syncReadSlices, &effects.syncWriteSlices})
+      for (const auto &[slice, ops] : *slices) {
+        if (!slice.physicalFootprint || slice.argumentIndex || ops.empty())
+          return true;
+        for (Operation *op : ops) {
+          if (!ownership.hasKnownOwnership(op))
+            return true;
+          // An earlier unrelated barrier may have cleared pending write slices
+          // while the copy was outstanding. Check all physical writers in the
+          // function, including other iterations and execution regions.
+          for (const auto &[writer, footprint] : writers)
+            if (mayOverlap(slice.physicalFootprint, footprint) &&
+                !ownership.isSameWarp(writer, op, &allocation))
+              return true;
+        }
+      }
+    // Retain the completion state for any later cross-warp consumer.
+    return false;
+  }
+
+private:
+  SharedWarpOwnership &ownership;
+  bool enableWarpLocal;
+  SmallVector<std::pair<Operation *, const BufferRegionFootprint *>> writers;
+  bool hasCalls = false;
+};
 
 struct TritonAMDGPUMembar
     : public impl::TritonAMDGPUMembarBase<TritonAMDGPUMembar> {
@@ -38,8 +354,46 @@ struct TritonAMDGPUMembar
     if (targetInfo.requiresAliasInfoForAsyncOps())
       AMD::annotateLocalLoadsSyncedViaAsyncWait(mod);
 
-    ModuleMembarAnalysis membarPass(allocation, AMD::membarFilter);
-    membarPass.run();
+    // LLVM AMDGPUUsage, "Memory Model GFX6-GFX9" and "Memory Model GFX942":
+    // LDS operations are wavefront-wide, uncached, and ordered within a wave.
+    // Async-mark waits complete that wave's copies; they do not join waves.
+    // LLVM AMDGPUUsage, "Memory Model GFX125x": non-async LDS operations
+    // are wavefront-wide and ordered; async/tensor completion is explicit.
+    // CDNA5 uses per-wave asynccnt/tensorcnt waits for ordinary/TDM copies.
+    // Keep those waits; only the cross-wave rendezvous is relaxed.
+    bool enableWarpLocal =
+        targetInfo.useAsyncMarks() || targetInfo.supportsTDM();
+    auto solver = createDataFlowSolver();
+    auto *regions = solver->load<BufferRegionAnalysis>(
+        BufferRegionAnalysis::Mode::AllMemory, &allocation);
+    if (failed(solver->initializeAndRun(mod))) {
+      signalPassFailure();
+      return;
+    }
+    SharedWarpOwnership ownership(*regions);
+    auto filter = [&](Operation *lhs, Operation *rhs, bool lhsIsRead,
+                      bool rhsIsRead, Allocation *alloc,
+                      const AllocationSlice &lhsSlice,
+                      const AllocationSlice &rhsSlice) {
+      if (AMD::membarFilter(lhs, rhs, lhsIsRead, rhsIsRead, alloc, lhsSlice,
+                            rhsSlice))
+        return true;
+      if (!enableWarpLocal || !isOrdinarySharedAccess(rhs))
+        return false;
+      // CDNA5 async copies use explicit hardware counter waits, including
+      // tokenless TDM waits. Ownership removes only the rendezvous; programs
+      // must still wait for their async copies. Keep ordinary -> async-refill
+      // hazards conservative, as on CDNA3/CDNA4.
+      bool supportedProducer =
+          isOrdinarySharedAccess(lhs) ||
+          (targetInfo.supportsTDM() &&
+           lhs->hasTrait<OpTrait::GlobalToLocalCopyTrait>());
+      return supportedProducer && ownership.isSameWarp(lhs, rhs, alloc);
+    };
+    AMDMembarAnalysis::runModule(mod, [&](FunctionOpInterface function) {
+      return AMDMembarAnalysis(*allocation.getFuncData(function), filter,
+                               *regions, ownership, enableWarpLocal);
+    });
   }
 };
 
