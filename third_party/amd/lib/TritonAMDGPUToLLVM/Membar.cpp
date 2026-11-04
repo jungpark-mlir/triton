@@ -46,8 +46,7 @@ public:
   bool isSameWarp(Operation *lhsOp, Operation *rhsOp, Allocation *allocation) {
     auto function = cast<FunctionOpInterface>(allocation->getOperation());
     if (lhsOp->getParentRegion() != rhsOp->getParentRegion() ||
-        lhsOp->getParentOfType<FunctionOpInterface>() != function ||
-        rhsOp->getParentOfType<FunctionOpInterface>() != function)
+        lhsOp->getParentOfType<FunctionOpInterface>() != function)
       return false;
     auto [it, inserted] = sameWarps.try_emplace({lhsOp, rhsOp}, false);
     if (!inserted)
@@ -316,32 +315,41 @@ protected:
         pending.threadSync.completion != CompletionSync::Shared || hasCalls)
       return true;
     // Other synchronization reasons must hold even if ownership matches.
-    BlockInfo withoutCompletion = pending;
+    BlockInfo withoutCompletion;
+    withoutCompletion.threadSync = pending.threadSync;
     withoutCompletion.threadSync.completion = CompletionSync::None;
     if (MembarAnalysis::requiresThreadSync(withoutCompletion, effects) ||
         (effects.syncReadSlices.empty() && effects.syncWriteSlices.empty()))
       return true;
     for (auto *slices : {&effects.syncReadSlices, &effects.syncWriteSlices})
-      for (const auto &[slice, ops] : *slices) {
-        if (!slice.physicalFootprint || slice.argumentIndex || ops.empty())
+      for (const auto &[slice, ops] : *slices)
+        if (!isCompletionWarpLocal(slice, ops))
           return true;
-        for (Operation *op : ops) {
-          if (!ownership.hasKnownOwnership(op))
-            return true;
-          // An earlier unrelated barrier may have cleared pending write slices
-          // while the copy was outstanding. Check all physical writers in the
-          // function, including other iterations and execution regions.
-          for (const auto &[writer, footprint] : writers)
-            if (mayOverlap(slice.physicalFootprint, footprint) &&
-                !ownership.isSameWarp(writer, op, &allocation))
-              return true;
-        }
-      }
     // Retain the completion state for any later cross-warp consumer.
     return false;
   }
 
 private:
+  // Prove every consumer agrees with every overlapping async writer.
+  bool isCompletionWarpLocal(const AllocationSlice &slice,
+                             const std::set<Operation *> &ops) {
+    if (!slice.physicalFootprint || slice.argumentIndex || ops.empty())
+      return false;
+    for (Operation *op : ops)
+      if (!ownership.hasKnownOwnership(op))
+        return false;
+    // An earlier barrier may have cleared pending writes while a copy was
+    // outstanding. Include writers from all iterations and execution regions.
+    for (const auto &[writer, footprint] : writers) {
+      if (!mayOverlap(slice.physicalFootprint, footprint))
+        continue;
+      for (Operation *op : ops)
+        if (!ownership.isSameWarp(writer, op, &allocation))
+          return false;
+    }
+    return true;
+  }
+
   SharedWarpOwnership &ownership;
   bool enableWarpLocal;
   SmallVector<std::pair<Operation *, const BufferRegionFootprint *>> writers;

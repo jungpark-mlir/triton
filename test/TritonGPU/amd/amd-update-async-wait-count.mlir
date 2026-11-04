@@ -793,6 +793,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %tw = amdg.async_tdm_wait %g {num = 0 : i32}
     tt.return
   }
+
+  // CHECK-LABEL: @completion_scope_both_queues_all(
+  tt.func @completion_scope_both_queues_all(%mem: !ttg.memdesc<64x128xf16, #shared, #smem, mutable>, %desc: !tt.tensordesc<64x128xf16>, %indices: tensor<64xi32, #idx>, %ptr: tensor<64x128x!tt.ptr<f16>, #copy>) {
+    %store = amdg.async_copy_local_to_global %mem, %ptr : !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> tensor<64x128x!tt.ptr<f16>, #copy>
+    // A later load must not narrow the ordinary queue back to shared-only.
+    %load = ttg.async_copy_global_to_local %ptr, %mem : tensor<64x128x!tt.ptr<f16>, #copy> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %store, %load
+    %scatter = amdg.async_tdm_scatter %desc[%indices] from %mem : tensor<64xi32, #idx>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // Both queues are now all, but subsequent waits must still be annotated.
+    // CHECK: amdg.async_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "all"
+    %cw = ttg.async_wait %group {num = 0 : i32}
+    // CHECK: amdg.async_tdm_intrinsic_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "all"
+    %tw = amdg.async_tdm_wait %scatter {num = 0 : i32}
+    %gather = amdg.async_tdm_gather %desc[%indices] to %mem : tensor<64xi32, #idx>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // CHECK: amdg.async_tdm_intrinsic_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "all"
+    %done = amdg.async_tdm_wait %gather {num = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @completion_scope_scatter_then_gather(
+  tt.func @completion_scope_scatter_then_gather(%mem: !ttg.memdesc<64x128xf16, #shared, #smem, mutable>, %desc: !tt.tensordesc<64x128xf16>, %indices: tensor<64xi32, #idx>) {
+    %scatter = amdg.async_tdm_scatter %desc[%indices] from %mem : tensor<64xi32, #idx>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // A gather must not narrow the TDM queue even when the other queue is empty.
+    %gather = amdg.async_tdm_gather %desc[%indices] to %mem : tensor<64xi32, #idx>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // CHECK: amdg.async_tdm_intrinsic_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "all"
+    %done = amdg.async_tdm_wait %scatter, %gather {num = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @completion_scope_no_producers(
+  tt.func @completion_scope_no_producers() {
+    // Missing producers cannot establish shared-only completion. Overwrite any
+    // stale annotations even though no async work contributes to the summary.
+    // CHECK: amdg.async_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "all"
+    amdg.async_wait {num_inst = 0 : i32, ttg.amdg.completion_scope = "shared"}
+    // CHECK: amdg.async_tdm_intrinsic_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "all"
+    amdg.async_tdm_intrinsic_wait {count = 0 : i32, ttg.amdg.completion_scope = "shared"}
+    tt.return
+  }
+
 }
 
 // -----

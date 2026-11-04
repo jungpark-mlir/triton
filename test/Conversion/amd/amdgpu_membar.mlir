@@ -933,6 +933,30 @@ tt.func @warp_local_ordinary_hazards(%x: tensor<512xf32, #own>, %y: tensor<512xf
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32, "ttg.num-ctas" = 1 : i32} {
+// CHECK-LABEL: @warp_local_disjoint_async_writers(
+tt.func @warp_local_disjoint_async_writers(%ptr: !tt.ptr<f32>) -> (tensor<512xf32, #own>, tensor<512xf32, #own>) {
+  %offsets = tt.make_range {start = 0 : i32, end = 512 : i32} : tensor<512xi32, #own>
+  %cross_offsets = tt.make_range {start = 0 : i32, end = 512 : i32} : tensor<512xi32, #cross>
+  %buf = ttg.local_alloc : () -> !ttg.memdesc<512xf32, #shared, #smem, mutable>
+  %other = ttg.local_alloc : () -> !ttg.memdesc<512xf32, #shared, #smem, mutable>
+  %copy = amdg.buffer_load_to_local %ptr[%offsets] into %buf : !tt.ptr<f32>[tensor<512xi32, #own>] -> <512xf32, #shared, #smem, mutable>
+  %cross_copy = amdg.buffer_load_to_local %ptr[%cross_offsets] into %other : !tt.ptr<f32>[tensor<512xi32, #cross>] -> <512xf32, #shared, #smem, mutable>
+  %group = ttg.async_commit_group tokens %copy, %cross_copy
+  // Clear pending slices so the completion proof must check both writers.
+  // CHECK: ttg.barrier local
+  ttg.barrier local
+  // The disjoint writer cannot block the first load's warp-local proof.
+  // Completion must still synchronize the second load's different owners.
+  // CHECK: ttg.async_wait
+  // CHECK-NEXT: ttg.local_load
+  // CHECK-NEXT: ttg.barrier local
+  // CHECK-NEXT: ttg.local_load
+  %wait = ttg.async_wait %group {num = 0 : i32}
+  %a = ttg.local_load %buf token %wait : !ttg.memdesc<512xf32, #shared, #smem, mutable> -> tensor<512xf32, #own>
+  %b = ttg.local_load %other token %wait : !ttg.memdesc<512xf32, #shared, #smem, mutable> -> tensor<512xf32, #own>
+  tt.return %a, %b : tensor<512xf32, #own>, tensor<512xf32, #own>
+}
+
 // CHECK-LABEL: @warp_local_then_cross_warp_wait(
 tt.func @warp_local_then_cross_warp_wait(%ptr: !tt.ptr<f32>) -> (tensor<512xf32, #own>, tensor<512xf32, #cross>) {
   %offsets = tt.make_range {start = 0 : i32, end = 512 : i32} : tensor<512xi32, #own>
@@ -1476,8 +1500,9 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 
 #AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #A_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+#LOAD = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [1, 4], order = [1, 0]}>
 
-// The scheduler also moves a barrier inserted by Membar for a local load.
+// Different copy/load warp ownership requires a barrier for the scheduler to move.
 // CHECK-LABEL: @schedule_inserted_barrier
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
   tt.func @schedule_inserted_barrier(%ptr: !tt.ptr<f16>) -> f16 {
@@ -1491,7 +1516,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     // CHECK-NEXT: ttg.barrier local
     // CHECK-NEXT: {{.*}} = arith.addf
     %sum = arith.addf %loaded, %loaded : f16
-    %tile = ttg.local_load %buffer token %wait : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #AL>
+    %tile = ttg.local_load %buffer token %wait : !ttg.memdesc<16x16xf16, #A_SHARED, #ttg.shared_memory, mutable> -> tensor<16x16xf16, #LOAD>
     // CHECK-NOT: ttg.barrier local
     // CHECK: tt.return
     tt.return %sum : f16
