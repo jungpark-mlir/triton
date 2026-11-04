@@ -1,6 +1,7 @@
 #include "TritonAMDGPUToLLVM/Passes.h"
 
 #include "AsyncUtility.h"
+#include "ScheduleMembar.h"
 #include "TDMUtility.h"
 #include "TargetInfo.h"
 #include "TritonAMDGPUToLLVM/MembarUtility.h"
@@ -411,6 +412,9 @@ struct TritonAMDGPUMembar
       return AMDMembarAnalysis(*allocation.getFuncData(function), filter,
                                *regions, ownership, enableWarpLocal);
     });
+    // Reschedule local rendezvous while waits and memory effects are explicit,
+    // before ConSan and LLVM lowering.
+    AMD::scheduleMembarBarriers(mod);
   }
 };
 
