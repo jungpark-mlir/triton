@@ -26,6 +26,7 @@ from triton._internal_testing import (
     is_hip_cdna,
     is_hip_cdna3,
     is_hip_cdna4,
+    is_hip_cdna5,
     is_hopper_or_newer,
     is_hopper,
     skip_if_unsupported_cluster_size,
@@ -42,6 +43,7 @@ from triton.experimental.gluon.language.nvidia import hopper
 from triton.experimental.gluon.language.nvidia import rubin
 from triton.experimental.gluon.language.nvidia.blackwell import tma as blackwell_tma
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
+from triton.experimental.gluon.language.amd.cdna5 import tdm
 from triton.experimental.gluon.language.extra import libdevice
 from triton.experimental.gluon.language.nvidia.blackwell import (
     TensorMemoryLayout,
@@ -2727,6 +2729,96 @@ def test_amd_direct_load_to_shared(use_buffer_load):
     else:
         assert re.search(r"global_load_lds", pgm.asm['amdgcn'], re.MULTILINE)
     assert 'vmcnt(0)' in pgm.asm['amdgcn']
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
+@pytest.mark.parametrize("cross_warp", [False, True])
+@pytest.mark.parametrize("use_buffer_load", [False, True])
+def test_membar_warp_local_async_read(cross_warp, use_buffer_load):
+
+    @gluon.jit
+    def kernel(src, dst, CROSS: ttgl.constexpr, BUFFER: ttgl.constexpr):
+        writer: ttgl.constexpr = ttgl.BlockedLayout([1], [64], [4], [0])
+        reader: ttgl.constexpr = ttgl.BlockedLayout([2], [64], [4], [0]) if CROSS else writer
+        shared: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [0])
+        smem = ttgl.allocate_shared_memory(ttgl.float32, [512], shared)
+        offsets = ttgl.arange(0, 512, layout=writer)
+        output_offsets = ttgl.arange(0, 512, layout=reader)
+        acc = ttgl.full([512], 0, ttgl.float32, reader)
+        for i in range(4):
+            if BUFFER:
+                cdna4_async_copy.buffer_load_to_shared(smem, src, i * 512 + offsets)
+            else:
+                cdna4_async_copy.global_load_to_shared(smem, src + i * 512 + offsets)
+            cdna4_async_copy.commit_group()
+            cdna4_async_copy.wait_group(0)
+            acc += cdna4_async_copy.load_shared_relaxed(smem, reader)
+        ttgl.store(dst + output_offsets, acc)
+
+    source = torch.randn((4, 512), device="cuda", dtype=torch.float32)
+    result = torch.empty((512,), device="cuda", dtype=torch.float32)
+    compiled = kernel[(1,)](source, result, cross_warp, use_buffer_load, num_warps=4)
+    torch.testing.assert_close(result, source.sum(dim=0))
+    # Refilling the buffer can still require a WAR barrier. Check the specific
+    # wait-to-read intervals instead of counting all barriers in the kernel.
+    # The TTGIR snapshot precedes Membar; LLVM IR includes its barriers.
+    wait_to_reads = re.findall(
+        r"call void @llvm\.amdgcn\.wait\.asyncmark\(i16 0\)[^\n]*\n(.*?)\bload [^\n]*addrspace\(3\)",
+        compiled.asm["llir"], re.S)
+    assert wait_to_reads
+    assert all(("call void @llvm.amdgcn.s.barrier" in interval) == cross_warp for interval in wait_to_reads)
+    assert "vmcnt(0)" in compiled.asm["amdgcn"]
+
+
+@pytest.mark.skipif(not is_hip_cdna5(), reason="Requires CDNA5")
+@pytest.mark.parametrize("cross_warp,hint,reshape", [
+    (False, None, False), (True, None, False), (False, 15, False),
+    (False, 3, False), (False, 12, False), (False, None, True),
+])
+def test_membar_warp_local_tdm_read(cross_warp, hint, reshape):
+
+    @gluon.jit
+    def kernel(src, dst, CROSS: ttgl.constexpr, HINT: ttgl.constexpr, RESHAPE: ttgl.constexpr):
+        shared: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        desc = tdm.make_tensor_descriptor(src, [512, 16], [16, 1], [128, 16], shared)
+        smem = ttgl.allocate_shared_memory(ttgl.float16, [128, 16], shared)
+        if RESHAPE:
+            layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1, 2], [1, 4, 8], [4, 1, 1], [2, 1, 0])
+            acc = ttgl.full([4, 32, 16], 0, ttgl.float32, layout)
+        else:
+            layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1] if CROSS else [8, 1], [4, 8], [4, 1], [1, 0])
+            acc = ttgl.full([128, 16], 0, ttgl.float32, layout)
+        for i in range(4):
+            tdm.async_load(desc, [i * 128, 0], smem, warp_used_hint=HINT)
+            tdm.async_wait(0)
+            if RESHAPE:
+                acc += smem.reshape([4, 32, 16]).load(layout).to(ttgl.float32)
+            else:
+                acc += smem.load(layout).to(ttgl.float32)
+        if RESHAPE:
+            b = ttgl.arange(0, 4, layout=ttgl.SliceLayout(1, ttgl.SliceLayout(2, layout)))
+            r = ttgl.arange(0, 32, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(2, layout)))
+            c = ttgl.arange(0, 16, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(1, layout)))
+            offsets = b[:, None, None] * 512 + r[None, :, None] * 16 + c[None, None, :]
+        else:
+            r = ttgl.arange(0, 128, layout=ttgl.SliceLayout(1, layout))
+            c = ttgl.arange(0, 16, layout=ttgl.SliceLayout(0, layout))
+            offsets = r[:, None] * 16 + c[None, :]
+        ttgl.store(dst + offsets, acc)
+
+    source = torch.randn((4, 128, 16), device="cuda", dtype=torch.float16)
+    result = torch.empty((128, 16), device="cuda", dtype=torch.float32)
+    compiled = kernel[(1,)](source, result, cross_warp, hint, reshape, num_warps=4)
+    torch.testing.assert_close(result, source.float().sum(dim=0))
+    # LDS reads may lower to either ordinary loads or ds_load_tr intrinsics.
+    wait_to_reads = re.findall(
+        r"call void @llvm\.amdgcn\.s\.wait\.tensorcnt\(i16 0\)[^\n]*\n"
+        r"(.*?)(?:\bload [^\n]*addrspace\(3\)|call [^\n]*@llvm\.amdgcn\.ds\.load)",
+        compiled.asm["llir"], re.S)
+    assert wait_to_reads
+    needs_barrier = cross_warp or hint in (3, 12)
+    assert all(("call void @llvm.amdgcn.s.barrier" in interval) == needs_barrier for interval in wait_to_reads)
+    assert "s_wait_tensorcnt 0" in compiled.asm["amdgcn"]
 
 
 @pytest.mark.skipif(not (is_hip_rdna3() or is_hip_rdna4()), reason="Requires RDNA3 or RDNA4")

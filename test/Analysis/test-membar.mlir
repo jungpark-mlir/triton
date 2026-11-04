@@ -1,5 +1,10 @@
 // RUN: triton-opt %s -split-input-file --convert-scf-to-cf --allocate-shared-memory -test-print-membar | FileCheck %s
-// RUN: triton-opt %s -split-input-file --convert-scf-to-cf --allocate-shared-memory --triton-amdgpu-membar='gfx-arch=gfx942' | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-scf-to-cf --allocate-shared-memory --triton-amdgpu-membar='gfx-arch=gfx90a' | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-scf-to-cf --allocate-shared-memory --triton-amdgpu-membar='gfx-arch=gfx942' -o /dev/null
+
+// Keep the backend-independent barrier expectations on a target without
+// warp-local relaxation. Conversion/amd/amdgpu_membar.mlir checks the relaxed
+// barriers; the gfx942 run here also exercises incomplete layouts conservatively.
 
 #AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #sliceAd0 = #ttg.slice<{dim = 0, parent = #AL}>
