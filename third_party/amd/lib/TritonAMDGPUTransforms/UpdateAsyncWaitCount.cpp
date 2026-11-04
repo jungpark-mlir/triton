@@ -64,10 +64,12 @@ public:
   explicit AsyncCompletionScopeAnalysis(ModuleOp module) {
     // A callee can wait on work issued by its caller. Without call summaries,
     // keep all-memory scope throughout modules containing calls.
-    module.walk([&](CallOpInterface) { hasCalls = true; });
+    hasCalls =
+        module.walk([](CallOpInterface) { return WalkResult::interrupt(); })
+            .wasInterrupted();
   }
 
-  // Select the wait's queue from its cached function summary; unknown means all.
+  // Select the wait's queue from the cached summary; unknown means all.
   StringRef getCompletionScope(Operation *wait) {
     auto function = wait->getParentOfType<FunctionOpInterface>();
     if (hasCalls || !function)
@@ -91,48 +93,68 @@ private:
     bool unknown = false;
   };
 
-  // Summarize ordinary and TDM queues independently across the whole function.
+  static bool hasAsyncToken(TypeRange types) {
+    return llvm::any_of(
+        types, [](Type type) { return isa<ttg::AsyncTokenType>(type); });
+  }
+
+  // Classify token operations by queue and destination memory.
+  static void classifyAsyncOp(Operation *op, Summary &summary) {
+    if (isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp, amdgpu::AsyncWaitOp,
+            amdgpu::AsyncTDMWait, amdgpu::AsyncTDMIntrinsicWait>(op)) {
+      // Waits and commits do not add queue work.
+    } else if (isa<BranchOpInterface, RegionBranchOpInterface,
+                   RegionBranchTerminatorOpInterface>(op)) {
+      // Control flow forwards tokens; nested producers are visited separately.
+      summary.unknown = hasOpaqueEffects(op);
+    } else if (isa<ttg::AsyncCopyGlobalToLocalOp, amdgpu::BufferLoadToLocalOp>(
+                   op)) {
+      summary.copySeen = true;
+    } else if (isa<amdgpu::AsyncCopyLocalToGlobalOp>(op)) {
+      summary.copySeen = true;
+      summary.copySharedOnly = false;
+    } else if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+                   amdgpu::AsyncTDMFusedCopyGlobalToLocalOp,
+                   amdgpu::AsyncTDMGatherOp>(op)) {
+      summary.tdmSeen = true;
+    } else if (isa<amdgpu::TDMOpInterface>(op)) {
+      // Stores, scatters, and any future unsupported TDM operation.
+      summary.tdmSeen = true;
+      summary.tdmSharedOnly = false;
+    } else {
+      summary.unknown = true;
+    }
+  }
+
+  // Opaque effects may hide queue work; known synchronous memory effects do
+  // not. Inspect only this op's effects: the walk visits nested ops separately.
+  static bool hasOpaqueEffects(Operation *op) {
+    auto interface = dyn_cast<MemoryEffectOpInterface>(op);
+    if (!interface)
+      return !op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+    SmallVector<MemoryEffects::EffectInstance> effects;
+    interface.getEffects(effects);
+    return llvm::any_of(effects, [](const auto &effect) {
+      return isa<SideEffects::DefaultResource>(effect.getResource());
+    });
+  }
+
+  // Summarize each function once, stopping if unknown work forces all scope.
   static Summary analyze(FunctionOpInterface function) {
     Summary summary;
-    // An incoming token may refer to work outside the function even without
-    // an explicit call in this module.
-    summary.unknown = llvm::any_of(function.getArgumentTypes(), [](Type type) {
-      return isa<ttg::AsyncTokenType>(type);
-    });
+    // An incoming token may refer to work outside the function.
+    summary.unknown = hasAsyncToken(function.getArgumentTypes());
+    if (summary.unknown)
+      return summary;
     function.walk([&](Operation *op) {
-      if (isa<ttg::AsyncCopyGlobalToLocalOp, amdgpu::BufferLoadToLocalOp>(op)) {
-        summary.copySeen = true;
-      } else if (isa<amdgpu::AsyncCopyLocalToGlobalOp>(op)) {
-        summary.copySeen = true;
-        summary.copySharedOnly = false;
-      } else if (isa<amdgpu::AsyncTDMCopyGlobalToLocalOp,
-                     amdgpu::AsyncTDMFusedCopyGlobalToLocalOp,
-                     amdgpu::AsyncTDMGatherOp>(op)) {
-        summary.tdmSeen = true;
-      } else if (isa<amdgpu::TDMOpInterface>(op)) {
-        // Stores, scatters, and any future unsupported TDM operation.
-        summary.tdmSeen = true;
-        summary.tdmSharedOnly = false;
-      } else if (op == function.getOperation() ||
-                 isa<ttg::AsyncCommitGroupOp, ttg::AsyncWaitOp,
-                     amdgpu::AsyncWaitOp, amdgpu::AsyncTDMWait,
-                     amdgpu::AsyncTDMIntrinsicWait, BranchOpInterface,
-                     RegionBranchOpInterface,
-                     RegionBranchTerminatorOpInterface>(op)) {
-        // Waits and token/control-flow operations do not add queue work.
-        // The walk visits nested producers separately.
-      } else {
-        summary.unknown |= llvm::any_of(op->getResultTypes(), [](Type type) {
-          return isa<ttg::AsyncTokenType>(type);
-        });
-        // Unknown effects (including impure inline assembly) may hide queue
-        // producers. Known synchronous shared/global effects do not add work
-        // to these async queues.
-        auto effects = getEffectsRecursively(op);
-        summary.unknown |= !effects || llvm::any_of(*effects, [](auto &effect) {
-          return isa<SideEffects::DefaultResource>(effect.getResource());
-        });
-      }
+      if (op == function.getOperation())
+        return WalkResult::advance();
+      if (hasAsyncToken(op->getResultTypes()) ||
+          isa<amdgpu::TDMOpInterface>(op))
+        classifyAsyncOp(op, summary);
+      else
+        summary.unknown = hasOpaqueEffects(op);
+      return summary.unknown ? WalkResult::interrupt() : WalkResult::advance();
     });
     return summary;
   }

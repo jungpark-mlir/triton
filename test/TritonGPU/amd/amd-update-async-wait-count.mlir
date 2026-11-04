@@ -831,6 +831,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %tw = amdg.async_tdm_wait %g {num = 0 : i32}
     tt.return
   }
+
+  // CHECK-LABEL: @completion_scope_nested_unknown_asm(
+  tt.func @completion_scope_nested_unknown_asm(%mem: !ttg.memdesc<64x128xf16, #shared, #smem, mutable>, %desc: !tt.tensordesc<64x128xf16>, %indices: tensor<64xi32, #idx>, %ptr: tensor<64x128x!tt.ptr<f16>, #copy>, %cond: i1) {
+    %g = amdg.async_tdm_gather %desc[%indices] to %mem : tensor<64xi32, #idx>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // Opaque work in a nested region still invalidates the whole summary.
+    scf.if %cond {
+      %opaque = tt.elementwise_inline_asm "" {constraints = "=s", packed_element = 1 : i32, pure = false} -> i32
+    }
+    // CHECK: amdg.async_tdm_intrinsic_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "all"
+    %tw = amdg.async_tdm_wait %g {num = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @completion_scope_forwarded_token(
+  tt.func @completion_scope_forwarded_token(%mem: !ttg.memdesc<64x128xf16, #shared, #smem, mutable>, %desc: !tt.tensordesc<64x128xf16>, %indices: tensor<64xi32, #idx>, %ptr: tensor<64x128x!tt.ptr<f16>, #copy>, %cond: i1) {
+    %g = amdg.async_tdm_gather %desc[%indices] to %mem : tensor<64xi32, #idx>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // Forwarding a token and synchronous nested effects add no queue work.
+    %token = scf.if %cond -> (!ttg.async.token) {
+      %observed = tt.load %ptr : tensor<64x128x!tt.ptr<f16>, #copy>
+      scf.yield %g : !ttg.async.token
+    } else {
+      scf.yield %g : !ttg.async.token
+    }
+    // CHECK: amdg.async_tdm_intrinsic_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "shared"
+    %tw = amdg.async_tdm_wait %token {num = 0 : i32}
+    tt.return
+  }
+
+  // CHECK-LABEL: @completion_scope_incoming_token(
+  tt.func @completion_scope_incoming_token(%mem: !ttg.memdesc<64x128xf16, #shared, #smem, mutable>, %desc: !tt.tensordesc<64x128xf16>, %indices: tensor<64xi32, #idx>, %ptr: tensor<64x128x!tt.ptr<f16>, #copy>, %incoming: !ttg.async.token) {
+    %g = amdg.async_tdm_gather %desc[%indices] to %mem : tensor<64xi32, #idx>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    // A local load cannot narrow scope when incoming work is unknown.
+    // CHECK: amdg.async_tdm_intrinsic_wait
+    // CHECK-SAME: ttg.amdg.completion_scope = "all"
+    %tw = amdg.async_tdm_wait %g {num = 0 : i32}
+    tt.return
+  }
 }
 
 // -----
