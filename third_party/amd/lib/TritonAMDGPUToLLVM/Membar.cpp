@@ -26,6 +26,7 @@ namespace mlir::triton {
 namespace mlir::triton {
 namespace {
 
+// Synchronous LDS accesses eligible for slice-hazard relaxation.
 bool isOrdinarySharedAccess(Operation *op) {
   if (isa<gpu::LocalLoadOp, gpu::LocalStoreOp>(op))
     return true;
@@ -40,6 +41,7 @@ public:
   explicit SharedWarpOwnership(BufferRegionAnalysis &regions)
       : regions(regions) {}
 
+  // Check execution regions, then compare every pair of accessed destinations.
   bool isSameWarp(Operation *lhsOp, Operation *rhsOp, Allocation *allocation) {
     auto function = cast<FunctionOpInterface>(allocation->getOperation());
     if (lhsOp->getParentRegion() != rhsOp->getParentRegion() ||
@@ -62,6 +64,7 @@ public:
     return it->second = true;
   }
 
+  // Require a proven ownership map for every access made by the operation.
   bool hasKnownOwnership(Operation *op) {
     const auto *accesses = getAccesses(op);
     return accesses && llvm::all_of(*accesses, [](const Access &access) {
@@ -76,6 +79,7 @@ private:
     unsigned elementBytes;
     const BufferRegionFootprint *footprint;
 
+    // Compare owners on overlapping bytes, with a fast path for identical maps.
     bool hasSameWarp(const Access &other) const {
       if (!mayOverlap(footprint, other.footprint))
         return true;
@@ -106,6 +110,7 @@ private:
       return true;
     }
 
+    // Map a relative byte offset to its owner; out-of-range offsets fail proof.
     std::optional<uint32_t> getWarp(uint32_t byteOffset) const {
       auto offset = *warps->getInDimNames().begin();
       uint32_t element = byteOffset / elementBytes;
@@ -116,6 +121,7 @@ private:
   };
   using AccessList = SmallVector<Access>;
 
+  // Accept only descriptor chains whose physical offsets this proof supports.
   bool hasSupportedOrigin(Value mem) {
     auto found = origins.find(mem);
     if (found != origins.end())
@@ -138,6 +144,8 @@ private:
     return supported;
   }
 
+  // Derive LDS-offset -> warp from the access layout. Retain the footprint even
+  // when ownership cannot be proven, so disjoint accesses can still be excluded.
   Access computeAccess(Operation *op, Value mem,
                        std::optional<LinearLayout> layout) {
     auto memTy = cast<gpu::MemDescType>(mem.getType());
@@ -180,6 +188,7 @@ private:
     return result;
   }
 
+  // Reuse lowering's message/warp layout for all-warp, single-instruction copies.
   std::optional<LinearLayout> getTDMLayout(Operation *op, Value mem,
                                            std::optional<uint32_t> hint) {
     auto ty = cast<gpu::MemDescType>(mem.getType());
@@ -203,6 +212,7 @@ private:
                                    hint);
   }
 
+  // Dispatch by op kind and cache each destination's footprint and ownership.
   const AccessList *getAccesses(Operation *op) {
     auto [it, inserted] = accessesByOp.try_emplace(op);
     if (!inserted)
@@ -255,6 +265,7 @@ private:
 
 class AMDMembarAnalysis : public MembarAnalysis {
 public:
+  // Build function-wide writer candidates for later completion checks.
   AMDMembarAnalysis(Allocation &allocation, MembarFilterFn filter,
                     BufferRegionAnalysis &regions,
                     SharedWarpOwnership &ownership, bool enableWarpLocal)
@@ -280,6 +291,7 @@ public:
   }
 
 protected:
+  // Consume the earlier wait-count pass's scope proof before merging state.
   CompletionSync getCompletionSync(Operation *op) override {
     if (isa<gpu::AsyncWaitOp, amdgpu::AsyncWaitOp, amdgpu::AsyncTDMWait,
             amdgpu::AsyncTDMIntrinsicWait>(op)) {
@@ -293,6 +305,8 @@ protected:
     return MembarAnalysis::getCompletionSync(op);
   }
 
+  // Relax shared completion only when other thread demands permit it and all
+  // overlapping async writers have the same ownership as the upcoming accesses.
   bool requiresThreadSync(const BlockInfo &pending,
                           const BlockInfo &effects) override {
     if (!MembarAnalysis::requiresThreadSync(pending, effects))
@@ -300,6 +314,7 @@ protected:
     if (!enableWarpLocal ||
         pending.threadSync.completion != CompletionSync::Shared || hasCalls)
       return true;
+    // Other synchronization reasons must hold even if ownership matches.
     BlockInfo withoutCompletion = pending;
     withoutCompletion.threadSync.completion = CompletionSync::None;
     if (MembarAnalysis::requiresThreadSync(withoutCompletion, effects) ||
@@ -336,6 +351,7 @@ struct TritonAMDGPUMembar
     : public impl::TritonAMDGPUMembarBase<TritonAMDGPUMembar> {
   using TritonAMDGPUMembarBase::TritonAMDGPUMembarBase;
 
+  // Build physical footprints and share one ownership proof between both checks.
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     AMD::TargetInfo targetInfo(gfxArch);
@@ -371,6 +387,7 @@ struct TritonAMDGPUMembar
       return;
     }
     SharedWarpOwnership ownership(*regions);
+    // Slice hazards are checked independently of the completion override above.
     auto filter = [&](Operation *lhs, Operation *rhs, bool lhsIsRead,
                       bool rhsIsRead, Allocation *alloc,
                       const AllocationSlice &lhsSlice,

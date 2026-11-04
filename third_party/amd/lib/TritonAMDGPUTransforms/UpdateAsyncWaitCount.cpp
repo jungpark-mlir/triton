@@ -67,6 +67,7 @@ public:
     module.walk([&](CallOpInterface) { hasCalls = true; });
   }
 
+  // Select the wait's queue from its cached function summary; unknown means all.
   StringRef getCompletionScope(Operation *wait) {
     auto function = wait->getParentOfType<FunctionOpInterface>();
     if (hasCalls || !function)
@@ -90,6 +91,7 @@ private:
     bool unknown = false;
   };
 
+  // Summarize ordinary and TDM queues independently across the whole function.
   static Summary analyze(FunctionOpInterface function) {
     Summary summary;
     // An incoming token may refer to work outside the function even without
