@@ -4,43 +4,36 @@
 #include "amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include <limits>
+#include <memory>
 
-// This pass computes, for each AsyncWait, the number of outstanding async
-// intrinsics that must be waited on. An AsyncWait can specify its wait target
-// either via AsyncToken operands or via an explicit count (num) of outstanding
-// async operations, with tokens taking precedence. To preserve correctness, the
-// pass must never overestimate the wait count; underestimation only impacts
-// performance by waiting more conservatively. The wait count represents the
-// number of hardware instructions/intrinsics corresponding to the outstanding
-// async operations. For waits that carry async tokens, the pass walks the
-// def-use chains of each token and sums the number of async intrinsics
-// outstanding excluding the producer of the async token. Tokens may be copied
-// across loop boundaries (e.g., passed as loop initial arguments and yielded
-// from the loop body); in such cases, the pass takes the minimum count across
-// the possible paths. The final wait count is the minimum over all tokens and
-// their paths. For waits without tokens the count represent the number of
-// outstanding ttg.async_commit_groups (inclusive). The pass scans the IR
-// backward to find the specified num async commit groups and computes the
-// number of outstanding async intrinsics from async operations. Note that we
-// walk until we find n+1 commit groups to include all async ops of the n'th
-// commit group. Again, when multiple paths are possible, the pass takes the
-// minimum count across all paths needed to reach num async operations. For
-// ttg.async_wait we count:
-// - On GFX9 the number of direct-to-lds instructions. We ignore loads to
-//   registers since we do not control the vectorization (llvm can change it).
-//   Therefore interleaving direct-to-lds and loads to registers will produce
-//   conservative waits.
-// - On CDNA5 the number of (multicast) async_load and async_stores. On
-//   CDNA5 those are out of order with register loads so we will not get
-//   conservative waits.
-// For amdg.tdm_async_wait we only count TDM ops, then translate each op to the
-// number of TDM intrinsics emitted by lowering.
+// Lower async waits to hardware instruction counts and annotate their
+// completion scope for AMD Membar. On asyncmark targets, retain ordinary
+// commit-group waits and let LLVM compute their hardware counts; TDM waits
+// still need lowering.
+//
+// For instruction-counted waits, token operands take precedence over `num`.
+// Follow each token's definition and count the instructions issued after it,
+// taking the minimum across tokens and possible control-flow paths. Tokenless
+// waits instead walk backward over `num` outstanding commit groups (ordinary
+// copies) or TDM operations, counting the instructions emitted by lowering.
+// Never overestimate the number allowed to remain outstanding: a smaller count
+// waits more conservatively, while a larger count could leave required work
+// incomplete.
+//
+// A compact graph reuses the collected waits to track producer categories
+// through control flow. Scope is evaluated before a full hardware wait clears
+// its queue; partial waits conservatively retain every possible producer
+// category.
 
 namespace tt = triton;
 namespace ttg = triton::gpu;
@@ -52,6 +45,249 @@ namespace mlir {
 #include "TritonAMDGPUTransforms/Passes.h.inc"
 
 namespace {
+
+static bool hasAsyncToken(TypeRange types) {
+  return llvm::any_of(types,
+                      [](Type type) { return isa<ttg::AsyncTokenType>(type); });
+}
+
+static bool isAsyncWait(Operation *op) {
+  return isa<ttg::AsyncWaitOp, amdgpu::AsyncWaitOp, amdgpu::AsyncTDMWait,
+             amdgpu::AsyncTDMIntrinsicWait>(op);
+}
+
+// Opaque effects may hide queue work; known synchronous memory effects do not.
+// Inspect only this op's effects; the graph builder handles regions separately.
+static bool hasOpaqueEffects(Operation *op) {
+  auto interface = dyn_cast<MemoryEffectOpInterface>(op);
+  if (!interface)
+    return !op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+  SmallVector<MemoryEffects::EffectInstance> effects;
+  interface.getEffects(effects);
+  return llvm::any_of(effects, [](const auto &effect) {
+    return isa<SideEffects::DefaultResource>(effect.getResource());
+  });
+}
+
+// Keep only producer categories, waits, and control-flow edges. This is the
+// cheapest model for separating fully drained phases: no per-copy history or
+// token provenance is needed. Partial waits retain all possible work. A more
+// precise model can retain producer order/counts in this graph when needed.
+class AsyncCompletionGraph {
+  enum Work : unsigned {
+    CopyShared = 1,
+    CopyAll = 2,
+    TDMShared = 4,
+    TDMAll = 8,
+    // Opaque effects may involve unmodeled queues; ordinary drains cannot
+    // establish that this work has completed.
+    Unknown = 16,
+    Copy = CopyShared | CopyAll,
+    TDM = TDMShared | TDMAll,
+  };
+
+  // Each node summarizes producers before an optional wait. Classify the wait
+  // before applying its drain to the outgoing state.
+  struct Node {
+    unsigned generated = 0;
+    unsigned incoming = 0;
+    unsigned drained = 0;
+    Operation *wait = nullptr;
+    SmallVector<unsigned, 2> successors;
+    bool reached = false;
+    bool queued = false;
+  };
+  SmallVector<Node> nodes;
+  // Preserve IR order for count lowering, independent of graph node numbering.
+  SmallVector<unsigned> waits;
+  bool unsupported = false;
+
+  unsigned addNode() {
+    nodes.emplace_back();
+    return nodes.size() - 1;
+  }
+
+  void addEdge(unsigned from, unsigned to) {
+    nodes[from].successors.push_back(to);
+  }
+
+  // Synchronous operations disappear; consecutive producers share one summary.
+  static unsigned classify(Operation *op) {
+    if (!hasAsyncToken(op->getResultTypes()) &&
+        !isa<amdgpu::TDMOpInterface>(op))
+      return hasOpaqueEffects(op) ? Unknown : 0;
+    return llvm::TypeSwitch<Operation *, unsigned>(op)
+        .Case<ttg::AsyncCopyGlobalToLocalOp, amdgpu::BufferLoadToLocalOp>(
+            [](auto) { return CopyShared; })
+        .Case<amdgpu::AsyncCopyLocalToGlobalOp>([](auto) { return CopyAll; })
+        .Case<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+              amdgpu::AsyncTDMFusedCopyGlobalToLocalOp,
+              amdgpu::AsyncTDMGatherOp>([](auto) { return TDMShared; })
+        .Case<amdgpu::TDMOpInterface>([](auto) { return TDMAll; })
+        .Case<ttg::AsyncCommitGroupOp>([](auto) { return 0; })
+        .Case<BranchOpInterface, RegionBranchTerminatorOpInterface>(
+            [](auto op) { return hasOpaqueEffects(op) ? Unknown : 0; })
+        .Default([](Operation *) { return Unknown; });
+  }
+
+  // Retain block edges as well as structured branches and loop backedges.
+  // Unsupported regions may execute concurrently, so do not model them as
+  // sequential code. Keep their waits, but disable narrowing for the function.
+  // Pure reduce/scan combiners do not contribute queue work.
+  void buildRegion(Region &region, unsigned entry, unsigned exit) {
+    if (region.empty()) {
+      addEdge(entry, exit);
+      return;
+    }
+    DenseMap<Block *, unsigned> blocks;
+    for (Block &block : region)
+      blocks[&block] = addNode();
+    addEdge(entry, blocks.lookup(&region.front()));
+    for (Block &block : region) {
+      unsigned current = blocks.lookup(&block);
+      for (Operation &op : block) {
+        if (isAsyncWait(&op)) {
+          nodes[current].wait = &op;
+          waits.push_back(current);
+          unsigned next = addNode();
+          addEdge(current, next);
+          current = next;
+        } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+          unsigned next = addNode();
+          buildRegion(ifOp.getThenRegion(), current, next);
+          buildRegion(ifOp.getElseRegion(), current, next);
+          current = next;
+        } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+          // Do not regenerate pre-loop work on the backedge.
+          unsigned header = addNode(), next = addNode();
+          addEdge(current, header);
+          addEdge(header, next);
+          buildRegion(forOp.getRegion(), header, header);
+          current = next;
+        } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+          // The before-region also executes on the zero-trip path.
+          unsigned header = addNode(), condition = addNode(), next = addNode();
+          addEdge(current, header);
+          buildRegion(whileOp.getBefore(), header, condition);
+          addEdge(condition, next);
+          buildRegion(whileOp.getAfter(), condition, header);
+          current = next;
+        } else if (auto execute = dyn_cast<scf::ExecuteRegionOp>(op)) {
+          unsigned next = addNode();
+          buildRegion(execute.getRegion(), current, next);
+          current = next;
+        } else if (op.getNumRegions() && !isa<tt::ReduceOp, tt::ScanOp>(op)) {
+          unsupported = true;
+          op.walk([&](Operation *nested) {
+            if (isAsyncWait(nested)) {
+              unsigned index = addNode();
+              nodes[index].wait = nested;
+              waits.push_back(index);
+            }
+          });
+        } else {
+          nodes[current].generated |= classify(&op);
+        }
+      }
+      auto successors = block.getSuccessors();
+      if (successors.empty())
+        addEdge(current, exit);
+      else
+        for (Block *successor : successors)
+          addEdge(current, blocks.lookup(successor));
+    }
+  }
+
+public:
+  explicit AsyncCompletionGraph(FunctionOpInterface function) {
+    unsigned entry = addNode(), exit = addNode();
+    for (Region &region : function->getRegions())
+      buildRegion(region, entry, exit);
+  }
+
+  // Lower counts before deciding which waits drain a hardware queue. Tokens
+  // constrain the count but do not exclude other work from completion scope.
+  void updateWaits(llvm::function_ref<Operation *(Operation *)> update) {
+    for (unsigned index : waits) {
+      Node &node = nodes[index];
+      node.wait = update(node.wait);
+      if (auto wait = dyn_cast<amdgpu::AsyncWaitOp>(node.wait)) {
+        if (wait.getNumInst() == 0)
+          node.drained = Copy;
+      } else if (auto wait =
+                     dyn_cast<amdgpu::AsyncTDMIntrinsicWait>(node.wait)) {
+        if (wait.getCount() == 0)
+          node.drained = TDM;
+      }
+      // Retained ttg.async_wait uses asyncmark commit groups. It need not drain
+      // uncommitted copies, so conservatively retain the ordinary queue.
+    }
+  }
+
+  // Union states at joins and revisit successors only when their input grows.
+  // Backedges reach a fixed point before any wait receives its final scope.
+  void annotate(bool unknownEntry, StringAttr name, StringAttr shared,
+                StringAttr all) {
+    SmallVector<unsigned> worklist{0};
+    nodes[0].reached = nodes[0].queued = true;
+    while (!worklist.empty() && !unsupported && !unknownEntry) {
+      unsigned index = worklist.pop_back_val();
+      Node &node = nodes[index];
+      node.queued = false;
+      unsigned outgoing = (node.incoming | node.generated) & ~node.drained;
+      for (unsigned successor : node.successors) {
+        Node &next = nodes[successor];
+        unsigned merged = next.incoming | outgoing;
+        if (next.reached && merged == next.incoming)
+          continue;
+        next.incoming = merged;
+        next.reached = true;
+        if (!next.queued) {
+          next.queued = true;
+          worklist.push_back(successor);
+        }
+      }
+    }
+    for (unsigned index : waits) {
+      const Node &node = nodes[index];
+      bool isTDM = isa<amdgpu::AsyncTDMIntrinsicWait>(node.wait);
+      unsigned work =
+          (node.incoming | node.generated) & ((isTDM ? TDM : Copy) | Unknown);
+      bool sharedOnly = !unsupported && !unknownEntry && node.reached &&
+                        work == (isTDM ? TDMShared : CopyShared);
+      node.wait->setAttr(name, sharedOnly ? shared : all);
+    }
+  }
+};
+
+// Build each function's compact graph once, reusing its wait list for count
+// lowering and scope analysis. Calls retain the conservative module-wide scope
+// because a callee can wait on work issued by its caller.
+static void
+updateAsyncWaits(ModuleOp module,
+                 llvm::function_ref<Operation *(Operation *)> update) {
+  bool hasCalls =
+      module.walk([](CallOpInterface) { return WalkResult::interrupt(); })
+          .wasInterrupted();
+  auto *ctx = module.getContext();
+  auto name = StringAttr::get(ctx, amdgpu::kAsyncCompletionScopeAttrName);
+  auto shared = StringAttr::get(ctx, "shared");
+  auto all = StringAttr::get(ctx, "all");
+  module.walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (auto function = dyn_cast<FunctionOpInterface>(op)) {
+      AsyncCompletionGraph graph(function);
+      graph.updateWaits(update);
+      graph.annotate(hasCalls || hasAsyncToken(function.getArgumentTypes()),
+                     name, shared, all);
+      return WalkResult::skip();
+    }
+    if (isAsyncWait(op)) {
+      update(op)->setAttr(name, all);
+      return WalkResult::skip();
+    }
+    return WalkResult::advance();
+  });
+}
 
 // Returns the number of async copy instructions for global↔shared transfers.
 // Works for both load (global→shared) and store (shared→global) operations.
@@ -352,14 +588,13 @@ int computeMinCountBackward(triton::amdgpu::AsyncTDMWait waitOp,
       memoCache, countFunc);
 }
 
-// Follows the tokens of waitOp or walks the IR backwards from waitOp and
-// modifies the waitCnt in place based on the accumulated result of
-// computeCountForOp on interleaved instructions. See the file header for more
-// details.
+// Infer the hardware count from tokens or backward traversal, then return the
+// replacement wait so the graph can retain it and recognize full drains.
 template <typename WaitType>
-void updateWaitCount(WaitType waitOp,
-                     llvm::function_ref<int(Operation *)> computeCountForOp,
-                     RewriterBase &rewriter) {
+Operation *
+updateWaitCount(WaitType waitOp,
+                llvm::function_ref<int(Operation *)> computeCountForOp,
+                RewriterBase &rewriter) {
   int waitCnt = std::numeric_limits<int>::max();
 
   if (waitOp.getNumOperands() > 0) {
@@ -397,6 +632,7 @@ void updateWaitCount(WaitType waitOp,
     // still access it after this lowering.
     newOp->setAttr("ttg.num_commit_groups",
                    rewriter.getI32IntegerAttr(origNum));
+    return newOp;
   } else if (std::is_same_v<WaitType, triton::amdgpu::AsyncTDMWait>) {
     // Replace amdg.async_tdm_wait (counts TDM operations) with
     // amdg.async_tdm_intrinsic_wait (counts TDM intrinsics)
@@ -408,8 +644,9 @@ void updateWaitCount(WaitType waitOp,
     // Preserve the original TDM operation count so downstream passes
     // (e.g. ConcurrencySanitizer) can still access it after this lowering.
     newOp->setAttr("ttg.num_tdm_ops", rewriter.getI32IntegerAttr(origNum));
+    return newOp;
   } else {
-    assert(false && "Unsupported wait type");
+    llvm_unreachable("Unsupported wait type");
   }
 }
 
@@ -428,44 +665,22 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
 
     ModuleOp m = getOperation();
 
-    // With asyncmark/wait_asyncmark, LLVM handles vmcnt computation —
-    // Triton no longer needs to walk the IR and count outstanding async
-    // intrinsics. Keep the ttg.async_wait ops unchanged (they track
-    // commit groups) and lower them directly to wait_asyncmark later.
-    if (!targetFeatures.useAsyncMarks()) {
-      // CDNA5 (and future arches without asyncmark) use instruction counting.
-      SmallVector<ttg::AsyncWaitOp> waitOps;
-      getOperation()->walk(
-          [&](ttg::AsyncWaitOp waitOp) { waitOps.push_back(waitOp); });
+    // Asyncmark targets retain commit-group waits and do not need axis info.
+    std::unique_ptr<ModuleAxisInfoAnalysis> axisInfo;
+    if (!targetFeatures.useAsyncMarks())
+      axisInfo = std::make_unique<ModuleAxisInfoAnalysis>(m);
+    DenseMap<Operation *, int> intrinsicCountCache;
+    auto countAsyncInstructions = [&](Operation *op) -> int {
+      auto found = intrinsicCountCache.find(op);
+      if (found != intrinsicCountCache.end())
+        return found->second;
+      int count = getOpNumberOfAsyncCopyInstructions(
+          op, targetFeatures, *axisInfo, /*emitRemarkOnNonAsyncOp=*/false);
+      intrinsicCountCache[op] = count;
+      return count;
+    };
 
-      ModuleAxisInfoAnalysis axisInfo(m);
-      DenseMap<Operation *, int> intrinsicCountCache;
-      auto countAsyncLoadInstructions = [&](Operation *op) -> int {
-        auto found = intrinsicCountCache.find(op);
-        if (found != intrinsicCountCache.end()) {
-          return found->second;
-        }
-        auto v = getOpNumberOfAsyncCopyInstructions(
-            op, targetFeatures, axisInfo,
-            /*emitRemarkOnNonAsyncOp=*/false);
-        intrinsicCountCache[op] = v;
-        return v;
-      };
-
-      for (auto waitOp : waitOps) {
-        IRRewriter builder(waitOp->getContext());
-        updateWaitCount(waitOp, countAsyncLoadInstructions, builder);
-      }
-    }
-
-    // amdgpu.AsyncTDMWait should only count async tdm ops. Fused TDM copies are
-    // explicit IR operations by this point, so the count mirrors LLVM lowering
-    // directly.
-    SmallVector<triton::amdgpu::AsyncTDMWait> waitTDMOps;
-    getOperation()->walk([&](triton::amdgpu::AsyncTDMWait waitOp) {
-      waitTDMOps.push_back(waitOp);
-    });
-
+    // Fused and partitioned TDM operations use the same counts as lowering.
     DenseMap<Operation *, int> tdmIntrinsicCountCache;
     auto countTDMInstructions = [&](Operation *op) -> int {
       auto found = tdmIntrinsicCountCache.find(op);
@@ -506,10 +721,16 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
       return v;
     };
 
-    for (auto waitOp : waitTDMOps) {
-      IRRewriter builder(waitOp->getContext());
-      updateWaitCount(waitOp, countTDMInstructions, builder);
-    }
+    updateAsyncWaits(m, [&](Operation *op) -> Operation * {
+      IRRewriter builder(op->getContext());
+      if (auto wait = dyn_cast<ttg::AsyncWaitOp>(op)) {
+        if (!targetFeatures.useAsyncMarks())
+          return updateWaitCount(wait, countAsyncInstructions, builder);
+      } else if (auto wait = dyn_cast<amdgpu::AsyncTDMWait>(op)) {
+        return updateWaitCount(wait, countTDMInstructions, builder);
+      }
+      return op;
+    });
   }
 };
 
