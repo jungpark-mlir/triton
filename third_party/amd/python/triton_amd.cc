@@ -359,10 +359,6 @@ static std::optional<std::string> lldInvoke(const char *inPath,
   return {};
 }
 
-struct AMDLinkError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
-
 void init_triton_amd(py::module_ &m) {
   mlir::triton::AMD::registerTargetInfo();
   m.doc() = "Python bindings to the AMD Triton backend";
@@ -566,14 +562,13 @@ void init_triton_amd(py::module_ &m) {
     }
   });
 
-  py::exception<AMDLinkError>(m, "LinkError", PyExc_RuntimeError);
   m.def(
       "link_hsaco",
       [](const std::string &inPath, const std::string &outPath) {
         if (auto errString = lldInvoke(inPath.c_str(), outPath.c_str()))
-          throw AMDLinkError("LLD failed to link hsaco source " + inPath +
-                             " into object file " + outPath + " because " +
-                             errString.value());
+          throw std::runtime_error("LLD failed to link hsaco source " + inPath +
+                                   " into object file " + outPath +
+                                   " because " + errString.value());
       },
       // Linking may wait for in-flight compilations on other threads; do not
       // hold the GIL meanwhile.

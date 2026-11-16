@@ -848,31 +848,6 @@ def test_amd_codegen_assembly_error_translation(fresh_knobs, capfd):
     assert "this_is_not_an_instruction" in capfd.readouterr().err
 
 
-def test_amd_codegen_link_error_diagnostics(fresh_knobs, monkeypatch):
-    from triton.backends.amd import compiler
-    from triton.runtime.errors import BackendCompilationError
-
-    monkeypatch.setattr(compiler, "assemble_amdgcn", lambda *args: b"invalid ELF object")
-    with pytest.raises(BackendCompilationError) as exc:
-        compiler.HIPBackend.make_hsaco("", {}, compiler.HIPOptions(arch="gfx942"))
-    assert exc.value.stage == "linking"
-    assert "LLD failed to link" in exc.value.diagnostics
-    assert "invalid ELF object" in exc.value.diagnostics or "unknown file type" in exc.value.diagnostics
-
-
-def test_amd_codegen_link_unrelated_error_propagates(fresh_knobs, monkeypatch):
-    from triton.backends.amd import compiler
-
-    monkeypatch.setattr(compiler, "assemble_amdgcn", lambda *args: b"object")
-
-    def unrelated_failure(*args):
-        raise RuntimeError("unrelated failure")
-
-    monkeypatch.setattr(compiler.amd, "link_hsaco", unrelated_failure)
-    with pytest.raises(RuntimeError, match="unrelated failure"):
-        compiler.HIPBackend.make_hsaco("", {}, compiler.HIPOptions(arch="gfx942"))
-
-
 def test_amd_codegen_native_parse_error_translation(fresh_knobs, monkeypatch):
     from triton.backends.amd import compiler
     from triton.runtime.errors import BackendCompilationError

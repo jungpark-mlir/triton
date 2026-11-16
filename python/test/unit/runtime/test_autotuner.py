@@ -729,7 +729,7 @@ def test_prune_all_configs(device):
         ) == "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
 
 
-@pytest.mark.parametrize("stage", ["LLVM codegen", "assembly", "linking"])
+@pytest.mark.parametrize("stage", ["LLVM codegen", "assembly"])
 def test_backend_compilation_error_skips_candidate(stage, fresh_knobs):
     from triton.runtime.errors import BackendCompilationError
 

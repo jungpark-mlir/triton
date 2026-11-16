@@ -931,10 +931,7 @@ class HIPBackend(BaseBackend):
             with tempfile.NamedTemporaryFile() as tmp_in:
                 with open(tmp_in.name, "wb") as fd_in:
                     fd_in.write(hsaco)
-                try:
-                    amd.link_hsaco(tmp_in.name, tmp_out.name)
-                except amd.LinkError as error:
-                    raise BackendCompilationError("linking", str(error)) from error
+                amd.link_hsaco(tmp_in.name, tmp_out.name)
             with open(tmp_out.name, "rb") as fd_out:
                 ret = fd_out.read()
         return ret
