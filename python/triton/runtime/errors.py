@@ -44,3 +44,15 @@ class AutotunerError(TritonError):
     def __str__(self) -> str:
         error_message = self.error_message or ""
         return f"Autotuner error: {error_message}"
+
+
+class BackendCompilationError(TritonError):
+    """A reported backend compilation failure (not a crash or fatal abort)."""
+
+    def __init__(self, stage: str, diagnostics: str):
+        self.stage = stage
+        self.diagnostics = diagnostics
+        super().__init__(stage, diagnostics)
+
+    def __str__(self) -> str:
+        return f"Backend compilation failed during {self.stage}: {self.diagnostics}"

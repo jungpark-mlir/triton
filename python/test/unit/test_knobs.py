@@ -790,3 +790,119 @@ def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
     assert fresh_knobs.amd.use_block_pingpong
     monkeypatch.delenv("TRITON_HIP_USE_BLOCK_PINGPONG")
     assert fresh_knobs.amd.use_block_pingpong is None
+
+
+@pytest.mark.parametrize("size", [1024, 98304])
+def test_amd_codegen_static_lds_diagnostics(size, fresh_knobs, monkeypatch):
+    import ctypes
+    from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
+
+    source = f"""
+@lds = internal addrspace(3) global [{size} x i8] undef, align 16
+define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {{
+  %p = getelementptr i8, ptr addrspace(3) @lds, i32 %index
+  store volatile i8 1, ptr addrspace(3) %p
+  %v = load volatile i8, ptr addrspace(3) %p
+  store i8 %v, ptr addrspace(1) %out
+  ret void
+}}
+"""
+    library = compiler._load_amd_codegen(compiler.get_amd_codegen_path())
+    native_compile = library.triton_amdgpu_compile
+    statuses = []
+
+    def check_output(*args):
+        status = native_compile(*args)
+        statuses.append(status)
+        if status:
+            assert not ctypes.cast(args[3], ctypes.POINTER(ctypes.c_void_p))[0]
+            assert ctypes.cast(args[4], ctypes.POINTER(ctypes.c_size_t))[0] == 0
+        return status
+
+    monkeypatch.setattr(library, "triton_amdgpu_compile", check_output)
+    options = dict(flags=[], enable_fp_fusion=True, disable_optimization=False, canonicalize_gep=False,
+                   disabled_passes="", dump_ir=False, enable_timing=False)
+    if size > 65536:
+        with pytest.raises(BackendCompilationError) as exc:
+            compiler.compile_amdgpu(source, "amdgcn-amd-amdhsa", "gfx942", "", **options)
+        assert exc.value.stage == "LLVM codegen"
+        assert "local memory" in exc.value.diagnostics
+        assert "98304" in exc.value.diagnostics
+        assert "65536" in exc.value.diagnostics
+        assert statuses == [1]
+    else:
+        assert "lds_kernel:" in compiler.compile_amdgpu(source, "amdgcn-amd-amdhsa", "gfx942", "", **options)
+        assert statuses == [0]
+
+
+def test_amd_codegen_assembly_error_diagnostics(fresh_knobs):
+    from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
+
+    with pytest.raises(BackendCompilationError) as exc:
+        compiler.assemble_amdgcn("this_is_not_an_instruction\n", "gfx942", "")
+    assert exc.value.stage == "assembly"
+    assert "this_is_not_an_instruction" in exc.value.diagnostics
+    assert "error:" in exc.value.diagnostics
+
+
+def test_amd_codegen_link_error_diagnostics(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
+
+    monkeypatch.setattr(compiler, "assemble_amdgcn", lambda *args: b"invalid ELF object")
+    with pytest.raises(BackendCompilationError) as exc:
+        compiler.HIPBackend.make_hsaco("", {}, compiler.HIPOptions(arch="gfx942"))
+    assert exc.value.stage == "linking"
+    assert "LLD failed to link" in exc.value.diagnostics
+    assert "invalid ELF object" in exc.value.diagnostics or "unknown file type" in exc.value.diagnostics
+
+
+def test_amd_codegen_link_unrelated_error_propagates(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+
+    monkeypatch.setattr(compiler, "assemble_amdgcn", lambda *args: b"object")
+
+    def unrelated_failure(*args):
+        raise RuntimeError("unrelated failure")
+
+    monkeypatch.setattr(compiler.amd, "link_hsaco", unrelated_failure)
+    with pytest.raises(RuntimeError, match="unrelated failure"):
+        compiler.HIPBackend.make_hsaco("", {}, compiler.HIPOptions(arch="gfx942"))
+
+
+def test_amd_codegen_waves_per_eu_warning(fresh_knobs, capfd):
+    from triton.backends.amd import compiler
+
+    source = """
+@lds = internal addrspace(3) global [65536 x i8] undef, align 16
+define amdgpu_kernel void @hint_kernel(ptr addrspace(1) %out, i32 %index)
+    "amdgpu-waves-per-eu"="10" {
+  %p = getelementptr i8, ptr addrspace(3) @lds, i32 %index
+  store volatile i8 1, ptr addrspace(3) %p
+  %v = load volatile i8, ptr addrspace(3) %p
+  store i8 %v, ptr addrspace(1) %out
+  ret void
+}
+"""
+    assembly = compiler.compile_amdgpu(source, "amdgcn-amd-amdhsa", "gfx942", "", flags=[], enable_fp_fusion=True,
+                                       disable_optimization=False, canonicalize_gep=False, disabled_passes="",
+                                       dump_ir=False, enable_timing=False)
+    assert "hint_kernel:" in assembly
+    assert "failed to meet occupancy target" in capfd.readouterr().err
+
+
+def test_amd_codegen_native_parse_error_translation(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
+
+    # Bypass core LLVM's parser to exercise the separately pinned C ABI parser.
+    monkeypatch.setattr(compiler, "_serialize_for_amd_codegen", lambda src, _: src.encode())
+    with pytest.raises(BackendCompilationError) as exc:
+        compiler.compile_amdgpu("define invalid", "amdgcn-amd-amdhsa", "gfx942", "", flags=[], enable_fp_fusion=True,
+                                disable_optimization=False, canonicalize_gep=False, disabled_passes="", dump_ir=False,
+                                enable_timing=False)
+    assert exc.value.stage == "LLVM codegen"
+    assert "error:" in exc.value.diagnostics
+    assert "define invalid" in exc.value.diagnostics

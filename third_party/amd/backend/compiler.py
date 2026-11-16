@@ -1,6 +1,7 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm, amd
 from triton import knobs
+from triton.runtime.errors import BackendCompilationError
 from triton._instrumentation import instrument as _instrument, is_enabled
 from dataclasses import dataclass
 import ctypes
@@ -140,12 +141,12 @@ def _codegen_options(triple: str, processor: str, features: str, *, flags: list[
     )
 
 
-def _raise_codegen_error(library, error: ctypes.c_void_p, fallback: str):
+def _raise_codegen_error(library, error: ctypes.c_void_p, fallback: str, stage: str = "LLVM codegen"):
     message = ctypes.string_at(error).decode("utf-8") if error.value else fallback
     if error.value:
         library.triton_amdgpu_free(error)
     revision = library.triton_amdgpu_revision().decode("utf-8")
-    raise RuntimeError(f"AMD LLVM {revision}: {message}")
+    raise BackendCompilationError(stage, f"AMD LLVM {revision}: {message}")
 
 
 def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flags: list[str], enable_fp_fusion: bool,
@@ -278,11 +279,7 @@ def assemble_amdgcn(assembly: str, processor: str, features: str) -> bytes:
         ctypes.byref(error),
     )
     if status:
-        message = ctypes.string_at(error).decode("utf-8") if error.value else "unknown AMD assembly failure"
-        if error.value:
-            library.triton_amdgpu_free(error)
-        revision = library.triton_amdgpu_revision().decode("utf-8")
-        raise RuntimeError(f"AMD LLVM {revision}: {message}")
+        _raise_codegen_error(library, error, "unknown AMD assembly failure", stage="assembly")
     try:
         return ctypes.string_at(object_file, object_size.value)
     finally:
@@ -934,7 +931,10 @@ class HIPBackend(BaseBackend):
             with tempfile.NamedTemporaryFile() as tmp_in:
                 with open(tmp_in.name, "wb") as fd_in:
                     fd_in.write(hsaco)
-                amd.link_hsaco(tmp_in.name, tmp_out.name)
+                try:
+                    amd.link_hsaco(tmp_in.name, tmp_out.name)
+                except amd.LinkError as error:
+                    raise BackendCompilationError("linking", str(error)) from error
             with open(tmp_out.name, "rb") as fd_out:
                 ret = fd_out.read()
         return ret

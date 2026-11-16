@@ -12,6 +12,8 @@
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
@@ -85,6 +87,24 @@ struct CodegenOptions {
   // Read only by triton_amdgpu_translate_mir_to_asm.
   uint8_t enableMISched;
   uint8_t emitObject;
+};
+
+// Collect ordinary LLVM errors instead of merely printing them. Warnings
+// still use LLVM's default diagnostic printer. Fatal errors are not handled.
+class CodegenDiagnostics : public llvm::DiagnosticHandler {
+public:
+  std::string errors;
+
+  bool handleDiagnostics(const llvm::DiagnosticInfo &diagnostic) override {
+    if (diagnostic.getSeverity() != llvm::DS_Error)
+      return false;
+    llvm::raw_string_ostream stream(errors);
+    if (!errors.empty())
+      stream << "\n";
+    llvm::DiagnosticPrinterRawOStream printer(stream);
+    diagnostic.print(printer);
+    return true;
+  }
 };
 
 std::once_flag targetInitialization;
@@ -314,6 +334,9 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
   std::call_once(targetInitialization, initializeTarget);
 
   llvm::LLVMContext context;
+  auto diagnostics = std::make_unique<CodegenDiagnostics>();
+  auto *diagnosticHandler = diagnostics.get();
+  context.setDiagnosticHandler(std::move(diagnostics));
   std::unique_ptr<llvm::Module> module;
   std::optional<ScopedLLVMOptions> optionScope;
   std::unique_ptr<llvm::TargetMachine> machine;
@@ -334,6 +357,9 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
   }
 
   reportTimings(options);
+  // PassManager::run reports whether IR changed, not compilation success.
+  if (diagnosticHandler->HasErrors)
+    return fail(diagnosticHandler->errors, error);
   return publish(assembly, amdgcn, amdgcnSize, "AMDGCN assembly result", error);
 }
 
@@ -372,6 +398,9 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   settings.emplace_back("stop-after", llvm::mir_dag::livePipelineDAGPassName());
 
   llvm::LLVMContext context;
+  auto diagnostics = std::make_unique<CodegenDiagnostics>();
+  auto *diagnosticHandler = diagnostics.get();
+  context.setDiagnosticHandler(std::move(diagnostics));
   std::unique_ptr<llvm::Module> module;
   std::optional<ScopedLLVMOptions> optionScope;
   std::unique_ptr<llvm::TargetMachine> machine;
@@ -398,6 +427,9 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   }
 
   reportTimings(options);
+  // PassManager::run reports whether IR changed, not compilation success.
+  if (diagnosticHandler->HasErrors)
+    return fail(diagnosticHandler->errors, error);
 
   if (int status = publish(mirText, mir, mirSize, "MIR result", error))
     return status;
@@ -444,6 +476,9 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
   ScopedLLVMOptions optionScope(settings);
 
   llvm::LLVMContext context;
+  auto diagnostics = std::make_unique<CodegenDiagnostics>();
+  auto *diagnosticHandler = diagnostics.get();
+  context.setDiagnosticHandler(std::move(diagnostics));
   auto buffer = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(mirText, mirTextSize), "triton-amd-mir", false);
   std::unique_ptr<llvm::MIRParser> mirParser =
@@ -492,6 +527,9 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
   }
 
   reportTimings(options);
+  // PassManager::run reports whether IR changed, not compilation success.
+  if (diagnosticHandler->HasErrors)
+    return fail(diagnosticHandler->errors, error);
   return publish(result, output, outputSize, "MIR code-generation result",
                  error);
 }
@@ -521,7 +559,18 @@ triton_amdgpu_assemble(const char *assembly, size_t assemblySize,
   if (!target)
     return fail("target lookup error: " + targetError, error);
 
+  std::string diagnostics;
   llvm::SourceMgr sourceManager;
+  sourceManager.setDiagHandler(
+      [](const llvm::SMDiagnostic &diagnostic, void *opaque) {
+        if (diagnostic.getKind() != llvm::SourceMgr::DK_Error) {
+          diagnostic.print("triton-amdgpu-assembler", llvm::errs());
+          return;
+        }
+        llvm::raw_string_ostream stream(*static_cast<std::string *>(opaque));
+        diagnostic.print("triton-amdgpu-assembler", stream);
+      },
+      &diagnostics);
   sourceManager.AddNewSourceBuffer(
       llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(assembly, assemblySize),
                                        "triton-amdgpu-assembler", false),
@@ -567,8 +616,10 @@ triton_amdgpu_assemble(const char *assembly, size_t assemblySize,
     return fail("AMD assembler initialization error", error);
 
   parser->setTargetParser(*targetParser);
-  if (parser->Run(/*NoInitialTextSection=*/false))
-    return fail("AMD assembler rejected generated AMDGCN", error);
+  if (parser->Run(/*NoInitialTextSection=*/false) || context.hadError())
+    return fail(diagnostics.empty() ? "AMD assembler rejected generated AMDGCN"
+                                    : diagnostics,
+                error);
 
   return publish(llvm::StringRef(result.data(), result.size()), object,
                  objectSize, "AMD object result", error);
