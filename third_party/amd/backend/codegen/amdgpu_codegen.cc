@@ -12,6 +12,8 @@
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
@@ -87,6 +89,36 @@ struct CodegenOptions {
   uint8_t emitObject;
 };
 
+// Keep the existing nonzero failure convention and distinguish reported
+// compilation errors from configuration/infrastructure failures (status 1).
+constexpr int compilationFailure = 2;
+
+// PassManager::run reports whether IR changed, not compilation success.
+// Collect ordinary errors; let LLVM print warnings as before. Fatal errors
+// and crashes are outside this handler.
+class CodegenDiagnostics : public llvm::DiagnosticHandler {
+public:
+  std::string errors;
+
+  static CodegenDiagnostics *install(llvm::LLVMContext &context) {
+    auto handler = std::make_unique<CodegenDiagnostics>();
+    auto *diagnostics = handler.get();
+    context.setDiagnosticHandler(std::move(handler));
+    return diagnostics;
+  }
+
+  bool handleDiagnostics(const llvm::DiagnosticInfo &diagnostic) override {
+    if (diagnostic.getSeverity() != llvm::DS_Error)
+      return false;
+    llvm::raw_string_ostream stream(errors);
+    if (!errors.empty())
+      stream << "\n";
+    llvm::DiagnosticPrinterRawOStream printer(stream);
+    diagnostic.print(printer);
+    return true;
+  }
+};
+
 std::once_flag targetInitialization;
 
 char *copyString(llvm::StringRef value) {
@@ -98,10 +130,10 @@ char *copyString(llvm::StringRef value) {
   return result;
 }
 
-int fail(const std::string &message, char **error) {
+int fail(const std::string &message, char **error, int status = 1) {
   if (error)
     *error = copyString(message);
-  return 1;
+  return status;
 }
 
 void initializeTarget() {
@@ -233,7 +265,7 @@ int prepareModule(const char *llvmIR, size_t llvmIRSize,
     std::string message;
     llvm::raw_string_ostream stream(message);
     diagnostic.print("triton-amd-codegen", stream);
-    return fail(message, error);
+    return fail(message, error, compilationFailure);
   }
 
   // LLVM no longer supports globally enabling FP contraction through
@@ -271,9 +303,12 @@ int prepareModule(const char *llvmIR, size_t llvmIRSize,
 }
 
 // Hand `value` back to the caller through a malloc'd buffer it frees with
-// triton_amdgpu_free.
+// triton_amdgpu_free. Check codegen diagnostics before allocating output.
 int publish(llvm::StringRef value, char **out, size_t *outSize,
-            const char *what, char **error) {
+            const char *what, char **error,
+            const CodegenDiagnostics *diagnostics = nullptr) {
+  if (diagnostics && diagnostics->HasErrors)
+    return fail(diagnostics->errors, error, compilationFailure);
   *out = copyString(value);
   if (!*out)
     return fail(std::string("failed to allocate ") + what, error);
@@ -314,6 +349,7 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
   std::call_once(targetInitialization, initializeTarget);
 
   llvm::LLVMContext context;
+  auto *diagnostics = CodegenDiagnostics::install(context);
   std::unique_ptr<llvm::Module> module;
   std::optional<ScopedLLVMOptions> optionScope;
   std::unique_ptr<llvm::TargetMachine> machine;
@@ -334,7 +370,8 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
   }
 
   reportTimings(options);
-  return publish(assembly, amdgcn, amdgcnSize, "AMDGCN assembly result", error);
+  return publish(assembly, amdgcn, amdgcnSize, "AMDGCN assembly result", error,
+                 diagnostics);
 }
 
 // Emit the pre-machine-scheduler MIR for `llvmIR`, together with the scheduling
@@ -372,6 +409,7 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   settings.emplace_back("stop-after", llvm::mir_dag::livePipelineDAGPassName());
 
   llvm::LLVMContext context;
+  auto *diagnostics = CodegenDiagnostics::install(context);
   std::unique_ptr<llvm::Module> module;
   std::optional<ScopedLLVMOptions> optionScope;
   std::unique_ptr<llvm::TargetMachine> machine;
@@ -399,7 +437,8 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
 
   reportTimings(options);
 
-  if (int status = publish(mirText, mir, mirSize, "MIR result", error))
+  if (int status =
+          publish(mirText, mir, mirSize, "MIR result", error, diagnostics))
     return status;
   if (int status =
           publish(dagText, dag, dagSize, "scheduling DAG result", error)) {
@@ -444,6 +483,7 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
   ScopedLLVMOptions optionScope(settings);
 
   llvm::LLVMContext context;
+  auto *diagnostics = CodegenDiagnostics::install(context);
   auto buffer = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(mirText, mirTextSize), "triton-amd-mir", false);
   std::unique_ptr<llvm::MIRParser> mirParser =
@@ -453,7 +493,7 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
 
   std::unique_ptr<llvm::Module> module = mirParser->parseIRModule();
   if (!module)
-    return fail("failed to parse MIR IR module", error);
+    return fail("failed to parse MIR IR module", error, compilationFailure);
 
   std::unique_ptr<llvm::TargetMachine> machine =
       createTargetMachine(*module, options, error);
@@ -486,14 +526,15 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
       return fail("AMD target cannot emit code from MIR", error);
 
     if (mirParser->parseMachineFunctions(*module, MMIWP->getMMI()))
-      return fail("failed to parse machine functions from MIR", error);
+      return fail("failed to parse machine functions from MIR", error,
+                  compilationFailure);
 
     pass.run(*module);
   }
 
   reportTimings(options);
   return publish(result, output, outputSize, "MIR code-generation result",
-                 error);
+                 error, diagnostics);
 }
 
 extern "C" TRITON_AMD_EXPORT int
@@ -521,7 +562,19 @@ triton_amdgpu_assemble(const char *assembly, size_t assemblySize,
   if (!target)
     return fail("target lookup error: " + targetError, error);
 
+  std::string diagnostics;
   llvm::SourceMgr sourceManager;
+  sourceManager.setDiagHandler(
+      [](const llvm::SMDiagnostic &diagnostic, void *opaque) {
+        if (diagnostic.getKind() == llvm::SourceMgr::DK_Warning) {
+          diagnostic.print("triton-amdgpu-assembler", llvm::errs());
+          return;
+        }
+        // Include notes accompanying an error in the returned diagnostics.
+        llvm::raw_string_ostream stream(*static_cast<std::string *>(opaque));
+        diagnostic.print("triton-amdgpu-assembler", stream);
+      },
+      &diagnostics);
   sourceManager.AddNewSourceBuffer(
       llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(assembly, assemblySize),
                                        "triton-amdgpu-assembler", false),
@@ -567,8 +620,10 @@ triton_amdgpu_assemble(const char *assembly, size_t assemblySize,
     return fail("AMD assembler initialization error", error);
 
   parser->setTargetParser(*targetParser);
-  if (parser->Run(/*NoInitialTextSection=*/false))
-    return fail("AMD assembler rejected generated AMDGCN", error);
+  if (parser->Run(/*NoInitialTextSection=*/false) || context.hadError())
+    return fail(diagnostics.empty() ? "AMD assembler rejected generated AMDGCN"
+                                    : diagnostics,
+                error, compilationFailure);
 
   return publish(llvm::StringRef(result.data(), result.size()), object,
                  objectSize, "AMD object result", error);

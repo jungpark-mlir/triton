@@ -1,6 +1,7 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm, amd
 from triton import knobs
+from triton.runtime.errors import BackendCompilationError
 from triton._instrumentation import instrument as _instrument, is_enabled
 from dataclasses import dataclass
 import ctypes
@@ -113,7 +114,10 @@ def get_amd_codegen_revision() -> str:
 def _serialize_for_amd_codegen(src: str, enable_fp_fusion: bool) -> bytes:
     # Express fusion permission in the IR because newer LLVM versions no
     # longer honor TargetOptions::AllowFPOpFusion during code generation.
-    return llvm.to_bitcode(src, enable_fp_fusion)
+    try:
+        return llvm.to_bitcode(src, enable_fp_fusion)
+    except llvm.ParseError as error:
+        raise BackendCompilationError("LLVM IR parsing", str(error)) from error
 
 
 def _codegen_options(triple: str, processor: str, features: str, *, flags: list[str], enable_fp_fusion: bool,
@@ -140,12 +144,20 @@ def _codegen_options(triple: str, processor: str, features: str, *, flags: list[
     )
 
 
-def _raise_codegen_error(library, error: ctypes.c_void_p, fallback: str):
+# Must match compilationFailure in the native wrapper. Status 1 remains an
+# unclassified/configuration failure; old libraries never return status 2.
+_AMD_COMPILATION_FAILURE = 2
+
+
+def _raise_codegen_error(library, error: ctypes.c_void_p, fallback: str, status: int, stage: str = "LLVM codegen"):
     message = ctypes.string_at(error).decode("utf-8") if error.value else fallback
     if error.value:
         library.triton_amdgpu_free(error)
     revision = library.triton_amdgpu_revision().decode("utf-8")
-    raise RuntimeError(f"AMD LLVM {revision}: {message}")
+    diagnostics = f"AMD LLVM {revision}: {message}"
+    if status == _AMD_COMPILATION_FAILURE:
+        raise BackendCompilationError(stage, diagnostics)
+    raise RuntimeError(diagnostics)
 
 
 def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flags: list[str], enable_fp_fusion: bool,
@@ -171,7 +183,7 @@ def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flag
     status = library.triton_amdgpu_compile(llvm_ir, len(llvm_ir), ctypes.byref(options), ctypes.byref(assembly),
                                            ctypes.byref(assembly_size), ctypes.byref(error))
     if status:
-        _raise_codegen_error(library, error, "unknown AMD code-generation failure")
+        _raise_codegen_error(library, error, "unknown AMD code-generation failure", status)
     try:
         return ctypes.string_at(assembly, assembly_size.value).decode("utf-8")
     finally:
@@ -210,7 +222,7 @@ def translate_to_mir(src: str, triple: str, processor: str, features: str, flags
                                                     ctypes.byref(mir_size), ctypes.byref(dag), ctypes.byref(dag_size),
                                                     ctypes.byref(error))
     if status:
-        _raise_codegen_error(library, error, "unknown AMD MIR translation failure")
+        _raise_codegen_error(library, error, "unknown AMD MIR translation failure", status)
     try:
         mir_text = ctypes.string_at(mir, mir_size.value).decode("utf-8")
         dag_text = ctypes.string_at(dag, dag_size.value).decode("utf-8")
@@ -254,7 +266,7 @@ def translate_mir_to_asm(mir_path: str, triple: str, processor: str, features: s
                                                         ctypes.byref(output), ctypes.byref(output_size),
                                                         ctypes.byref(error))
     if status:
-        _raise_codegen_error(library, error, "unknown AMD MIR code-generation failure")
+        _raise_codegen_error(library, error, "unknown AMD MIR code-generation failure", status)
     try:
         return ctypes.string_at(output, output_size.value).decode("utf-8")
     finally:
@@ -278,11 +290,7 @@ def assemble_amdgcn(assembly: str, processor: str, features: str) -> bytes:
         ctypes.byref(error),
     )
     if status:
-        message = ctypes.string_at(error).decode("utf-8") if error.value else "unknown AMD assembly failure"
-        if error.value:
-            library.triton_amdgpu_free(error)
-        revision = library.triton_amdgpu_revision().decode("utf-8")
-        raise RuntimeError(f"AMD LLVM {revision}: {message}")
+        _raise_codegen_error(library, error, "unknown AMD assembly failure", status, stage="assembly")
     try:
         return ctypes.string_at(object_file, object_size.value)
     finally:
@@ -934,7 +942,10 @@ class HIPBackend(BaseBackend):
             with tempfile.NamedTemporaryFile() as tmp_in:
                 with open(tmp_in.name, "wb") as fd_in:
                     fd_in.write(hsaco)
-                amd.link_hsaco(tmp_in.name, tmp_out.name)
+                try:
+                    amd.link_hsaco(tmp_in.name, tmp_out.name)
+                except amd.LinkError as error:
+                    raise BackendCompilationError("linking", str(error)) from error
             with open(tmp_out.name, "rb") as fd_out:
                 ret = fd_out.read()
         return ret

@@ -381,11 +381,13 @@ def test_amd_codegen_options_restored(option, capfd, fresh_knobs):
 def test_amd_codegen_reports_invalid_llvm_ir(fresh_knobs):
     from triton.backends.compiler import GPUTarget
     from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
 
     source = "define amdgpu_kernel void @invalid_kernel() { invalid }"
     backend = compiler.HIPBackend(GPUTarget("hip", "gfx942", 64))
-    with pytest.raises(RuntimeError, match="failed to parse LLVM IR"):
+    with pytest.raises(BackendCompilationError, match="failed to parse LLVM IR") as exc:
         backend.make_amdgcn(source, {}, compiler.HIPOptions(arch="gfx942"))
+    assert exc.value.stage == "LLVM IR parsing"
 
 
 def test_amd_codegen_assembles_object_with_private_llvm(fresh_knobs):
@@ -790,3 +792,161 @@ def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
     assert fresh_knobs.amd.use_block_pingpong
     monkeypatch.delenv("TRITON_HIP_USE_BLOCK_PINGPONG")
     assert fresh_knobs.amd.use_block_pingpong is None
+
+
+def _compile_amd_ir(source):
+    from triton.backends.amd import compiler
+
+    return compiler.compile_amdgpu(source, compiler.amd.get_target_triple("gfx942"), "gfx942", "", flags=[],
+                                   enable_fp_fusion=True, disable_optimization=False, canonicalize_gep=False,
+                                   disabled_passes="", dump_ir=False, enable_timing=False)
+
+
+@pytest.mark.parametrize("pipeline", ["llvm", "mir"])
+@pytest.mark.parametrize("size, waves_per_eu", [(1024, 0), (98304, 0), (65536, 10)])
+def test_amd_codegen_static_lds_diagnostics(size, waves_per_eu, pipeline, fresh_knobs, monkeypatch, capfd, tmp_path):
+    import ctypes
+    from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
+
+    attributes = f'"amdgpu-waves-per-eu"="{waves_per_eu}"' if waves_per_eu else ""
+    source = f"""
+@lds = internal addrspace(3) global [{size} x i8] undef, align 16
+define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attributes} {{
+  %p = getelementptr i8, ptr addrspace(3) @lds, i32 %index
+  store volatile i8 1, ptr addrspace(3) %p
+  %v = load volatile i8, ptr addrspace(3) %p
+  store i8 %v, ptr addrspace(1) %out
+  ret void
+}}
+"""
+    library = compiler._load_amd_codegen(compiler.get_amd_codegen_path())
+    entry_point = "triton_amdgpu_compile" if pipeline == "llvm" else "triton_amdgpu_translate_mir_to_asm"
+    native_compile = getattr(library, entry_point)
+
+    def compile_source():
+        if pipeline == "llvm":
+            return _compile_amd_ir(source)
+        triple = compiler.amd.get_target_triple("gfx942")
+        compiler.translate_to_mir(source, triple, "gfx942", "", flags=[], enable_fp_fusion=True, dump_file_id="lds",
+                                  dump_dir=str(tmp_path), disabled_passes="", dump_ir=False)
+        return compiler.translate_mir_to_asm(str(tmp_path / "lds.txt"), triple, "gfx942", "", flags=[],
+                                             enable_fp_fusion=True, is_object=False, enable_misched=True, dump_ir=False)
+
+    def check_output(*args):
+        status = native_compile(*args)
+        assert status == (2 if size > 65536 else 0)
+        if status:
+            assert not ctypes.cast(args[3], ctypes.POINTER(ctypes.c_void_p))[0]
+            assert ctypes.cast(args[4], ctypes.POINTER(ctypes.c_size_t))[0] == 0
+        return status
+
+    monkeypatch.setattr(library, entry_point, check_output)
+    if size > 65536:
+        with pytest.raises(BackendCompilationError) as exc:
+            compile_source()
+        assert exc.value.stage == "LLVM codegen"
+        assert "local memory" in exc.value.diagnostics
+        assert "98304" in exc.value.diagnostics
+        assert "65536" in exc.value.diagnostics
+    else:
+        assert "lds_kernel:" in compile_source()
+        if waves_per_eu:
+            assert "failed to meet occupancy target" in capfd.readouterr().err
+
+
+def test_amd_codegen_native_parse_error_translation(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
+
+    # Bypass core LLVM's parser to exercise the separate C ABI parser.
+    monkeypatch.setattr(compiler, "_serialize_for_amd_codegen", lambda src, _: src.encode())
+    with pytest.raises(BackendCompilationError) as exc:
+        _compile_amd_ir("define invalid")
+    assert exc.value.stage == "LLVM codegen"
+    assert "error:" in exc.value.diagnostics
+    assert "define invalid" in exc.value.diagnostics
+
+
+def test_amd_codegen_invalid_options_propagate(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+
+    make_options = compiler._codegen_options
+
+    def invalid_options(*args, **kwargs):
+        options = make_options(*args, **kwargs)
+        options.abi_version = 0
+        return options
+
+    monkeypatch.setattr(compiler, "_codegen_options", invalid_options)
+    with pytest.raises(RuntimeError, match="incompatible AMD code-generation ABI"):
+        _compile_amd_ir("define amdgpu_kernel void @kernel() { ret void }")
+
+
+def test_amd_codegen_unexpected_error_propagates(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+
+    def unexpected_failure(*args):
+        raise RuntimeError("unexpected serialization failure")
+
+    monkeypatch.setattr(compiler.llvm, "to_bitcode", unexpected_failure)
+    with pytest.raises(RuntimeError, match="unexpected serialization failure"):
+        _compile_amd_ir("define amdgpu_kernel void @kernel() { ret void }")
+
+
+def test_amd_codegen_loading_error_propagates(fresh_knobs, tmp_path):
+    fresh_knobs.amd.codegen_path = str(tmp_path / "missing-codegen-library.so")
+    with pytest.raises(OSError):
+        _compile_amd_ir("define amdgpu_kernel void @kernel() { ret void }")
+
+
+def test_amd_codegen_assembly_error_diagnostics(fresh_knobs):
+    from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
+
+    with pytest.raises(BackendCompilationError) as exc:
+        compiler.assemble_amdgcn("this_is_not_an_instruction\n", "gfx942", "")
+    assert exc.value.stage == "assembly"
+    assert "this_is_not_an_instruction" in exc.value.diagnostics
+    assert "error:" in exc.value.diagnostics
+
+
+def test_amd_codegen_assembly_invalid_target_propagates(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+
+    monkeypatch.setattr(compiler.amd, "get_target_triple", lambda _: "invalid-target")
+    with pytest.raises(RuntimeError, match="target lookup error"):
+        compiler.assemble_amdgcn("s_endpgm\n", "gfx942", "")
+
+
+def test_amd_codegen_link_error_diagnostics(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+    from triton.runtime.errors import BackendCompilationError
+
+    monkeypatch.setattr(compiler, "assemble_amdgcn", lambda *args: b"invalid ELF object")
+    with pytest.raises(BackendCompilationError) as exc:
+        compiler.HIPBackend.make_hsaco("", {}, compiler.HIPOptions(arch="gfx942"))
+    assert exc.value.stage == "linking"
+    assert "LLD failed to link" in exc.value.diagnostics
+    assert "invalid ELF object" in exc.value.diagnostics
+
+
+def test_amd_codegen_link_unrelated_error_propagates(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+
+    monkeypatch.setattr(compiler, "assemble_amdgcn", lambda *args: b"object")
+
+    def unrelated_failure(*args):
+        raise RuntimeError("unrelated failure")
+
+    monkeypatch.setattr(compiler.amd, "link_hsaco", unrelated_failure)
+    with pytest.raises(RuntimeError, match="unrelated failure"):
+        compiler.HIPBackend.make_hsaco("", {}, compiler.HIPOptions(arch="gfx942"))
+
+
+def test_amd_codegen_assembly_warning_preserved(fresh_knobs, capfd):
+    from triton.backends.amd import compiler
+
+    result = compiler.assemble_amdgcn('.text\n.warning "keep warning"\ns_endpgm\n', "gfx942", "")
+    assert result.startswith(b"\x7fELF")
+    assert "keep warning" in capfd.readouterr().err

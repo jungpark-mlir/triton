@@ -416,7 +416,12 @@ using ret = py::rv_policy;
 
 } // namespace
 
+struct LLVMParseError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 void init_triton_llvm(py::module_ &m) {
+  py::exception<LLVMParseError>(m, "ParseError", PyExc_RuntimeError);
 
   py::class_<llvm::LLVMContext>(m, "context").def(py::init<>());
   py::class_<llvm::SourceMgr>(m, "source_mgr").def(py::init<>());
@@ -551,7 +556,7 @@ void init_triton_llvm(py::module_ &m) {
           auto module =
               llvm::parseIR(buffer->getMemBufferRef(), error, context);
           if (!module)
-            throw std::runtime_error(
+            throw LLVMParseError(
                 "failed to parse LLVM IR: " + error.getMessage().str() +
                 " at line " + std::to_string(error.getLineNo()));
           if (enable_fp_fusion)
