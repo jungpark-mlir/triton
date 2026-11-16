@@ -792,15 +792,16 @@ def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
     assert fresh_knobs.amd.use_block_pingpong is None
 
 
-@pytest.mark.parametrize("size", [1024, 98304])
-def test_amd_codegen_static_lds_diagnostics(size, fresh_knobs, monkeypatch):
+@pytest.mark.parametrize("size, waves_per_eu", [(1024, 0), (98304, 0), (65536, 10)])
+def test_amd_codegen_static_lds_diagnostics(size, waves_per_eu, fresh_knobs, monkeypatch, capfd):
     import ctypes
     from triton.backends.amd import compiler
     from triton.runtime.errors import BackendCompilationError
 
+    attributes = f'"amdgpu-waves-per-eu"="{waves_per_eu}"' if waves_per_eu else ""
     source = f"""
 @lds = internal addrspace(3) global [{size} x i8] undef, align 16
-define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {{
+define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attributes} {{
   %p = getelementptr i8, ptr addrspace(3) @lds, i32 %index
   store volatile i8 1, ptr addrspace(3) %p
   %v = load volatile i8, ptr addrspace(3) %p
@@ -810,30 +811,30 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {{
 """
     library = compiler._load_amd_codegen(compiler.get_amd_codegen_path())
     native_compile = library.triton_amdgpu_compile
-    statuses = []
 
     def check_output(*args):
         status = native_compile(*args)
-        statuses.append(status)
+        assert bool(status) == (size > 65536)
         if status:
             assert not ctypes.cast(args[3], ctypes.POINTER(ctypes.c_void_p))[0]
             assert ctypes.cast(args[4], ctypes.POINTER(ctypes.c_size_t))[0] == 0
         return status
 
     monkeypatch.setattr(library, "triton_amdgpu_compile", check_output)
+    triple = compiler.amd.get_target_triple("gfx942")
     options = dict(flags=[], enable_fp_fusion=True, disable_optimization=False, canonicalize_gep=False,
                    disabled_passes="", dump_ir=False, enable_timing=False)
     if size > 65536:
         with pytest.raises(BackendCompilationError) as exc:
-            compiler.compile_amdgpu(source, "amdgcn-amd-amdhsa", "gfx942", "", **options)
+            compiler.compile_amdgpu(source, triple, "gfx942", "", **options)
         assert exc.value.stage == "LLVM codegen"
         assert "local memory" in exc.value.diagnostics
         assert "98304" in exc.value.diagnostics
         assert "65536" in exc.value.diagnostics
-        assert statuses == [1]
     else:
-        assert "lds_kernel:" in compiler.compile_amdgpu(source, "amdgcn-amd-amdhsa", "gfx942", "", **options)
-        assert statuses == [0]
+        assert "lds_kernel:" in compiler.compile_amdgpu(source, triple, "gfx942", "", **options)
+        if waves_per_eu:
+            assert "failed to meet occupancy target" in capfd.readouterr().err
 
 
 def test_amd_codegen_assembly_error_diagnostics(fresh_knobs):
@@ -870,27 +871,6 @@ def test_amd_codegen_link_unrelated_error_propagates(fresh_knobs, monkeypatch):
     monkeypatch.setattr(compiler.amd, "link_hsaco", unrelated_failure)
     with pytest.raises(RuntimeError, match="unrelated failure"):
         compiler.HIPBackend.make_hsaco("", {}, compiler.HIPOptions(arch="gfx942"))
-
-
-def test_amd_codegen_waves_per_eu_warning(fresh_knobs, capfd):
-    from triton.backends.amd import compiler
-
-    source = """
-@lds = internal addrspace(3) global [65536 x i8] undef, align 16
-define amdgpu_kernel void @hint_kernel(ptr addrspace(1) %out, i32 %index)
-    "amdgpu-waves-per-eu"="10" {
-  %p = getelementptr i8, ptr addrspace(3) @lds, i32 %index
-  store volatile i8 1, ptr addrspace(3) %p
-  %v = load volatile i8, ptr addrspace(3) %p
-  store i8 %v, ptr addrspace(1) %out
-  ret void
-}
-"""
-    assembly = compiler.compile_amdgpu(source, "amdgcn-amd-amdhsa", "gfx942", "", flags=[], enable_fp_fusion=True,
-                                       disable_optimization=False, canonicalize_gep=False, disabled_passes="",
-                                       dump_ir=False, enable_timing=False)
-    assert "hint_kernel:" in assembly
-    assert "failed to meet occupancy target" in capfd.readouterr().err
 
 
 def test_amd_codegen_native_parse_error_translation(fresh_knobs, monkeypatch):

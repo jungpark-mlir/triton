@@ -91,6 +91,7 @@ struct CodegenOptions {
 
 // Collect ordinary LLVM errors instead of merely printing them. Warnings
 // still use LLVM's default diagnostic printer. Fatal errors are not handled.
+// PassManager::run reports whether IR changed; diagnostics determine failure.
 class CodegenDiagnostics : public llvm::DiagnosticHandler {
 public:
   std::string errors;
@@ -357,7 +358,6 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
   }
 
   reportTimings(options);
-  // PassManager::run reports whether IR changed, not compilation success.
   if (diagnosticHandler->HasErrors)
     return fail(diagnosticHandler->errors, error);
   return publish(assembly, amdgcn, amdgcnSize, "AMDGCN assembly result", error);
@@ -427,7 +427,6 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   }
 
   reportTimings(options);
-  // PassManager::run reports whether IR changed, not compilation success.
   if (diagnosticHandler->HasErrors)
     return fail(diagnosticHandler->errors, error);
 
@@ -527,7 +526,6 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
   }
 
   reportTimings(options);
-  // PassManager::run reports whether IR changed, not compilation success.
   if (diagnosticHandler->HasErrors)
     return fail(diagnosticHandler->errors, error);
   return publish(result, output, outputSize, "MIR code-generation result",
