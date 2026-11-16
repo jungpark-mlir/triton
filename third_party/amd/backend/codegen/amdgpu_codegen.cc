@@ -96,6 +96,13 @@ class CodegenDiagnostics : public llvm::DiagnosticHandler {
 public:
   std::string errors;
 
+  static CodegenDiagnostics *install(llvm::LLVMContext &context) {
+    auto handler = std::make_unique<CodegenDiagnostics>();
+    auto *diagnostics = handler.get();
+    context.setDiagnosticHandler(std::move(handler));
+    return diagnostics;
+  }
+
   bool handleDiagnostics(const llvm::DiagnosticInfo &diagnostic) override {
     if (diagnostic.getSeverity() != llvm::DS_Error)
       return false;
@@ -292,9 +299,12 @@ int prepareModule(const char *llvmIR, size_t llvmIRSize,
 }
 
 // Hand `value` back to the caller through a malloc'd buffer it frees with
-// triton_amdgpu_free.
+// triton_amdgpu_free. Reject recorded codegen errors before allocating output.
 int publish(llvm::StringRef value, char **out, size_t *outSize,
-            const char *what, char **error) {
+            const char *what, char **error,
+            const CodegenDiagnostics *diagnostics = nullptr) {
+  if (diagnostics && diagnostics->HasErrors)
+    return fail(diagnostics->errors, error);
   *out = copyString(value);
   if (!*out)
     return fail(std::string("failed to allocate ") + what, error);
@@ -335,9 +345,7 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
   std::call_once(targetInitialization, initializeTarget);
 
   llvm::LLVMContext context;
-  auto diagnostics = std::make_unique<CodegenDiagnostics>();
-  auto *diagnosticHandler = diagnostics.get();
-  context.setDiagnosticHandler(std::move(diagnostics));
+  auto *diagnostics = CodegenDiagnostics::install(context);
   std::unique_ptr<llvm::Module> module;
   std::optional<ScopedLLVMOptions> optionScope;
   std::unique_ptr<llvm::TargetMachine> machine;
@@ -358,9 +366,8 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
   }
 
   reportTimings(options);
-  if (diagnosticHandler->HasErrors)
-    return fail(diagnosticHandler->errors, error);
-  return publish(assembly, amdgcn, amdgcnSize, "AMDGCN assembly result", error);
+  return publish(assembly, amdgcn, amdgcnSize, "AMDGCN assembly result", error,
+                 diagnostics);
 }
 
 // Emit the pre-machine-scheduler MIR for `llvmIR`, together with the scheduling
@@ -398,9 +405,7 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   settings.emplace_back("stop-after", llvm::mir_dag::livePipelineDAGPassName());
 
   llvm::LLVMContext context;
-  auto diagnostics = std::make_unique<CodegenDiagnostics>();
-  auto *diagnosticHandler = diagnostics.get();
-  context.setDiagnosticHandler(std::move(diagnostics));
+  auto *diagnostics = CodegenDiagnostics::install(context);
   std::unique_ptr<llvm::Module> module;
   std::optional<ScopedLLVMOptions> optionScope;
   std::unique_ptr<llvm::TargetMachine> machine;
@@ -427,10 +432,9 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   }
 
   reportTimings(options);
-  if (diagnosticHandler->HasErrors)
-    return fail(diagnosticHandler->errors, error);
 
-  if (int status = publish(mirText, mir, mirSize, "MIR result", error))
+  if (int status =
+          publish(mirText, mir, mirSize, "MIR result", error, diagnostics))
     return status;
   if (int status =
           publish(dagText, dag, dagSize, "scheduling DAG result", error)) {
@@ -475,9 +479,7 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
   ScopedLLVMOptions optionScope(settings);
 
   llvm::LLVMContext context;
-  auto diagnostics = std::make_unique<CodegenDiagnostics>();
-  auto *diagnosticHandler = diagnostics.get();
-  context.setDiagnosticHandler(std::move(diagnostics));
+  auto *diagnostics = CodegenDiagnostics::install(context);
   auto buffer = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(mirText, mirTextSize), "triton-amd-mir", false);
   std::unique_ptr<llvm::MIRParser> mirParser =
@@ -526,10 +528,8 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
   }
 
   reportTimings(options);
-  if (diagnosticHandler->HasErrors)
-    return fail(diagnosticHandler->errors, error);
   return publish(result, output, outputSize, "MIR code-generation result",
-                 error);
+                 error, diagnostics);
 }
 
 extern "C" TRITON_AMD_EXPORT int
