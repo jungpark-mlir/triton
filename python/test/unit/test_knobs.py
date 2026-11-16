@@ -837,15 +837,15 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
             assert "failed to meet occupancy target" in capfd.readouterr().err
 
 
-def test_amd_codegen_assembly_error_diagnostics(fresh_knobs):
+def test_amd_codegen_assembly_error_translation(fresh_knobs, capfd):
     from triton.backends.amd import compiler
     from triton.runtime.errors import BackendCompilationError
 
     with pytest.raises(BackendCompilationError) as exc:
         compiler.assemble_amdgcn("this_is_not_an_instruction\n", "gfx942", "")
     assert exc.value.stage == "assembly"
-    assert "this_is_not_an_instruction" in exc.value.diagnostics
-    assert "error:" in exc.value.diagnostics
+    assert "AMD assembler rejected generated AMDGCN" in exc.value.diagnostics
+    assert "this_is_not_an_instruction" in capfd.readouterr().err
 
 
 def test_amd_codegen_link_error_diagnostics(fresh_knobs, monkeypatch):
