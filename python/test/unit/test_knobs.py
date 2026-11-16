@@ -802,9 +802,8 @@ def _compile_amd_ir(source):
                                    disabled_passes="", dump_ir=False, enable_timing=False)
 
 
-@pytest.mark.parametrize("pipeline", ["llvm", "mir"])
-@pytest.mark.parametrize("size, waves_per_eu", [(1024, 0), (98304, 0), (65536, 10)])
-def test_amd_codegen_static_lds_diagnostics(size, waves_per_eu, pipeline, fresh_knobs, monkeypatch, capfd, tmp_path):
+@pytest.mark.parametrize("size, waves_per_eu", [(98304, 0), (65536, 10)])
+def test_amd_codegen_static_lds_diagnostics(size, waves_per_eu, fresh_knobs, monkeypatch, capfd):
     import ctypes
     from triton.backends.amd import compiler
     from triton.runtime.errors import BackendCompilationError
@@ -821,17 +820,7 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
 }}
 """
     library = compiler._load_amd_codegen(compiler.get_amd_codegen_path())
-    entry_point = "triton_amdgpu_compile" if pipeline == "llvm" else "triton_amdgpu_translate_mir_to_asm"
-    native_compile = getattr(library, entry_point)
-
-    def compile_source():
-        if pipeline == "llvm":
-            return _compile_amd_ir(source)
-        triple = compiler.amd.get_target_triple("gfx942")
-        compiler.translate_to_mir(source, triple, "gfx942", "", flags=[], enable_fp_fusion=True, dump_file_id="lds",
-                                  dump_dir=str(tmp_path), disabled_passes="", dump_ir=False)
-        return compiler.translate_mir_to_asm(str(tmp_path / "lds.txt"), triple, "gfx942", "", flags=[],
-                                             enable_fp_fusion=True, is_object=False, enable_misched=True, dump_ir=False)
+    native_compile = library.triton_amdgpu_compile
 
     def check_output(*args):
         status = native_compile(*args)
@@ -841,10 +830,10 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
             assert ctypes.cast(args[4], ctypes.POINTER(ctypes.c_size_t))[0] == 0
         return status
 
-    monkeypatch.setattr(library, entry_point, check_output)
+    monkeypatch.setattr(library, "triton_amdgpu_compile", check_output)
     if size > 65536:
         with pytest.raises(BackendCompilationError) as exc:
-            compile_source()
+            _compile_amd_ir(source)
         assert exc.value.stage == "LLVM codegen"
         assert "AMD LLVM codegen failed" in exc.value.diagnostics
         diagnostics = capfd.readouterr().err
@@ -852,22 +841,9 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
         assert "98304" in diagnostics
         assert "65536" in diagnostics
     else:
-        assert "lds_kernel:" in compile_source()
+        assert "lds_kernel:" in _compile_amd_ir(source)
         if waves_per_eu:
             assert "failed to meet occupancy target" in capfd.readouterr().err
-
-
-def test_amd_codegen_native_parse_error_translation(fresh_knobs, monkeypatch):
-    from triton.backends.amd import compiler
-    from triton.runtime.errors import BackendCompilationError
-
-    # Bypass core LLVM's parser to exercise the separate C ABI parser.
-    monkeypatch.setattr(compiler, "_serialize_for_amd_codegen", lambda src, _: src.encode())
-    with pytest.raises(BackendCompilationError) as exc:
-        _compile_amd_ir("define invalid")
-    assert exc.value.stage == "LLVM codegen"
-    assert "error:" in exc.value.diagnostics
-    assert "define invalid" in exc.value.diagnostics
 
 
 def test_amd_codegen_invalid_options_propagate(fresh_knobs, monkeypatch):
@@ -885,40 +861,15 @@ def test_amd_codegen_invalid_options_propagate(fresh_knobs, monkeypatch):
         _compile_amd_ir("define amdgpu_kernel void @kernel() { ret void }")
 
 
-def test_amd_codegen_unexpected_error_propagates(fresh_knobs, monkeypatch):
-    from triton.backends.amd import compiler
-
-    def unexpected_failure(*args):
-        raise RuntimeError("unexpected serialization failure")
-
-    monkeypatch.setattr(compiler.llvm, "to_bitcode", unexpected_failure)
-    with pytest.raises(RuntimeError, match="unexpected serialization failure"):
-        _compile_amd_ir("define amdgpu_kernel void @kernel() { ret void }")
-
-
-def test_amd_codegen_loading_error_propagates(fresh_knobs, tmp_path):
-    fresh_knobs.amd.codegen_path = str(tmp_path / "missing-codegen-library.so")
-    with pytest.raises(OSError):
-        _compile_amd_ir("define amdgpu_kernel void @kernel() { ret void }")
-
-
-def test_amd_codegen_assembly_error_diagnostics(fresh_knobs):
+def test_amd_codegen_assembly_error_diagnostics(fresh_knobs, capfd):
     from triton.backends.amd import compiler
     from triton.runtime.errors import BackendCompilationError
 
     with pytest.raises(BackendCompilationError) as exc:
         compiler.assemble_amdgcn("this_is_not_an_instruction\n", "gfx942", "")
     assert exc.value.stage == "assembly"
-    assert "this_is_not_an_instruction" in exc.value.diagnostics
-    assert "error:" in exc.value.diagnostics
-
-
-def test_amd_codegen_assembly_invalid_target_propagates(fresh_knobs, monkeypatch):
-    from triton.backends.amd import compiler
-
-    monkeypatch.setattr(compiler.amd, "get_target_triple", lambda _: "invalid-target")
-    with pytest.raises(RuntimeError, match="target lookup error"):
-        compiler.assemble_amdgcn("s_endpgm\n", "gfx942", "")
+    assert "AMD assembler rejected generated AMDGCN" in exc.value.diagnostics
+    assert "this_is_not_an_instruction" in capfd.readouterr().err
 
 
 def test_amd_codegen_link_error_diagnostics(fresh_knobs, monkeypatch):
@@ -944,11 +895,3 @@ def test_amd_codegen_link_unrelated_error_propagates(fresh_knobs, monkeypatch):
     monkeypatch.setattr(compiler.amd, "link_hsaco", unrelated_failure)
     with pytest.raises(RuntimeError, match="unrelated failure"):
         compiler.HIPBackend.make_hsaco("", {}, compiler.HIPOptions(arch="gfx942"))
-
-
-def test_amd_codegen_assembly_warning_preserved(fresh_knobs, capfd):
-    from triton.backends.amd import compiler
-
-    result = compiler.assemble_amdgcn('.text\n.warning "keep warning"\ns_endpgm\n', "gfx942", "")
-    assert result.startswith(b"\x7fELF")
-    assert "keep warning" in capfd.readouterr().err

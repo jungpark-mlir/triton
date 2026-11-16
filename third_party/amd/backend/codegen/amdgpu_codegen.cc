@@ -535,19 +535,7 @@ triton_amdgpu_assemble(const char *assembly, size_t assemblySize,
   if (!target)
     return fail("target lookup error: " + targetError, error);
 
-  std::string diagnostics;
   llvm::SourceMgr sourceManager;
-  sourceManager.setDiagHandler(
-      [](const llvm::SMDiagnostic &diagnostic, void *opaque) {
-        if (diagnostic.getKind() == llvm::SourceMgr::DK_Warning) {
-          diagnostic.print("triton-amdgpu-assembler", llvm::errs());
-          return;
-        }
-        // Include notes accompanying an error in the returned diagnostics.
-        llvm::raw_string_ostream stream(*static_cast<std::string *>(opaque));
-        diagnostic.print("triton-amdgpu-assembler", stream);
-      },
-      &diagnostics);
   sourceManager.AddNewSourceBuffer(
       llvm::MemoryBuffer::getMemBuffer(llvm::StringRef(assembly, assemblySize),
                                        "triton-amdgpu-assembler", false),
@@ -594,9 +582,8 @@ triton_amdgpu_assemble(const char *assembly, size_t assemblySize,
 
   parser->setTargetParser(*targetParser);
   if (parser->Run(/*NoInitialTextSection=*/false) || context.hadError())
-    return fail(diagnostics.empty() ? "AMD assembler rejected generated AMDGCN"
-                                    : diagnostics,
-                error, compilationFailure);
+    return fail("AMD assembler rejected generated AMDGCN", error,
+                compilationFailure);
 
   return publish(llvm::StringRef(result.data(), result.size()), object,
                  objectSize, "AMD object result", error);
