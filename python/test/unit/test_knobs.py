@@ -829,9 +829,11 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
         with pytest.raises(BackendCompilationError) as exc:
             compiler.compile_amdgpu(source, triple, "gfx942", "", **options)
         assert exc.value.stage == "LLVM codegen"
-        assert "local memory" in exc.value.diagnostics
-        assert "98304" in exc.value.diagnostics
-        assert "65536" in exc.value.diagnostics
+        assert "AMD LLVM codegen failed" in exc.value.diagnostics
+        diagnostics = capfd.readouterr().err
+        assert "local memory" in diagnostics
+        assert "98304" in diagnostics
+        assert "65536" in diagnostics
     else:
         assert "lds_kernel:" in compiler.compile_amdgpu(source, triple, "gfx942", "", **options)
         if waves_per_eu:

@@ -12,8 +12,7 @@
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/DebugInfo.h"
-#include "llvm/IR/DiagnosticInfo.h"
-#include "llvm/IR/DiagnosticPrinter.h"
+#include "llvm/IR/DiagnosticHandler.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
@@ -98,32 +97,6 @@ struct CodegenOptions {
   // Read only by triton_amdgpu_translate_mir_to_asm.
   uint8_t enableMISched;
   uint8_t emitObject;
-};
-
-// Collect ordinary LLVM errors instead of merely printing them. Warnings
-// still use LLVM's default diagnostic printer. Fatal errors are not handled.
-// PassManager::run reports whether IR changed; diagnostics determine failure.
-class CodegenDiagnostics : public llvm::DiagnosticHandler {
-public:
-  std::string errors;
-
-  static CodegenDiagnostics *install(llvm::LLVMContext &context) {
-    auto handler = std::make_unique<CodegenDiagnostics>();
-    auto *diagnostics = handler.get();
-    context.setDiagnosticHandler(std::move(handler));
-    return diagnostics;
-  }
-
-  bool handleDiagnostics(const llvm::DiagnosticInfo &diagnostic) override {
-    if (diagnostic.getSeverity() != llvm::DS_Error)
-      return false;
-    llvm::raw_string_ostream stream(errors);
-    if (!errors.empty())
-      stream << "\n";
-    llvm::DiagnosticPrinterRawOStream printer(stream);
-    diagnostic.print(printer);
-    return true;
-  }
 };
 
 std::once_flag targetInitialization;
@@ -313,9 +286,11 @@ int prepareModule(const char *llvmIR, size_t llvmIRSize,
 // triton_amdgpu_free. Reject recorded codegen errors before allocating output.
 int publish(llvm::StringRef value, char **out, size_t *outSize,
             const char *what, char **error,
-            const CodegenDiagnostics *diagnostics = nullptr) {
-  if (diagnostics && diagnostics->HasErrors)
-    return fail(diagnostics->errors, error, CompilationFailure);
+            const llvm::LLVMContext *context = nullptr) {
+  // LLVM records ordinary errors and prints their diagnostics to stderr.
+  if (context && context->getDiagHandlerPtr()->HasErrors)
+    return fail("AMD LLVM codegen failed; see diagnostic output", error,
+                CompilationFailure);
   *out = copyString(value);
   if (!*out)
     return fail(std::string("failed to allocate ") + what, error);
@@ -356,7 +331,6 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
   std::call_once(targetInitialization, initializeTarget);
 
   llvm::LLVMContext context;
-  auto *diagnostics = CodegenDiagnostics::install(context);
   std::unique_ptr<llvm::Module> module;
   std::optional<ScopedLLVMOptions> optionScope;
   std::unique_ptr<llvm::TargetMachine> machine;
@@ -378,7 +352,7 @@ triton_amdgpu_compile(const char *llvmIR, size_t llvmIRSize,
 
   reportTimings(options);
   return publish(assembly, amdgcn, amdgcnSize, "AMDGCN assembly result", error,
-                 diagnostics);
+                 &context);
 }
 
 // Emit the pre-machine-scheduler MIR for `llvmIR`, together with the scheduling
@@ -416,7 +390,6 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   settings.emplace_back("stop-after", llvm::mir_dag::livePipelineDAGPassName());
 
   llvm::LLVMContext context;
-  auto *diagnostics = CodegenDiagnostics::install(context);
   std::unique_ptr<llvm::Module> module;
   std::optional<ScopedLLVMOptions> optionScope;
   std::unique_ptr<llvm::TargetMachine> machine;
@@ -445,7 +418,7 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
   reportTimings(options);
 
   if (int status =
-          publish(mirText, mir, mirSize, "MIR result", error, diagnostics))
+          publish(mirText, mir, mirSize, "MIR result", error, &context))
     return status;
   if (int status =
           publish(dagText, dag, dagSize, "scheduling DAG result", error)) {
@@ -490,7 +463,6 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
   ScopedLLVMOptions optionScope(settings);
 
   llvm::LLVMContext context;
-  auto *diagnostics = CodegenDiagnostics::install(context);
   auto buffer = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(mirText, mirTextSize), "triton-amd-mir", false);
   std::unique_ptr<llvm::MIRParser> mirParser =
@@ -541,7 +513,7 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
 
   reportTimings(options);
   return publish(result, output, outputSize, "MIR code-generation result",
-                 error, diagnostics);
+                 error, &context);
 }
 
 extern "C" TRITON_AMD_EXPORT int
