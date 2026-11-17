@@ -71,6 +71,17 @@ using mlir::triton::tools::ScopedLLVMOptions;
 
 constexpr uint32_t codegenABIVersion = 2;
 
+// C ABI status contract for the exported compilation/assembly functions.
+// Returned as int; independent of PassManager::run's IR-modification boolean.
+// Keep these values stable and synchronized with compiler.py.
+enum CodegenStatus : int {
+  Success = 0,
+  // Invalid arguments/options, target setup, or allocation failure.
+  SetupFailure = 1,
+  // Reported native IR parsing, LLVM codegen, or assembly error.
+  CompilationFailure = 2,
+};
+
 struct CodegenOptions {
   uint32_t abiVersion;
   const char *triple;
@@ -115,10 +126,6 @@ public:
   }
 };
 
-// Status 1 is a setup/infrastructure failure; status 2 is a compilation
-// failure.
-constexpr int compilationFailure = 2;
-
 std::once_flag targetInitialization;
 
 char *copyString(llvm::StringRef value) {
@@ -130,7 +137,7 @@ char *copyString(llvm::StringRef value) {
   return result;
 }
 
-int fail(const std::string &message, char **error, int status = 1) {
+int fail(const std::string &message, char **error, int status = SetupFailure) {
   if (error)
     *error = copyString(message);
   return status;
@@ -174,7 +181,7 @@ int validateOptions(const CodegenOptions *options, char **error) {
   if (!options->triple || !options->processor || !options->features ||
       !options->abi)
     return fail("incomplete AMD code-generation target options", error);
-  return 0;
+  return Success;
 }
 
 std::vector<ScopedLLVMOptions::Setting>
@@ -265,7 +272,7 @@ int prepareModule(const char *llvmIR, size_t llvmIRSize,
     std::string message;
     llvm::raw_string_ostream stream(message);
     diagnostic.print("triton-amd-codegen", stream);
-    return fail(message, error, compilationFailure);
+    return fail(message, error, CompilationFailure);
   }
 
   // LLVM no longer supports globally enabling FP contraction through
@@ -276,7 +283,7 @@ int prepareModule(const char *llvmIR, size_t llvmIRSize,
 
   machine = createTargetMachine(*module, options, error);
   if (!machine)
-    return 1;
+    return SetupFailure;
 
   for (llvm::Function &function : module->functions())
     if (!function.hasFnAttribute(llvm::Attribute::NoInline))
@@ -299,7 +306,7 @@ int prepareModule(const char *llvmIR, size_t llvmIRSize,
     cleanup.run(*module);
   }
 
-  return 0;
+  return Success;
 }
 
 // Hand `value` back to the caller through a malloc'd buffer it frees with
@@ -308,12 +315,12 @@ int publish(llvm::StringRef value, char **out, size_t *outSize,
             const char *what, char **error,
             const CodegenDiagnostics *diagnostics = nullptr) {
   if (diagnostics && diagnostics->HasErrors)
-    return fail(diagnostics->errors, error, compilationFailure);
+    return fail(diagnostics->errors, error, CompilationFailure);
   *out = copyString(value);
   if (!*out)
     return fail(std::string("failed to allocate ") + what, error);
   *outSize = value.size();
-  return 0;
+  return Success;
 }
 
 // Drain the -time-passes report enableTiming asked for. LLVM accumulates into
@@ -447,7 +454,7 @@ extern "C" TRITON_AMD_EXPORT int triton_amdgpu_translate_to_mir(
     *mirSize = 0;
     return status;
   }
-  return 0;
+  return Success;
 }
 
 // Resume code generation from `mirText`, which must be MIR this library
@@ -493,12 +500,12 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
 
   std::unique_ptr<llvm::Module> module = mirParser->parseIRModule();
   if (!module)
-    return fail("failed to parse MIR IR module", error, compilationFailure);
+    return fail("failed to parse MIR IR module", error, CompilationFailure);
 
   std::unique_ptr<llvm::TargetMachine> machine =
       createTargetMachine(*module, options, error);
   if (!machine)
-    return 1;
+    return SetupFailure;
 
   llvm::legacy::PassManager pass;
 
@@ -527,7 +534,7 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
 
     if (mirParser->parseMachineFunctions(*module, MMIWP->getMMI()))
       return fail("failed to parse machine functions from MIR", error,
-                  compilationFailure);
+                  CompilationFailure);
 
     pass.run(*module);
   }
@@ -610,7 +617,7 @@ triton_amdgpu_assemble(const char *assembly, size_t assemblySize,
   parser->setTargetParser(*targetParser);
   if (parser->Run(/*NoInitialTextSection=*/false))
     return fail("AMD assembler rejected generated AMDGCN", error,
-                compilationFailure);
+                CompilationFailure);
 
   return publish(llvm::StringRef(result.data(), result.size()), object,
                  objectSize, "AMD object result", error);
