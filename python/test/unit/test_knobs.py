@@ -815,7 +815,7 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
 
     def check_output(*args):
         status = native_compile(*args)
-        assert status == (2 if size > 65536 else 0)
+        assert status == (compiler._AMD_COMPILATION_FAILURE if size > 65536 else compiler._AMD_SUCCESS)
         if status:
             assert not ctypes.cast(args[3], ctypes.POINTER(ctypes.c_void_p))[0]
             assert ctypes.cast(args[4], ctypes.POINTER(ctypes.c_size_t))[0] == 0

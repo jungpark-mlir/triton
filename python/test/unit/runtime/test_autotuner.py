@@ -729,8 +729,8 @@ def test_prune_all_configs(device):
         ) == "Autotuner error: No valid autotuner configs after pruning. `early_config_prune` should return at least one config."
 
 
-@pytest.mark.parametrize("stage", ["LLVM codegen", "assembly"])
-def test_backend_compilation_error_skips_candidate(stage, fresh_knobs):
+@pytest.mark.parametrize("runtime_error", [False, True])
+def test_backend_failure_tuning_policy(runtime_error, fresh_knobs):
     from triton.runtime.errors import BackendCompilationError
 
     calls = []
@@ -743,7 +743,9 @@ def test_backend_compilation_error_skips_candidate(stage, fresh_knobs):
         def run(self, **kwargs):
             calls.append(kwargs["BLOCK_SIZE"])
             if kwargs["BLOCK_SIZE"] == 128:
-                raise BackendCompilationError(stage, "candidate failed")
+                if runtime_error:
+                    raise RuntimeError("unexpected execution failure")
+                raise BackendCompilationError("LLVM codegen", "candidate failed")
             return "valid candidate"
 
     def bench(call, quantiles):
@@ -753,9 +755,14 @@ def test_backend_compilation_error_skips_candidate(stage, fresh_knobs):
     bad = triton.Config({"BLOCK_SIZE": 128})
     good = triton.Config({"BLOCK_SIZE": 32})
     tuner = triton.runtime.Autotuner(Kernel(), ["BLOCK_SIZE"], [bad, good], key=[], reset_to_zero=None,
-                                     restore_value=None, pre_hook=None, post_hook=None, prune_configs_by=None,
-                                     warmup=None, rep=None, use_cuda_graph=False, do_bench=bench)
-    assert tuner.run() == "valid candidate"
-    assert tuner.best_config is good
-    assert tuner.configs_timings[bad] == [float("inf")] * 3
-    assert calls == [128, 32, 32]
+                                     restore_value=None, do_bench=bench)
+    if runtime_error:
+        with pytest.raises(RuntimeError, match="unexpected execution failure"):
+            tuner.run()
+        assert calls == [128]
+        assert not tuner.cache
+    else:
+        assert tuner.run() == "valid candidate"
+        assert tuner.best_config is good
+        assert tuner.configs_timings[bad] == [float("inf")] * 3
+        assert calls == [128, 32, 32]

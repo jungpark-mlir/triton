@@ -146,7 +146,7 @@ _AMD_SUCCESS = 0
 _AMD_SETUP_FAILURE = 1  # Invalid arguments/options, target setup, or allocation.
 _AMD_COMPILATION_FAILURE = 2  # Reported native parsing, codegen, or assembly error.
 # SetupFailure and unknown nonzero statuses raise RuntimeError. Older libraries
-# return only Success or SetupFailure.
+# use status 1 for all failures; those retain their RuntimeError behavior.
 
 
 def _raise_codegen_error(library, error: ctypes.c_void_p, fallback: str, status: int, stage: str = "LLVM codegen"):
