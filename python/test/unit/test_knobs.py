@@ -794,7 +794,7 @@ def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
 
 @pytest.mark.parametrize("size, waves_per_eu", [(1024, 0), (98304, 0), (65536, 10)])
 @pytest.mark.skip(reason="Requires the rebuilt AMD codegen artifact; re-enable with the download-manifest update")
-def test_amd_codegen_static_lds_diagnostics(size, waves_per_eu, fresh_knobs, monkeypatch, capfd):
+def test_amd_codegen_static_lds_compilation_failure(size, waves_per_eu, fresh_knobs, monkeypatch, capfd):
     import ctypes
     from triton.backends.amd import compiler
     from triton.runtime.errors import BackendCompilationError
@@ -830,10 +830,10 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
             compiler.compile_amdgpu(source, triple, "gfx942", "", **options)
         assert exc.value.stage == "LLVM codegen"
         assert "AMD LLVM codegen failed" in exc.value.error_message
-        diagnostics = capfd.readouterr().err
-        assert "local memory" in diagnostics
-        assert "98304" in diagnostics
-        assert "65536" in diagnostics
+        stderr = capfd.readouterr().err
+        assert "local memory" in stderr
+        assert "98304" in stderr
+        assert "65536" in stderr
     else:
         assert "lds_kernel:" in compiler.compile_amdgpu(source, triple, "gfx942", "", **options)
         if waves_per_eu:
