@@ -115,6 +115,10 @@ public:
   }
 };
 
+// Status 1 is a setup/infrastructure failure; status 2 is a compilation
+// failure.
+constexpr int compilationFailure = 2;
+
 std::once_flag targetInitialization;
 
 char *copyString(llvm::StringRef value) {
@@ -126,10 +130,10 @@ char *copyString(llvm::StringRef value) {
   return result;
 }
 
-int fail(const std::string &message, char **error) {
+int fail(const std::string &message, char **error, int status = 1) {
   if (error)
     *error = copyString(message);
-  return 1;
+  return status;
 }
 
 void initializeTarget() {
@@ -261,7 +265,7 @@ int prepareModule(const char *llvmIR, size_t llvmIRSize,
     std::string message;
     llvm::raw_string_ostream stream(message);
     diagnostic.print("triton-amd-codegen", stream);
-    return fail(message, error);
+    return fail(message, error, compilationFailure);
   }
 
   // LLVM no longer supports globally enabling FP contraction through
@@ -304,7 +308,7 @@ int publish(llvm::StringRef value, char **out, size_t *outSize,
             const char *what, char **error,
             const CodegenDiagnostics *diagnostics = nullptr) {
   if (diagnostics && diagnostics->HasErrors)
-    return fail(diagnostics->errors, error);
+    return fail(diagnostics->errors, error, compilationFailure);
   *out = copyString(value);
   if (!*out)
     return fail(std::string("failed to allocate ") + what, error);
@@ -489,7 +493,7 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
 
   std::unique_ptr<llvm::Module> module = mirParser->parseIRModule();
   if (!module)
-    return fail("failed to parse MIR IR module", error);
+    return fail("failed to parse MIR IR module", error, compilationFailure);
 
   std::unique_ptr<llvm::TargetMachine> machine =
       createTargetMachine(*module, options, error);
@@ -522,7 +526,8 @@ triton_amdgpu_translate_mir_to_asm(const char *mirText, size_t mirTextSize,
       return fail("AMD target cannot emit code from MIR", error);
 
     if (mirParser->parseMachineFunctions(*module, MMIWP->getMMI()))
-      return fail("failed to parse machine functions from MIR", error);
+      return fail("failed to parse machine functions from MIR", error,
+                  compilationFailure);
 
     pass.run(*module);
   }
@@ -604,7 +609,8 @@ triton_amdgpu_assemble(const char *assembly, size_t assemblySize,
 
   parser->setTargetParser(*targetParser);
   if (parser->Run(/*NoInitialTextSection=*/false))
-    return fail("AMD assembler rejected generated AMDGCN", error);
+    return fail("AMD assembler rejected generated AMDGCN", error,
+                compilationFailure);
 
   return publish(llvm::StringRef(result.data(), result.size()), object,
                  objectSize, "AMD object result", error);

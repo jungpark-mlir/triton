@@ -141,12 +141,19 @@ def _codegen_options(triple: str, processor: str, features: str, *, flags: list[
     )
 
 
-def _raise_codegen_error(library, error: ctypes.c_void_p, fallback: str, stage: str = "LLVM codegen"):
+# Must match compilationFailure in the native wrapper.
+_AMD_COMPILATION_FAILURE = 2
+
+
+def _raise_codegen_error(library, error: ctypes.c_void_p, fallback: str, status: int, stage: str = "LLVM codegen"):
     message = ctypes.string_at(error).decode("utf-8") if error.value else fallback
     if error.value:
         library.triton_amdgpu_free(error)
     revision = library.triton_amdgpu_revision().decode("utf-8")
-    raise BackendCompilationError(stage, f"AMD LLVM {revision}: {message}")
+    diagnostics = f"AMD LLVM {revision}: {message}"
+    if status == _AMD_COMPILATION_FAILURE:
+        raise BackendCompilationError(stage, diagnostics)
+    raise RuntimeError(diagnostics)
 
 
 def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flags: list[str], enable_fp_fusion: bool,
@@ -172,7 +179,7 @@ def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flag
     status = library.triton_amdgpu_compile(llvm_ir, len(llvm_ir), ctypes.byref(options), ctypes.byref(assembly),
                                            ctypes.byref(assembly_size), ctypes.byref(error))
     if status:
-        _raise_codegen_error(library, error, "unknown AMD code-generation failure")
+        _raise_codegen_error(library, error, "unknown AMD code-generation failure", status)
     try:
         return ctypes.string_at(assembly, assembly_size.value).decode("utf-8")
     finally:
@@ -211,7 +218,7 @@ def translate_to_mir(src: str, triple: str, processor: str, features: str, flags
                                                     ctypes.byref(mir_size), ctypes.byref(dag), ctypes.byref(dag_size),
                                                     ctypes.byref(error))
     if status:
-        _raise_codegen_error(library, error, "unknown AMD MIR translation failure")
+        _raise_codegen_error(library, error, "unknown AMD MIR translation failure", status)
     try:
         mir_text = ctypes.string_at(mir, mir_size.value).decode("utf-8")
         dag_text = ctypes.string_at(dag, dag_size.value).decode("utf-8")
@@ -255,7 +262,7 @@ def translate_mir_to_asm(mir_path: str, triple: str, processor: str, features: s
                                                         ctypes.byref(output), ctypes.byref(output_size),
                                                         ctypes.byref(error))
     if status:
-        _raise_codegen_error(library, error, "unknown AMD MIR code-generation failure")
+        _raise_codegen_error(library, error, "unknown AMD MIR code-generation failure", status)
     try:
         return ctypes.string_at(output, output_size.value).decode("utf-8")
     finally:
@@ -279,7 +286,7 @@ def assemble_amdgcn(assembly: str, processor: str, features: str) -> bytes:
         ctypes.byref(error),
     )
     if status:
-        _raise_codegen_error(library, error, "unknown AMD assembly failure", stage="assembly")
+        _raise_codegen_error(library, error, "unknown AMD assembly failure", status, stage="assembly")
     try:
         return ctypes.string_at(object_file, object_size.value)
     finally:

@@ -814,7 +814,7 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
 
     def check_output(*args):
         status = native_compile(*args)
-        assert bool(status) == (size > 65536)
+        assert status == (2 if size > 65536 else 0)
         if status:
             assert not ctypes.cast(args[3], ctypes.POINTER(ctypes.c_void_p))[0]
             assert ctypes.cast(args[4], ctypes.POINTER(ctypes.c_size_t))[0] == 0
@@ -861,3 +861,20 @@ def test_amd_codegen_native_parse_error_translation(fresh_knobs, monkeypatch):
     assert exc.value.stage == "LLVM codegen"
     assert "error:" in exc.value.diagnostics
     assert "define invalid" in exc.value.diagnostics
+
+
+def test_amd_codegen_invalid_options_propagate(fresh_knobs, monkeypatch):
+    from triton.backends.amd import compiler
+
+    make_options = compiler._codegen_options
+
+    def invalid_options(*args, **kwargs):
+        options = make_options(*args, **kwargs)
+        options.abi_version = 0
+        return options
+
+    monkeypatch.setattr(compiler, "_codegen_options", invalid_options)
+    with pytest.raises(RuntimeError, match="incompatible AMD code-generation ABI"):
+        compiler.compile_amdgpu("define amdgpu_kernel void @kernel() { ret void }", "amdgcn-amd-amdhsa", "gfx942", "",
+                                flags=[], enable_fp_fusion=True, disable_optimization=False, canonicalize_gep=False,
+                                disabled_passes="", dump_ir=False, enable_timing=False)
