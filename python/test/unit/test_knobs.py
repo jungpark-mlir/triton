@@ -793,6 +793,7 @@ def test_opt_bool(fresh_knobs_including_libraries, monkeypatch):
 
 
 @pytest.mark.parametrize("size, waves_per_eu", [(1024, 0), (98304, 0), (65536, 10)])
+@pytest.mark.skip(reason="Requires the rebuilt AMD codegen artifact; re-enable with the download-manifest update")
 def test_amd_codegen_static_lds_diagnostics(size, waves_per_eu, fresh_knobs, monkeypatch, capfd):
     import ctypes
     from triton.backends.amd import compiler
@@ -837,6 +838,7 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
             assert "failed to meet occupancy target" in capfd.readouterr().err
 
 
+@pytest.mark.skip(reason="Requires the rebuilt AMD codegen artifact; re-enable with the download-manifest update")
 def test_amd_codegen_assembly_error_translation(fresh_knobs, capfd):
     from triton.backends.amd import compiler
     from triton.runtime.errors import BackendCompilationError
@@ -848,6 +850,7 @@ def test_amd_codegen_assembly_error_translation(fresh_knobs, capfd):
     assert "this_is_not_an_instruction" in capfd.readouterr().err
 
 
+@pytest.mark.skip(reason="Requires the rebuilt AMD codegen artifact; re-enable with the download-manifest update")
 def test_amd_codegen_native_parse_error_translation(fresh_knobs, monkeypatch):
     from triton.backends.amd import compiler
     from triton.runtime.errors import BackendCompilationError
