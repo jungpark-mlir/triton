@@ -154,10 +154,10 @@ def _raise_codegen_error(library, error: ctypes.c_void_p, fallback: str, status:
     if error.value:
         library.triton_amdgpu_free(error)
     revision = library.triton_amdgpu_revision().decode("utf-8")
-    diagnostics = f"AMD LLVM {revision}: {message}"
+    error_message = f"AMD LLVM {revision}: {message}"
     if status == _AMD_COMPILATION_FAILURE:
-        raise BackendCompilationError(stage, diagnostics)
-    raise RuntimeError(diagnostics)
+        raise BackendCompilationError(stage, error_message)
+    raise RuntimeError(error_message)
 
 
 def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flags: list[str], enable_fp_fusion: bool,

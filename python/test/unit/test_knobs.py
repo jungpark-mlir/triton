@@ -829,7 +829,7 @@ define amdgpu_kernel void @lds_kernel(ptr addrspace(1) %out, i32 %index) {attrib
         with pytest.raises(BackendCompilationError) as exc:
             compiler.compile_amdgpu(source, triple, "gfx942", "", **options)
         assert exc.value.stage == "LLVM codegen"
-        assert "AMD LLVM codegen failed" in exc.value.diagnostics
+        assert "AMD LLVM codegen failed" in exc.value.error_message
         diagnostics = capfd.readouterr().err
         assert "local memory" in diagnostics
         assert "98304" in diagnostics
@@ -848,7 +848,7 @@ def test_amd_codegen_assembly_error_translation(fresh_knobs, capfd):
     with pytest.raises(BackendCompilationError) as exc:
         compiler.assemble_amdgcn("this_is_not_an_instruction\n", "gfx942", "")
     assert exc.value.stage == "assembly"
-    assert "AMD assembler rejected generated AMDGCN" in exc.value.diagnostics
+    assert "AMD assembler rejected generated AMDGCN" in exc.value.error_message
     assert "this_is_not_an_instruction" in capfd.readouterr().err
 
 
@@ -864,8 +864,8 @@ def test_amd_codegen_native_parse_error_translation(fresh_knobs, monkeypatch):
                                 disable_optimization=False, canonicalize_gep=False, disabled_passes="", dump_ir=False,
                                 enable_timing=False)
     assert exc.value.stage == "LLVM codegen"
-    assert "error:" in exc.value.diagnostics
-    assert "define invalid" in exc.value.diagnostics
+    assert "error:" in exc.value.error_message
+    assert "define invalid" in exc.value.error_message
 
 
 def test_amd_codegen_invalid_options_propagate(fresh_knobs, monkeypatch):
